@@ -19,11 +19,23 @@
   },
   "connectors": {
     "platform": {
+      "kind": "infisical",
       "base_url": "https://infisical.example.com",
       "auth": {
         "type": "kubernetes",
         "identity_id": "replace-with-existing-infisical-identity-id",
         "token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+      }
+    },
+    "openbao": {
+      "kind": "openbao",
+      "base_url": "https://openbao.example.com",
+      "namespace": "",
+      "auth": {
+        "type": "kubernetes",
+        "role": "av",
+        "token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        "mount_path": "kubernetes"
       }
     }
   },
@@ -47,6 +59,11 @@
       "project_id": "existing-codewire-project-id",
       "environment": "prod",
       "secret_path": "/",
+      "allowed_keys": []
+    },
+    "openbao-infra": {
+      "connector": "openbao",
+      "secret_path": "secret/data/infra",
       "allowed_keys": []
     }
   },

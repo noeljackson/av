@@ -41,6 +41,11 @@ jobs:
           install -Dm755 target/release/av dist/av
           tar -C dist -czf "dist/av-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" av
           (cd dist && sha256sum "av-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz" > "av-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu.tar.gz.sha256")
+      - name: Production image auth smoke
+        run: |
+          docker build --tag av:test .
+          tests/container-smoke.sh av:test
+          AV_IMAGE=av:test tests/connector-integration.sh
       - name: Attest binary
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:

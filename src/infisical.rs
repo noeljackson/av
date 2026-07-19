@@ -39,10 +39,10 @@ struct Secret {
 }
 
 impl InfisicalConnector {
-    pub fn new(config: InfisicalConfig) -> Result<Self> {
+    pub fn new(config: InfisicalConfig, allow_insecure_http: bool) -> Result<Self> {
         let base = Url::parse(&config.base_url).context("invalid Infisical base_url")?;
-        if base.scheme() != "https" && !base.host_str().is_some_and(is_loopback) {
-            bail!("Infisical base_url must use HTTPS unless it is loopback");
+        if base.scheme() != "https" && !(base.scheme() == "http" && allow_insecure_http) {
+            bail!("Infisical base_url must use HTTPS");
         }
         Ok(Self {
             config,
@@ -118,6 +118,7 @@ impl InfisicalConnector {
                     "clientSecret": read_secret_file(client_secret_file)?,
                 }),
             ),
+            InfisicalAuth::Token { token_file } => return read_secret_file(token_file),
         };
 
         let response = self
@@ -159,11 +160,4 @@ fn read_secret_file(path: impl AsRef<Path>) -> Result<String> {
         bail!("credential file {} is empty", path.display());
     }
     Ok(value)
-}
-
-fn is_loopback(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }

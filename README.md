@@ -2,19 +2,20 @@
 
 `av` is a stateless, OIDC-authenticated connector and credential proxy. It does
 not have registration, a user database, or an application-secret database.
-Infisical remains the current source of truth; OpenBao can be added as another
-connector without changing the CLI or proxy contract.
+Infisical and OpenBao are connector backends; neither is embedded in `av`, and
+switching a profile between them does not change the CLI or proxy contract.
 
 ## What it implements
 
 | Tier | `av` behavior | Credential exposure |
 |---|---|---|
-| 1 — dynamic | Connector interface reserved for provider/OpenBao leases | Lease only, when the connector supports it |
+| 1 — dynamic | OpenBao reads, including dynamic-secret response data | Generated values are limited by the backend lease |
 | 2 — proxy | Fixed HTTPS origin, method/path allowlist, server-side header injection | Credential never enters the caller |
 | 3 — process environment | Authenticated profile lease followed by local child-process execution | Only the `av` process and its child receive values |
 
-The first connector is Infisical. A profile maps directly to an existing
-project, environment, and path; no dedicated `av` project is required.
+An Infisical profile maps directly to an existing project, environment, and
+path; no dedicated `av` project is required. OpenBao profiles map to an API
+secret path such as `secret/data/infra` or `database/creds/read-only`.
 
 ## Daily use
 
@@ -65,8 +66,10 @@ auth is rejected unless the listener is loopback and
 
 Configuration is strict JSON; unknown fields fail startup. Start from
 [`config.example.json`](config.example.json). Connector credentials are file
-references, never literal values in the config. Kubernetes auth is preferred in
-the cluster; Universal Auth exists for installations that cannot use it.
+references, never literal values in the config. Infisical supports Kubernetes,
+Universal, and token auth. OpenBao supports Kubernetes, AppRole, and token auth;
+Kubernetes is preferred for in-cluster workloads and AppRole for external
+automation.
 
 ```bash
 AV_ALLOW_INSECURE_AUTH=1 cargo run -- serve --config config.local.json
@@ -91,7 +94,13 @@ cargo clippy --locked --all-targets -- -D warnings
 (cd ui && /usr/bin/bun install --frozen-lockfile && /usr/bin/bun run check && /usr/bin/bun run build)
 supplychain verify-bun --minimum-age-days=30 --baseline=../.supplychain/bun-baseline.json ui
 helm lint chart/av
+tests/connector-integration.sh
 ```
+
+The integration runner starts separate pinned containers for AV, Infisical,
+Postgres, Redis, OpenBao, and a credential-aware upstream. It bootstraps only
+disposable test data on an internal Docker network, verifies both connector
+reads plus Tier 2 injection, and removes containers and volumes on exit.
 
 Install or update the CLI repeatedly from an attested release without a
 `curl | sh` path:

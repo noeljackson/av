@@ -240,7 +240,57 @@ fn claim_allows_group(claim: Option<&serde_json::Value>, allowed_groups: &[Strin
 
 #[cfg(test)]
 mod tests {
-    use super::claim_allows_group;
+    use super::*;
+    use crate::config::BasicUserConfig;
+    use axum::http::HeaderValue;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn basic_login_accepts_only_the_configured_password_file() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let password_file =
+            std::env::temp_dir().join(format!("av-basic-auth-{}-{nonce}", std::process::id()));
+        std::fs::write(&password_file, "correct-horse\n").unwrap();
+        let authenticator = Authenticator::new(AuthConfig {
+            mode: AuthMode::Basic,
+            issuer: String::new(),
+            client_id: String::new(),
+            audiences: vec![],
+            scopes: vec![],
+            allowed_groups: vec![],
+            group_claim: "groups".into(),
+            basic_users: vec![BasicUserConfig {
+                username: "operator".into(),
+                password_file: password_file.display().to_string(),
+            }],
+        })
+        .await
+        .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!(
+                "Basic {}",
+                STANDARD.encode("operator:correct-horse")
+            ))
+            .unwrap(),
+        );
+        assert_eq!(
+            authenticator.authorize(&headers).await.unwrap().subject,
+            "basic:operator"
+        );
+
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Basic {}", STANDARD.encode("operator:wrong"))).unwrap(),
+        );
+        assert!(authenticator.authorize(&headers).await.is_err());
+        std::fs::remove_file(password_file).unwrap();
+    }
 
     #[test]
     fn accepts_standard_group_arrays() {

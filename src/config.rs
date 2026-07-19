@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, net::IpAddr, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::IpAddr,
+    path::Path,
+};
 
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -15,7 +19,7 @@ pub struct Config {
     pub ui_dir: String,
     pub auth: AuthConfig,
     #[serde(default)]
-    pub connectors: BTreeMap<String, InfisicalConfig>,
+    pub connectors: BTreeMap<String, ConnectorConfig>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
     #[serde(default)]
@@ -59,8 +63,40 @@ pub struct BasicUserConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum ConnectorConfig {
+    OpenBao(OpenBaoConfig),
+    Infisical(InfisicalConfig),
+}
+
+impl ConnectorConfig {
+    pub fn base_url(&self) -> &str {
+        match self {
+            Self::OpenBao(config) => &config.base_url,
+            Self::Infisical(config) => &config.base_url,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::OpenBao(_) => "openbao",
+            Self::Infisical(_) => "infisical",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum InfisicalKind {
+    #[default]
+    Infisical,
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InfisicalConfig {
+    #[serde(default, rename = "kind")]
+    _kind: InfisicalKind,
     pub base_url: String,
     pub auth: InfisicalAuth,
 }
@@ -77,13 +113,58 @@ pub enum InfisicalAuth {
         client_id_file: String,
         client_secret_file: String,
     },
+    Token {
+        token_file: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum OpenBaoKind {
+    #[serde(rename = "openbao")]
+    OpenBao,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenBaoConfig {
+    #[serde(rename = "kind")]
+    _kind: OpenBaoKind,
+    pub base_url: String,
+    #[serde(default)]
+    pub namespace: String,
+    pub auth: OpenBaoAuth,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum OpenBaoAuth {
+    #[serde(rename = "approle")]
+    AppRole {
+        role_id_file: String,
+        secret_id_file: String,
+        #[serde(default = "default_approle_mount_path")]
+        mount_path: String,
+    },
+    Kubernetes {
+        role: String,
+        #[serde(default = "default_service_account_token_file")]
+        token_file: String,
+        #[serde(default = "default_kubernetes_mount_path")]
+        mount_path: String,
+    },
+    Token {
+        token_file: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProfileConfig {
     pub connector: String,
+    #[serde(default)]
     pub project_id: String,
+    #[serde(default)]
     pub environment: String,
     #[serde(default = "default_secret_path")]
     pub secret_path: String,
@@ -133,6 +214,14 @@ impl Config {
         if public_url.scheme() != "https" && !public_url.host_str().is_some_and(is_loopback_host) {
             bail!("public_url must use HTTPS unless it is loopback");
         }
+        if public_url.host_str().is_none()
+            || has_url_credentials(&public_url)
+            || public_url.query().is_some()
+            || public_url.fragment().is_some()
+            || !matches!(public_url.path(), "" | "/")
+        {
+            bail!("public_url must be an origin without credentials, query, fragment, or path");
+        }
 
         match self.auth.mode {
             AuthMode::Oidc | AuthMode::OidcOrBasic => {
@@ -142,7 +231,17 @@ impl Config {
                 if self.auth.allowed_groups.is_empty() {
                     bail!("OIDC requires at least one allowed_group");
                 }
-                Url::parse(&self.auth.issuer).context("auth.issuer must be a URL")?;
+                let issuer = Url::parse(&self.auth.issuer).context("auth.issuer must be a URL")?;
+                if (issuer.scheme() != "https"
+                    && !(issuer.scheme() == "http"
+                        && issuer.host_str().is_some_and(is_loopback_host)))
+                    || issuer.host_str().is_none()
+                    || has_url_credentials(&issuer)
+                    || issuer.query().is_some()
+                    || issuer.fragment().is_some()
+                {
+                    bail!("auth.issuer must be a trusted HTTPS URL");
+                }
             }
             AuthMode::Basic => {}
             AuthMode::Disabled => {
@@ -164,17 +263,62 @@ impl Config {
         {
             bail!("basic auth mode requires basic_users");
         }
+        let mut basic_usernames = BTreeSet::new();
+        for user in &self.auth.basic_users {
+            if user.username.is_empty()
+                || user.username.contains(':')
+                || user.username.chars().any(char::is_control)
+            {
+                bail!("basic auth usernames must be non-empty and may not contain ':' or controls");
+            }
+            if !basic_usernames.insert(&user.username) {
+                bail!("basic auth usernames must be unique");
+            }
+            if !Path::new(&user.password_file).is_absolute() {
+                bail!("basic auth password files must use absolute paths");
+            }
+        }
+
+        let allow_insecure_connector_http = self.allow_insecure_connector_http();
+        for (name, connector) in &self.connectors {
+            validate_name("connector", name)?;
+            let base = Url::parse(connector.base_url())
+                .with_context(|| format!("connector {name} base_url must be a URL"))?;
+            if base.host_str().is_none()
+                || has_url_credentials(&base)
+                || base.query().is_some()
+                || base.fragment().is_some()
+            {
+                bail!("connector {name} base_url may not contain credentials, query, or fragment");
+            }
+            if base.scheme() != "https"
+                && !(base.scheme() == "http" && allow_insecure_connector_http)
+            {
+                bail!("connector {name} base_url must use HTTPS");
+            }
+            validate_connector_auth(name, connector)?;
+        }
 
         for (name, profile) in &self.profiles {
             validate_name("profile", name)?;
-            if !self.connectors.contains_key(&profile.connector) {
+            let Some(connector) = self.connectors.get(&profile.connector) else {
                 bail!(
                     "profile {name} references unknown connector {}",
                     profile.connector
                 );
-            }
-            if !profile.secret_path.starts_with('/') {
-                bail!("profile {name} secret_path must start with /");
+            };
+            match connector {
+                ConnectorConfig::Infisical(_) => {
+                    if profile.project_id.is_empty() || profile.environment.is_empty() {
+                        bail!("Infisical profile {name} requires project_id and environment");
+                    }
+                    if !profile.secret_path.starts_with('/') {
+                        bail!("Infisical profile {name} secret_path must start with /");
+                    }
+                }
+                ConnectorConfig::OpenBao(_) => {
+                    validate_openbao_secret_path(name, &profile.secret_path)?;
+                }
             }
         }
 
@@ -188,21 +332,156 @@ impl Config {
             }
             let base = Url::parse(&route.base_url)
                 .with_context(|| format!("proxy route {name} base_url must be a URL"))?;
-            if base.scheme() != "https" || base.host_str().is_none() {
-                bail!("proxy route {name} base_url must be an HTTPS origin");
+            if base.host_str().is_none()
+                || (base.scheme() != "https"
+                    && !(base.scheme() == "http" && allow_insecure_connector_http))
+            {
+                bail!("proxy route {name} base_url must use HTTPS");
+            }
+            if has_url_credentials(&base) || base.query().is_some() || base.fragment().is_some() {
+                bail!(
+                    "proxy route {name} base_url may not contain credentials, query, or fragment"
+                );
             }
             if route.allowed_methods.is_empty() || route.allowed_path_prefixes.is_empty() {
                 bail!("proxy route {name} must constrain both methods and path prefixes");
+            }
+            if route.allowed_methods.iter().any(|method| {
+                !matches!(
+                    method.to_ascii_uppercase().as_str(),
+                    "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE"
+                )
+            }) {
+                bail!("proxy route {name} contains a non-CRUD HTTP method");
+            }
+            if route.allowed_path_prefixes.iter().any(|prefix| {
+                let lower = prefix.to_ascii_lowercase();
+                !prefix.starts_with('/')
+                    || prefix.contains(['?', '#', '\\'])
+                    || lower.contains("%2e")
+                    || lower.contains("%2f")
+                    || lower.contains("%5c")
+                    || prefix
+                        .split('/')
+                        .any(|segment| matches!(segment, "." | ".."))
+            }) {
+                bail!("proxy route {name} contains an unsafe path prefix");
             }
             if !route.header.eq_ignore_ascii_case("authorization")
                 && !route.header.to_ascii_lowercase().starts_with("x-")
             {
                 bail!("proxy route {name} may inject Authorization or an X-* header only");
             }
+            if axum::http::HeaderName::from_bytes(route.header.as_bytes()).is_err() {
+                bail!("proxy route {name} injection header is invalid");
+            }
         }
 
         Ok(())
     }
+
+    pub fn allow_insecure_connector_http(&self) -> bool {
+        let public_host_is_loopback = Url::parse(&self.public_url)
+            .ok()
+            .and_then(|url| url.host_str().map(is_loopback_host))
+            .unwrap_or(false);
+        public_host_is_loopback
+            && std::env::var("AV_ALLOW_INSECURE_CONNECTORS")
+                .is_ok_and(|value| value == "integration-tests-only")
+    }
+}
+
+fn validate_connector_auth(name: &str, connector: &ConnectorConfig) -> Result<()> {
+    let credential_files: Vec<&str> = match connector {
+        ConnectorConfig::Infisical(config) => match &config.auth {
+            InfisicalAuth::Kubernetes {
+                identity_id,
+                token_file,
+            } => {
+                if identity_id.is_empty() {
+                    bail!("Infisical connector {name} identity_id may not be empty");
+                }
+                vec![token_file]
+            }
+            InfisicalAuth::Universal {
+                client_id_file,
+                client_secret_file,
+            } => vec![client_id_file, client_secret_file],
+            InfisicalAuth::Token { token_file } => vec![token_file],
+        },
+        ConnectorConfig::OpenBao(config) => {
+            if !config.namespace.is_empty()
+                && axum::http::HeaderValue::from_str(&config.namespace).is_err()
+            {
+                bail!("OpenBao connector {name} namespace is not a valid HTTP header value");
+            }
+            match &config.auth {
+                OpenBaoAuth::AppRole {
+                    role_id_file,
+                    secret_id_file,
+                    mount_path,
+                } => {
+                    validate_openbao_mount_path(name, mount_path)?;
+                    vec![role_id_file, secret_id_file]
+                }
+                OpenBaoAuth::Kubernetes {
+                    role,
+                    token_file,
+                    mount_path,
+                } => {
+                    if role.is_empty() {
+                        bail!("OpenBao connector {name} Kubernetes role may not be empty");
+                    }
+                    validate_openbao_mount_path(name, mount_path)?;
+                    vec![token_file]
+                }
+                OpenBaoAuth::Token { token_file } => vec![token_file],
+            }
+        }
+    };
+    if credential_files
+        .iter()
+        .any(|path| !Path::new(path).is_absolute())
+    {
+        bail!("connector {name} credential files must use absolute paths");
+    }
+    Ok(())
+}
+
+fn validate_openbao_mount_path(name: &str, mount_path: &str) -> Result<()> {
+    let normalized = mount_path.trim_matches('/');
+    if normalized.is_empty()
+        || normalized.split('/').any(|segment| {
+            segment.is_empty()
+                || !segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+    {
+        bail!("OpenBao connector {name} has an invalid auth mount_path");
+    }
+    Ok(())
+}
+
+fn validate_openbao_secret_path(name: &str, secret_path: &str) -> Result<()> {
+    let normalized = secret_path.trim_matches('/');
+    let lower = normalized.to_ascii_lowercase();
+    if normalized.is_empty()
+        || secret_path.contains(['?', '#', '\\'])
+        || lower.contains("%2e")
+        || lower.contains("%2f")
+        || lower.contains("%5c")
+        || normalized
+            .split('/')
+            .any(|segment| matches!(segment, "" | "." | ".."))
+    {
+        bail!("OpenBao profile {name} has an unsafe secret_path");
+    }
+    Ok(())
+}
+
+fn has_url_credentials(url: &Url) -> bool {
+    !url.username().is_empty() || url.password().is_some()
 }
 
 fn validate_name(kind: &str, name: &str) -> Result<()> {
@@ -241,6 +520,14 @@ fn default_secret_path() -> String {
 
 fn default_service_account_token_file() -> String {
     "/var/run/secrets/kubernetes.io/serviceaccount/token".into()
+}
+
+fn default_approle_mount_path() -> String {
+    "approle".into()
+}
+
+fn default_kubernetes_mount_path() -> String {
+    "kubernetes".into()
 }
 
 fn default_group_claim() -> String {
@@ -289,13 +576,14 @@ mod tests {
         let mut config = base_config();
         config.connectors.insert(
             "main".into(),
-            InfisicalConfig {
+            ConnectorConfig::Infisical(InfisicalConfig {
+                _kind: InfisicalKind::Infisical,
                 base_url: "https://infisical.example".into(),
                 auth: InfisicalAuth::Kubernetes {
                     identity_id: "identity".into(),
                     token_file: "/token".into(),
                 },
-            },
+            }),
         );
         config.profiles.insert(
             "infra".into(),
@@ -321,5 +609,31 @@ mod tests {
         );
         assert!(config.validate().is_err());
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
+    }
+
+    #[test]
+    fn parses_legacy_infisical_and_typed_openbao_connectors() {
+        let legacy: ConnectorConfig = serde_json::from_value(serde_json::json!({
+            "base_url": "https://infisical.example",
+            "auth": {
+                "type": "universal",
+                "client_id_file": "/run/client-id",
+                "client_secret_file": "/run/client-secret"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(legacy, ConnectorConfig::Infisical(_)));
+
+        let openbao: ConnectorConfig = serde_json::from_value(serde_json::json!({
+            "kind": "openbao",
+            "base_url": "https://openbao.example",
+            "auth": {
+                "type": "approle",
+                "role_id_file": "/run/role-id",
+                "secret_id_file": "/run/secret-id"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(openbao, ConnectorConfig::OpenBao(_)));
     }
 }

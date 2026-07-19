@@ -48,4 +48,7 @@ jobs:
           helm lint chart/av
           helm template av chart/av >/dev/null
       - name: Docker build
-        run: docker build --tag av:test .
+        run: |
+          docker build --tag av:test .
+          tests/container-smoke.sh av:test
+          AV_IMAGE=av:test tests/connector-integration.sh

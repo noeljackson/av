@@ -1,0 +1,140 @@
+name: av-connectors
+
+services:
+  postgres:
+    image: docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579
+    environment:
+      POSTGRES_DB: infisical
+      POSTGRES_PASSWORD: integration-only
+      POSTGRES_USER: infisical
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready --username=infisical --dbname=infisical"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks: [connectors]
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  redis:
+    image: docker.io/library/redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks: [connectors]
+
+  infisical:
+    image: docker.io/infisical/infisical:v0.160.7@sha256:48d9449db915dc0fec703bceab9c36a7fc48cc8839f52b9efa26258e8c6cc917
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      AUTH_SECRET: integration-only-auth-secret-integration-only-auth-secret
+      DB_CONNECTION_URI: postgres://infisical:integration-only@postgres:5432/infisical
+      ENCRYPTION_KEY: 9e1884bb3f26d05f76c116a0d6e3b52f
+      NODE_ENV: production
+      OTEL_TELEMETRY_COLLECTION_ENABLED: "false"
+      REDIS_URL: redis://redis:6379
+      SITE_URL: http://infisical:8080
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/api/status').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))
+      interval: 3s
+      timeout: 5s
+      retries: 60
+      start_period: 10s
+    networks: [connectors]
+
+  openbao:
+    image: docker.io/openbao/openbao:2.5.4@sha256:436eaf9778cad75507ff70ea26ace30dcbe15606e619ac3823495663d7f7c115
+    command: ["server", "-dev", "-dev-listen-address=0.0.0.0:8200"]
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: integration-only-root
+    healthcheck:
+      test: ["CMD", "bao", "status", "-address=http://127.0.0.1:8200"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks: [connectors]
+
+  upstream:
+    image: docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+    command: ["python", "/test/upstream.py"]
+    read_only: true
+    volumes:
+      - ./upstream.py:/test/upstream.py:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz',timeout=2)
+      interval: 2s
+      timeout: 5s
+      retries: 30
+    networks: [connectors]
+
+  setup:
+    image: docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+    command: ["python", "/test/setup.py"]
+    read_only: true
+    depends_on:
+      infisical:
+        condition: service_healthy
+      openbao:
+        condition: service_healthy
+    environment:
+      INFISICAL_URL: http://infisical:8080
+      OPENBAO_ROOT_TOKEN: integration-only-root
+      OPENBAO_URL: http://openbao:8200
+    volumes:
+      - connector-state:/state
+      - ./setup.py:/test/setup.py:ro
+    networks: [connectors]
+
+  av:
+    image: ${AV_IMAGE:-av:integration}
+    build:
+      context: ../..
+    command: ["serve", "--config", "/state/config.json"]
+    read_only: true
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      upstream:
+        condition: service_healthy
+    environment:
+      AV_ALLOW_INSECURE_CONNECTORS: integration-tests-only
+    volumes:
+      - connector-state:/state:ro
+    networks: [connectors]
+
+  verify:
+    image: docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
+    command: ["python", "/test/verify.py"]
+    read_only: true
+    depends_on:
+      av:
+        condition: service_started
+    environment:
+      AV_URL: http://av:14322
+    volumes:
+      - connector-state:/state:ro
+      - ./verify.py:/test/verify.py:ro
+    networks: [connectors]
+
+networks:
+  connectors:
+    internal: true
+
+volumes:
+  connector-state:
+  postgres-data:
