@@ -157,19 +157,10 @@ impl Authenticator {
             .context("bearer token validation failed")?
             .claims;
 
-        let groups = claims
-            .extra
-            .get(&self.config.group_claim)
-            .and_then(serde_json::Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(serde_json::Value::as_str);
-        if !groups.into_iter().any(|group| {
-            self.config
-                .allowed_groups
-                .iter()
-                .any(|allowed| allowed == group)
-        }) {
+        if !claim_allows_group(
+            claims.extra.get(&self.config.group_claim),
+            &self.config.allowed_groups,
+        ) {
             bail!("OIDC identity is not in an allowed group");
         }
         Ok(Identity {
@@ -229,5 +220,49 @@ impl Authenticator {
             .context("decode OIDC signing keys")?;
         *self.jwks.write().await = Some(set);
         Ok(())
+    }
+}
+
+fn claim_allows_group(claim: Option<&serde_json::Value>, allowed_groups: &[String]) -> bool {
+    match claim {
+        Some(serde_json::Value::Array(groups)) => groups
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|group| allowed_groups.iter().any(|allowed| allowed == group)),
+        // Zitadel represents project roles as an object keyed by role name. The values
+        // identify the organizations that granted each role and are not group names.
+        Some(serde_json::Value::Object(roles)) => roles
+            .keys()
+            .any(|role| allowed_groups.iter().any(|allowed| allowed == role)),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::claim_allows_group;
+
+    #[test]
+    fn accepts_standard_group_arrays() {
+        let claim = serde_json::json!(["developers", "av-users"]);
+        assert!(claim_allows_group(Some(&claim), &["av-users".into()]));
+        assert!(!claim_allows_group(Some(&claim), &["operators".into()]));
+    }
+
+    #[test]
+    fn accepts_zitadel_project_role_objects() {
+        let claim = serde_json::json!({
+            "av-users": {"org-id": "noel"},
+            "unrelated-role": {"org-id": "noel"}
+        });
+        assert!(claim_allows_group(Some(&claim), &["av-users".into()]));
+        assert!(!claim_allows_group(Some(&claim), &["operators".into()]));
+    }
+
+    #[test]
+    fn rejects_malformed_group_claims() {
+        let claim = serde_json::json!("av-users");
+        assert!(!claim_allows_group(Some(&claim), &["av-users".into()]));
+        assert!(!claim_allows_group(None, &["av-users".into()]));
     }
 }
