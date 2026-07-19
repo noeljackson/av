@@ -13,13 +13,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
       - name: Repository and Rust dependency scan
-        uses: noeljackson/supplychain@5d1a4de3ee932b218e05fc8605b1b8669365603e
+        uses: noeljackson/supplychain@dbf85be2f2efa1b265d96562d7c173b66ea08ec1
         with:
           path: .
           policy: strict
       - name: UI dependency scan and Bun trust baseline
-        uses: noeljackson/supplychain@5d1a4de3ee932b218e05fc8605b1b8669365603e
+        uses: noeljackson/supplychain@dbf85be2f2efa1b265d96562d7c173b66ea08ec1
         with:
           path: ui
           policy: strict
@@ -52,3 +54,9 @@ jobs:
           docker build --tag av:test .
           tests/container-smoke.sh av:test
           AV_IMAGE=av:test tests/connector-integration.sh
+      - name: Image SBOM and vulnerability policy
+        uses: noeljackson/supplychain@dbf85be2f2efa1b265d96562d7c173b66ea08ec1
+        with:
+          scan-source: "false"
+          image: av:test
+          fail-on-severity: high

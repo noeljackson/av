@@ -4,16 +4,13 @@ COPY ui/package.json ui/bun.lock ui/bunfig.toml ui/tsconfig.json ui/vite.config.
 COPY ui/src ./src
 RUN bun install --frozen-lockfile && bun run check && bun run build
 
-FROM docker.io/library/rust:1.96.1-slim-bookworm@sha256:e18a79fc84dfcfc3ab5ba72290398a644c135c97eaa881447fddc354ee4701a3 AS build
+FROM docker.io/library/rust:1.96.1-alpine3.23@sha256:14b9b5f47dcc6644d0f0c1b35a2c2c5d0124f67159aaee28a348627523459b55 AS build
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 RUN cargo build --locked --release
 
-FROM docker.io/library/debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
-RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 WORKDIR /app
 COPY --from=build /src/target/release/av /usr/local/bin/av
 COPY --from=ui /src/ui/dist /app/ui

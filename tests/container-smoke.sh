@@ -26,12 +26,12 @@ done
 curl --fail --silent "$base_url/healthz" >/dev/null
 
 status=$(curl --silent --output "$workdir/profiles" --write-out '%{http_code}' \
-  --user 'operator:correct-horse-test-only' "$base_url/v1/profiles")
+  --user 'operator:correct-horse-test-only' "$base_url/v1/profiles") # gitleaks:allow -- synthetic smoke-test credential
 [[ "$status" == "200" ]]
 grep --quiet '"name":"container-smoke"' "$workdir/profiles"
 
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
-  --user 'operator:wrong-password' "$base_url/v1/profiles")
+  --user 'operator:wrong-password' "$base_url/v1/profiles") # gitleaks:allow -- synthetic negative-test credential
 [[ "$status" == "401" ]]
 
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/profiles")
