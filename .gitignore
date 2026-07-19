@@ -1,0 +1,7 @@
+/target/
+/ui/dist/
+/ui/node_modules/
+/config.local.json
+/.env
+*.pem
+*.key
