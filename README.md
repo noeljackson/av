@@ -25,13 +25,13 @@ av login
 
 av profiles
 av infra -- ./scripts/atmos-run terraform plan headscale -s system
-av codewire-dev -- cargo test
-av codewire-prod -- ./scripts/check-production
+av example-dev -- cargo test
+av example-prod -- ./scripts/check-production
 
 av logout
 ```
 
-`av codewire-dev -- ...` fetches the configured Infisical profile and adds the
+`av example-dev -- ...` fetches the configured Infisical profile and adds the
 returned keys only to the child process. It never writes application secrets to
 disk or to the kernel keyring. The keyring contains only the short-lived OIDC
 access token. `AV_TOKEN` is available for CI; optional Basic credentials use

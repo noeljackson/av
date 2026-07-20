@@ -40,7 +40,7 @@ enum Command {
     Logout,
     /// List profiles available to the current identity.
     Profiles,
-    /// An unknown first word is treated as a profile: av codewire-dev -- cargo test.
+    /// An unknown first word is treated as a profile: av example-dev -- cargo test.
     #[command(external_subcommand)]
     Profile(Vec<OsString>),
 }
@@ -312,11 +312,11 @@ mod tests {
 
     #[test]
     fn unknown_subcommand_is_a_profile_wrapper() {
-        let cli = Cli::try_parse_from(["av", "codewire-dev", "--", "cargo", "test"]).unwrap();
+        let cli = Cli::try_parse_from(["av", "example-dev", "--", "cargo", "test"]).unwrap();
         let Some(Command::Profile(arguments)) = cli.command else {
             panic!("expected profile command");
         };
-        assert_eq!(arguments[0], OsString::from("codewire-dev"));
+        assert_eq!(arguments[0], OsString::from("example-dev"));
         assert_eq!(arguments[1], OsString::from("--"));
         assert_eq!(arguments[2], OsString::from("cargo"));
         assert_eq!(arguments[3], OsString::from("test"));

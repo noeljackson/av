@@ -86,6 +86,9 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/v1/profiles/{profile}/secrets", get(profile_secrets))
         .route("/v1/proxy/{route}/{*path}", any(proxy))
         .route("/v1/{*path}", any(api_not_found))
+        .fallback_service(
+            ServeDir::new(&ui_dir).not_found_service(ServeFile::new(ui_dir.join("index.html"))),
+        )
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
@@ -110,9 +113,6 @@ pub async fn run(config: Config) -> Result<()> {
             HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
         ))
         .layer(TraceLayer::new_for_http())
-        .fallback_service(
-            ServeDir::new(&ui_dir).not_found_service(ServeFile::new(ui_dir.join("index.html"))),
-        )
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
