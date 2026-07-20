@@ -137,7 +137,10 @@ async fn auth_config(State(state): State<AppState>) -> impl IntoResponse {
     no_store(axum::Json(state.auth.public_config()).into_response())
 }
 
-async fn status(State(state): State<AppState>) -> impl IntoResponse {
+async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(error) = state.auth.authorize(&headers).await {
+        return unauthorized(error);
+    }
     no_store(axum::Json(public_status(&state.config)).into_response())
 }
 
@@ -539,7 +542,7 @@ mod tests {
     }
 
     #[test]
-    fn public_status_exposes_capabilities_without_connector_credentials() {
+    fn runtime_status_exposes_capabilities_without_connector_credentials() {
         let config: Config = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1:14322",
             "public_url": "http://127.0.0.1:14322",

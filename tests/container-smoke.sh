@@ -49,7 +49,11 @@ status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/profiles")
 [[ "$status" == "401" ]]
 
-status=$(curl --silent --output "$workdir/status" --write-out '%{http_code}' "$base_url/v1/status")
+status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/status")
+[[ "$status" == "401" ]]
+
+status=$(curl --silent --output "$workdir/status" --write-out '%{http_code}' \
+  --user 'operator:correct-horse-test-only' "$base_url/v1/status") # gitleaks:allow -- synthetic smoke-test credential
 [[ "$status" == "200" ]]
 grep --quiet '"basicEnabled":true' "$workdir/status"
 grep --quiet '"persistenceEnabled":false' "$workdir/status"

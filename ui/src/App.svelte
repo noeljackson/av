@@ -33,17 +33,11 @@
 
   onMount(async () => {
     try {
-      const [authConfig, runtimeStatus] = await Promise.all([
-        fetchJson<AuthConfig>("/v1/auth/config"),
-        fetchJson<RuntimeStatus>("/v1/status")
-      ]);
-      auth = authConfig;
-      runtime = runtimeStatus;
+      auth = await fetchJson<AuthConfig>("/v1/auth/config");
       sessionStorage.removeItem("av_oidc_token");
       const token = await finishOidcCallback();
-      if (token) authorization = `Bearer ${token}`;
-      if (auth.mode === "disabled") authorization = "disabled";
-      if (authorization) await loadProfiles();
+      const candidate = token ? `Bearer ${token}` : auth.mode === "disabled" ? "disabled" : "";
+      if (candidate) await loadSession(candidate);
     } catch (cause) {
       error = message(cause);
     } finally {
@@ -100,28 +94,40 @@
   }
 
   async function loginBasic() {
-    authorization = `Basic ${btoa(`${username}:${password}`)}`;
+    const candidate = `Basic ${btoa(`${username}:${password}`)}`;
     password = "";
+    busy = true;
+    error = "";
     try {
-      await loadProfiles();
+      await loadSession(candidate);
     } catch (cause) {
-      authorization = "";
+      runtime = undefined;
+      profiles = [];
       error = message(cause);
+    } finally {
+      busy = false;
     }
   }
 
-  async function loadProfiles() {
-    profiles = await fetchJson<Profile[]>("/v1/profiles", {
-      headers: authorization === "disabled" ? {} : { authorization }
-    });
+  async function loadSession(candidate: string) {
+    const headers = candidate === "disabled" ? {} : { authorization: candidate };
+    const [runtimeStatus, availableProfiles] = await Promise.all([
+      fetchJson<RuntimeStatus>("/v1/status", { headers }),
+      fetchJson<Profile[]>("/v1/profiles", { headers })
+    ]);
+    runtime = runtimeStatus;
+    profiles = availableProfiles;
+    authorization = candidate;
   }
 
   function logout() {
     sessionStorage.removeItem("av_oidc_token");
     authorization = "";
+    runtime = undefined;
     profiles = [];
     username = "";
     password = "";
+    error = "";
   }
 
   function redirectUri() {
@@ -151,7 +157,7 @@
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; connect-src 'self' https:; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https:" />
 </svelte:head>
 
-<main>
+<main class:connected={Boolean(authorization)}>
   <nav class="topline" aria-label="AV status">
     <a class="brand" href="/" aria-label="AV home"><span>~/</span>av</a>
     <div class:linked={Boolean(authorization)} class="link-state">
@@ -160,120 +166,98 @@
     </div>
   </nav>
 
-  <section class="hero">
-    <div>
-      <p class="eyebrow">stateless connector // 0x01</p>
-      <h1>Access<br /><span>without custody.</span></h1>
-      <p class="lede">Identity enters. Scoped access exits. AV stores nothing.</p>
-    </div>
-    <div class="matrix-mark" aria-hidden="true">
-      <span>01100001 01110110</span>
-      <span>identity::verified</span>
-      <span>secrets::upstream</span>
-      <span>state::null</span>
-    </div>
-  </section>
-
-  <section class="terminal" aria-live="polite">
-    <header class="terminal-bar">
-      <span>session://av</span>
-      <span class="transport">tls // oidc // ephemeral</span>
-    </header>
-
-    {#if busy}
-      <div class="terminal-body compact">
-        <p class="command"><span>$</span> av policy inspect</p>
-        <p class="output pulse">negotiating trust boundary_</p>
-      </div>
-    {:else if error}
-      <div class="terminal-body compact error">
-        <p class="command"><span>!</span> session rejected</p>
-        <p class="output">{error}</p>
-      </div>
-    {/if}
-
-    {#if runtime}
-      <section class="runtime-matrix" aria-label="Runtime capabilities">
-        <header><span>runtime matrix</span><span>live configuration</span></header>
-        <div class="capabilities">
-          <div><span>oidc</span><strong class:on={runtime.oidcEnabled}>{runtime.oidcEnabled ? "enabled" : "disabled"}</strong></div>
-          <div><span>basic fallback</span><strong class:on={runtime.basicEnabled}>{runtime.basicEnabled ? "enabled" : "disabled"}</strong></div>
-          <div><span>persistence</span><strong class:on={runtime.persistenceEnabled}>{runtime.persistenceEnabled ? "enabled" : "disabled"}</strong></div>
-          <div><span>registration</span><strong class:on={runtime.registrationEnabled}>{runtime.registrationEnabled ? "enabled" : "disabled"}</strong></div>
-          <div><span>profiles</span><strong class:on={runtime.profileCount > 0}>{runtime.profileCount} exposed</strong></div>
-          <div><span>tier 2 proxy</span><strong class:on={runtime.proxyRoutes.length > 0}>{runtime.proxyRoutes.length > 0 ? `${runtime.proxyRoutes.length} enabled` : "disabled"}</strong></div>
+  {#if !authorization}
+    <section class="secure-screen">
+      <header class="secure-heading">
+        <span class="lock-mark" aria-hidden="true">[::]</span>
+        <div>
+          <p class="kicker">restricted</p>
+          <h1>authentication required</h1>
+          <p>Sign in to continue. Workspace details are unavailable before authentication.</p>
         </div>
-        <div class="connector-line">
-          <span>connectors</span>
-          {#each runtime.connectors as connector}
-            <code><i></i>{connector.name} / {connector.kind}</code>
-          {:else}
-            <code class="offline">none</code>
-          {/each}
-        </div>
-        {#if runtime.proxyRoutes.length > 0}
-          <div class="connector-line routes">
-            <span>proxy routes</span>
-            {#each runtime.proxyRoutes as route}<code><i></i>{route}</code>{/each}
+      </header>
+
+      <section class="terminal auth-terminal" aria-live="polite">
+        <header class="terminal-bar"><span>session://locked</span><span>access denied</span></header>
+
+        {#if busy}
+          <div class="terminal-body compact">
+            <p class="command"><span>$</span> av auth</p>
+            <p class="output pulse">checking session_</p>
+          </div>
+        {:else}
+          <div class="terminal-body auth">
+            {#if error}
+              <div class="error">
+                <p class="command"><span>!</span> authentication failed</p>
+                <p class="output">{error}</p>
+              </div>
+            {/if}
+
+            {#if auth?.mode === "oidc" || auth?.mode === "oidc_or_basic"}
+              <button class="primary" onclick={loginOidc}><span>[</span> continue with identity provider <span>]</span></button>
+            {/if}
+
+            {#if auth?.mode === "basic" || auth?.mode === "oidc_or_basic"}
+              {#if auth.mode === "oidc_or_basic"}<div class="divider"><span>or</span></div>{/if}
+              <div class="fields">
+                <label><span>user</span><input autocomplete="username" bind:value={username} /></label>
+                <label><span>pass</span><input type="password" autocomplete="current-password" bind:value={password} /></label>
+              </div>
+              <button onclick={loginBasic}><span>[</span> sign in <span>]</span></button>
+            {/if}
           </div>
         {/if}
       </section>
-    {/if}
+    </section>
+  {:else}
+    <section class="dashboard" aria-live="polite">
+      <header class="dashboard-heading">
+        <div><p class="kicker">authenticated session</p><h1>runtime</h1></div>
+        <button class="quiet" onclick={logout}>disconnect</button>
+      </header>
 
-    {#if auth && !authorization}
-      <div class="terminal-body auth">
-        <p class="command"><span>$</span> av auth status</p>
-        <div class="readout">
-          <span>identity</span><strong>unbound</strong>
-          <span>provider</span><strong>{auth.mode.includes("oidc") ? "zitadel" : "local"}</strong>
-          <span>credential store</span><strong>none</strong>
-        </div>
+      {#if busy}
+        <section class="terminal"><div class="terminal-body compact"><p class="output pulse">loading authorized workspace_</p></div></section>
+      {:else if error}
+        <section class="terminal"><div class="terminal-body compact error"><p class="command"><span>!</span> session rejected</p><p class="output">{error}</p></div></section>
+      {:else if runtime}
+        <section class="terminal">
+          <section class="runtime-matrix" aria-label="Runtime capabilities">
+            <header><span>runtime matrix</span><span>authorized view</span></header>
+            <div class="capabilities">
+              <div><span>oidc</span><strong class:on={runtime.oidcEnabled}>{runtime.oidcEnabled ? "enabled" : "disabled"}</strong></div>
+              <div><span>basic fallback</span><strong class:on={runtime.basicEnabled}>{runtime.basicEnabled ? "enabled" : "disabled"}</strong></div>
+              <div><span>persistence</span><strong class:on={runtime.persistenceEnabled}>{runtime.persistenceEnabled ? "enabled" : "disabled"}</strong></div>
+              <div><span>registration</span><strong class:on={runtime.registrationEnabled}>{runtime.registrationEnabled ? "enabled" : "disabled"}</strong></div>
+              <div><span>profiles</span><strong class:on={runtime.profileCount > 0}>{runtime.profileCount} exposed</strong></div>
+              <div><span>tier 2 proxy</span><strong class:on={runtime.proxyRoutes.length > 0}>{runtime.proxyRoutes.length > 0 ? `${runtime.proxyRoutes.length} enabled` : "disabled"}</strong></div>
+            </div>
+            <div class="connector-line">
+              <span>connectors</span>
+              {#each runtime.connectors as connector}<code><i></i>{connector.name} / {connector.kind}</code>{:else}<code class="offline">none</code>{/each}
+            </div>
+            {#if runtime.proxyRoutes.length > 0}
+              <div class="connector-line routes"><span>proxy routes</span>{#each runtime.proxyRoutes as route}<code><i></i>{route}</code>{/each}</div>
+            {/if}
+          </section>
 
-        {#if auth.mode === "oidc" || auth.mode === "oidc_or_basic"}
-          <button class="primary" onclick={loginOidc}><span>[</span> authenticate with zitadel <span>]</span></button>
-        {/if}
-
-        {#if auth.mode === "basic" || auth.mode === "oidc_or_basic"}
-          <div class="divider"><span>fallback channel</span></div>
-          <div class="fields">
-            <label><span>user</span><input autocomplete="username" bind:value={username} /></label>
-            <label><span>pass</span><input type="password" autocomplete="current-password" bind:value={password} /></label>
+          <div class="terminal-body connected">
+            <div class="session-row"><div><p class="command"><span>$</span> av profiles --available</p><p class="output"><span class="verified">verified</span> // ephemeral session active</p></div></div>
+            <div class="profiles">
+              {#each profiles as profile, index}
+                <article class="profile">
+                  <div class="profile-index">{String(index + 1).padStart(2, "0")}</div>
+                  <div class="profile-name"><h2>{profile.name}</h2><p>{profile.environment} // {profile.path}</p></div>
+                  <code>av {profile.name} -- command</code>
+                </article>
+              {:else}
+                <p class="empty">no profiles available_</p>
+              {/each}
+            </div>
           </div>
-          <button onclick={loginBasic}><span>[</span> authenticate locally <span>]</span></button>
-        {/if}
-      </div>
-    {/if}
-
-    {#if authorization}
-      <div class="terminal-body connected">
-        <div class="session-row">
-          <div>
-            <p class="command"><span>$</span> av profiles --available</p>
-            <p class="output"><span class="verified">verified</span> // ephemeral session active</p>
-          </div>
-          <button class="quiet" onclick={logout}>disconnect</button>
-        </div>
-
-        <div class="profiles">
-          {#each profiles as profile, index}
-            <article class="profile">
-              <div class="profile-index">{String(index + 1).padStart(2, "0")}</div>
-              <div class="profile-name">
-                <h2>{profile.name}</h2>
-                <p>{profile.environment} // {profile.path}</p>
-              </div>
-              <code>av {profile.name} -- command</code>
-            </article>
-          {:else}
-            <p class="empty">no profiles exposed by this connector_</p>
-          {/each}
-        </div>
-      </div>
-    {/if}
-  </section>
-
-  <footer>
-    <span>no vault // no registration // no persistence</span>
-    <span>connector online</span>
-  </footer>
+        </section>
+      {/if}
+    </section>
+  {/if}
 </main>
