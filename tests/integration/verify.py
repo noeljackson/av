@@ -47,7 +47,8 @@ def wait_for_av():
 
 def main():
     wait_for_av()
-    _, status, headers = request("/v1/status", auth=False)
+    _, _, _ = request("/v1/status", auth=False, accepted=(401,))
+    _, status, headers = request("/v1/status")
     assert status["basicEnabled"] is True
     assert status["persistenceEnabled"] is False
     assert status["registrationEnabled"] is False
