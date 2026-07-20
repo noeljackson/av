@@ -25,6 +25,18 @@ for _ in {1..30}; do
 done
 curl --fail --silent "$base_url/healthz" >/dev/null
 
+curl --fail --silent --dump-header "$workdir/root-headers" \
+  --output /dev/null "$base_url/"
+for header in \
+  cache-control \
+  content-security-policy \
+  x-content-type-options \
+  referrer-policy \
+  permissions-policy
+do
+  grep --ignore-case --quiet "^${header}:" "$workdir/root-headers"
+done
+
 status=$(curl --silent --output "$workdir/profiles" --write-out '%{http_code}' \
   --user 'operator:correct-horse-test-only' "$base_url/v1/profiles") # gitleaks:allow -- synthetic smoke-test credential
 [[ "$status" == "200" ]]

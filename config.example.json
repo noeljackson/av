@@ -47,16 +47,16 @@
       "secret_path": "/",
       "allowed_keys": []
     },
-    "codewire-dev": {
+    "example-dev": {
       "connector": "platform",
-      "project_id": "existing-codewire-project-id",
+      "project_id": "existing-application-project-id",
       "environment": "dev",
       "secret_path": "/",
       "allowed_keys": []
     },
-    "codewire-prod": {
+    "example-prod": {
       "connector": "platform",
-      "project_id": "existing-codewire-project-id",
+      "project_id": "existing-application-project-id",
       "environment": "prod",
       "secret_path": "/",
       "allowed_keys": []
