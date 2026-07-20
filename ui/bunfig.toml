@@ -1,0 +1,6 @@
+[install]
+ignoreScripts = true
+exact = true
+linker = "isolated"
+minimumReleaseAge = 2592000
+minimumReleaseAgeExcludes = []

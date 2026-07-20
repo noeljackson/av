@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo=${AV_INSTALL_REPOSITORY:-noeljackson/av}
+version=${AV_VERSION:-}
+destination=${AV_INSTALL_DIR:-"$HOME/.local/bin"}
+
+for command in gh sha256sum tar install; do
+  command -v "$command" >/dev/null 2>&1 || {
+    printf 'required command is missing: %s\n' "$command" >&2
+    exit 1
+  }
+done
+
+if [[ -z "$version" ]]; then
+  version=$(gh release view --repo "$repo" --json tagName --jq .tagName)
+fi
+[[ "$version" == v* ]] || {
+  printf 'AV_VERSION must be a v-prefixed release tag\n' >&2
+  exit 1
+}
+
+case $(uname -m) in
+  x86_64) target=x86_64-unknown-linux-gnu ;;
+  *)
+    printf 'no published av binary for architecture %s\n' "$(uname -m)" >&2
+    exit 1
+    ;;
+esac
+
+archive="av-${version}-${target}.tar.gz"
+cache_root=${XDG_CACHE_HOME:-"$HOME/.cache"}/av/install
+mkdir -p "$cache_root" "$destination"
+workdir=$(mktemp -d "$cache_root/XXXXXXXX")
+trap 'rm -rf "$workdir"' EXIT
+
+gh release download "$version" --repo "$repo" --dir "$workdir" \
+  --pattern "$archive" --pattern "$archive.sha256" --clobber
+(
+  cd "$workdir"
+  sha256sum --check "$archive.sha256"
+  gh attestation verify "$archive" --repo "$repo" >/dev/null
+  tar -xzf "$archive" av
+)
+install -m 0755 "$workdir/av" "$destination/av"
+printf 'installed verified av %s to %s/av\n' "$version" "$destination"

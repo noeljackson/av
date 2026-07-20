@@ -1,0 +1,83 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/noeljackson/av
+  tag: "0.1.0"
+  digest: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: true
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 14322
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: av.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+
+credentialSecrets: []
+# - name: av-basic
+#   secretName: av-basic
+#   mountPath: /var/run/av/basic
+
+config:
+  listen: "0.0.0.0:14322"
+  public_url: "https://av.example.com"
+  ui_dir: "/app/ui"
+  auth:
+    mode: oidc
+    issuer: "https://zitadel.example.com"
+    client_id: "replace-me"
+    audiences: ["replace-me"]
+    scopes: ["openid", "profile", "email", "groups"]
+    allowed_groups: ["av-users"]
+    group_claim: groups
+    basic_users: []
+  connectors: {}
+  profiles: {}
+  proxy_routes: {}
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 48Mi
+  limits:
+    cpu: 500m
+    memory: 192Mi
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: ["ALL"]
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 65532
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

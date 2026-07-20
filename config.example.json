@@ -1,0 +1,81 @@
+{
+  "listen": "127.0.0.1:14322",
+  "public_url": "http://127.0.0.1:14322",
+  "ui_dir": "ui/dist",
+  "auth": {
+    "mode": "oidc_or_basic",
+    "issuer": "https://zitadel.example.com",
+    "client_id": "av-public-client",
+    "audiences": ["av-public-client"],
+    "scopes": ["openid", "profile", "email", "groups"],
+    "allowed_groups": ["av-users"],
+    "group_claim": "groups",
+    "basic_users": [
+      {
+        "username": "break-glass",
+        "password_file": "/var/run/av/basic/password"
+      }
+    ]
+  },
+  "connectors": {
+    "platform": {
+      "kind": "infisical",
+      "base_url": "https://infisical.example.com",
+      "auth": {
+        "type": "kubernetes",
+        "identity_id": "replace-with-existing-infisical-identity-id",
+        "token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token"
+      }
+    },
+    "openbao": {
+      "kind": "openbao",
+      "base_url": "https://openbao.example.com",
+      "namespace": "",
+      "auth": {
+        "type": "kubernetes",
+        "role": "av",
+        "token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
+        "mount_path": "kubernetes"
+      }
+    }
+  },
+  "profiles": {
+    "infra": {
+      "connector": "platform",
+      "project_id": "existing-infrastructure-project-id",
+      "environment": "prod",
+      "secret_path": "/",
+      "allowed_keys": []
+    },
+    "codewire-dev": {
+      "connector": "platform",
+      "project_id": "existing-codewire-project-id",
+      "environment": "dev",
+      "secret_path": "/",
+      "allowed_keys": []
+    },
+    "codewire-prod": {
+      "connector": "platform",
+      "project_id": "existing-codewire-project-id",
+      "environment": "prod",
+      "secret_path": "/",
+      "allowed_keys": []
+    },
+    "openbao-infra": {
+      "connector": "openbao",
+      "secret_path": "secret/data/infra",
+      "allowed_keys": []
+    }
+  },
+  "proxy_routes": {
+    "cloudflare-dns": {
+      "profile": "infra",
+      "base_url": "https://api.cloudflare.com/client/v4",
+      "secret_key": "CLOUDFLARE_API_TOKEN",
+      "header": "Authorization",
+      "header_prefix": "Bearer ",
+      "allowed_methods": ["GET", "POST", "PUT", "PATCH"],
+      "allowed_path_prefixes": ["/zones/"]
+    }
+  }
+}

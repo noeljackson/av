@@ -1,0 +1,233 @@
+#!/usr/bin/env python3
+import json
+import os
+import pathlib
+import time
+import urllib.error
+import urllib.request
+
+INFISICAL_URL = os.environ["INFISICAL_URL"].rstrip("/")
+OPENBAO_URL = os.environ["OPENBAO_URL"].rstrip("/")
+OPENBAO_ROOT_TOKEN = os.environ["OPENBAO_ROOT_TOKEN"]
+STATE = pathlib.Path("/state")
+
+
+def request(base, path, method="GET", payload=None, token=None, accepted=(200,)):
+    body = None if payload is None else json.dumps(payload).encode()
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = urllib.request.Request(base + path, data=body, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            status = response.status
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        status = error.code
+        raw = error.read()
+    if status not in accepted:
+        raise RuntimeError(f"{method} {path} returned HTTP {status}")
+    return json.loads(raw) if raw else {}
+
+
+def bao_request(path, method="GET", payload=None, accepted=(200, 204)):
+    body = None if payload is None else json.dumps(payload).encode()
+    req = urllib.request.Request(
+        OPENBAO_URL + path,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "X-Vault-Token": OPENBAO_ROOT_TOKEN,
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as response:
+            status = response.status
+            raw = response.read()
+    except urllib.error.HTTPError as error:
+        status = error.code
+        raw = error.read()
+    if status not in accepted:
+        raise RuntimeError(f"{method} {path} returned HTTP {status}")
+    return json.loads(raw) if raw else {}
+
+
+def write_secret(name, value):
+    path = STATE / name
+    path.write_text(value + "\n", encoding="utf-8")
+    path.chmod(0o444)
+
+
+def bootstrap_infisical():
+    result = request(
+        INFISICAL_URL,
+        "/api/v1/admin/bootstrap",
+        method="POST",
+        payload={
+            "email": "av-integration@example.invalid",
+            "password": "integration-only-admin-password",
+            "organization": "AV Integration",
+        },
+    )
+    token = result["identity"]["credentials"]["token"]
+    project = request(
+        INFISICAL_URL,
+        "/api/v1/projects",
+        method="POST",
+        token=token,
+        payload={
+            "projectName": "AV Integration",
+            "projectDescription": "Disposable AV connector integration test",
+            "slug": "av-integration",
+            "template": "default",
+            "type": "secret-manager",
+            "shouldCreateDefaultEnvs": True,
+        },
+    )["project"]
+    environment = next(
+        (entry["slug"] for entry in project.get("environments", []) if entry["slug"] == "dev"),
+        None,
+    )
+    if environment is None:
+        environment = "dev"
+        request(
+            INFISICAL_URL,
+            f"/api/v1/projects/{project['id']}/environments",
+            method="POST",
+            token=token,
+            payload={"name": "Development", "slug": environment},
+        )
+    request(
+        INFISICAL_URL,
+        "/api/v4/secrets/INFISICAL_MARKER",
+        method="POST",
+        token=token,
+        payload={
+            "projectId": project["id"],
+            "environment": environment,
+            "secretPath": "/",
+            "secretValue": "infisical-ok",
+        },
+    )
+    write_secret("infisical-token", token)
+    return project["id"], environment
+
+
+def bootstrap_openbao():
+    auth_mounts = bao_request("/v1/sys/auth")
+    if "approle/" not in auth_mounts:
+        bao_request("/v1/sys/auth/approle", method="POST", payload={"type": "approle"})
+    mounts = bao_request("/v1/sys/mounts")
+    if "secret/" not in mounts:
+        bao_request(
+            "/v1/sys/mounts/secret",
+            method="POST",
+            payload={"type": "kv", "options": {"version": "2"}},
+        )
+    bao_request(
+        "/v1/sys/policies/acl/av-integration",
+        method="PUT",
+        payload={
+            "policy": 'path "secret/data/av-integration" { capabilities = ["read"] }'
+        },
+    )
+    bao_request(
+        "/v1/secret/data/av-integration",
+        method="POST",
+        payload={"data": {"OPENBAO_MARKER": "openbao-ok"}},
+    )
+    bao_request(
+        "/v1/auth/approle/role/av-integration",
+        method="POST",
+        payload={
+            "token_policies": ["av-integration"],
+            "token_ttl": "5m",
+            "token_max_ttl": "10m",
+            "secret_id_ttl": "10m",
+        },
+    )
+    role_id = bao_request("/v1/auth/approle/role/av-integration/role-id")["data"]["role_id"]
+    secret_id = bao_request(
+        "/v1/auth/approle/role/av-integration/secret-id", method="POST", payload={}
+    )["data"]["secret_id"]
+    write_secret("openbao-role-id", role_id)
+    write_secret("openbao-secret-id", secret_id)
+
+
+def write_config(project_id, environment):
+    password = "integration-only-av-password"
+    write_secret("av-password", password)
+    config = {
+        "listen": "0.0.0.0:14322",
+        "public_url": "http://127.0.0.1:14322",
+        "ui_dir": "/app/ui",
+        "auth": {
+            "mode": "basic",
+            "issuer": "",
+            "client_id": "",
+            "audiences": [],
+            "scopes": [],
+            "allowed_groups": [],
+            "group_claim": "groups",
+            "basic_users": [
+                {"username": "operator", "password_file": "/state/av-password"}
+            ],
+        },
+        "connectors": {
+            "infisical": {
+                "kind": "infisical",
+                "base_url": INFISICAL_URL,
+                "auth": {"type": "token", "token_file": "/state/infisical-token"},
+            },
+            "openbao": {
+                "kind": "openbao",
+                "base_url": OPENBAO_URL,
+                "auth": {
+                    "type": "approle",
+                    "role_id_file": "/state/openbao-role-id",
+                    "secret_id_file": "/state/openbao-secret-id",
+                },
+            },
+        },
+        "profiles": {
+            "infisical-integration": {
+                "connector": "infisical",
+                "project_id": project_id,
+                "environment": environment,
+                "secret_path": "/",
+                "allowed_keys": ["INFISICAL_MARKER"],
+            },
+            "openbao-integration": {
+                "connector": "openbao",
+                "secret_path": "secret/data/av-integration",
+                "allowed_keys": ["OPENBAO_MARKER"],
+            },
+        },
+        "proxy_routes": {
+            "openbao-upstream": {
+                "profile": "openbao-integration",
+                "base_url": "http://upstream:8081",
+                "secret_key": "OPENBAO_MARKER",
+                "header": "Authorization",
+                "header_prefix": "Bearer ",
+                "allowed_methods": ["GET"],
+                "allowed_path_prefixes": ["/verify"],
+            }
+        },
+    }
+    path = STATE / "config.json"
+    path.write_text(json.dumps(config, separators=(",", ":")), encoding="utf-8")
+    path.chmod(0o444)
+
+
+def main():
+    STATE.mkdir(parents=True, exist_ok=True)
+    project_id, environment = bootstrap_infisical()
+    bootstrap_openbao()
+    write_config(project_id, environment)
+    print("connector_setup=ok")
+
+
+if __name__ == "__main__":
+    main()

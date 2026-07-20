@@ -1,0 +1,13 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "dependencyDashboard": true,
+  "enabledManagers": ["cargo", "bun", "dockerfile", "github-actions", "helmv3", "rust-toolchain"],
+  "internalChecksFilter": "strict",
+  "minimumReleaseAge": "30 days",
+  "rangeStrategy": "pin",
+  "prConcurrentLimit": 3,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "minimumReleaseAge": null
+  }
+}

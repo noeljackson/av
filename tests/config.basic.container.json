@@ -1,0 +1,40 @@
+{
+  "listen": "0.0.0.0:14322",
+  "public_url": "http://127.0.0.1:17422",
+  "ui_dir": "/app/ui",
+  "auth": {
+    "mode": "basic",
+    "issuer": "",
+    "client_id": "",
+    "audiences": [],
+    "scopes": [],
+    "allowed_groups": [],
+    "group_claim": "groups",
+    "basic_users": [
+      {
+        "username": "operator",
+        "password_file": "/run/av/password"
+      }
+    ]
+  },
+  "connectors": {
+    "infisical": {
+      "base_url": "https://infisical.example.com",
+      "auth": {
+        "type": "kubernetes",
+        "identity_id": "container-smoke",
+        "token_file": "/run/av/unused-token"
+      }
+    }
+  },
+  "profiles": {
+    "container-smoke": {
+      "connector": "infisical",
+      "project_id": "container-smoke",
+      "environment": "test",
+      "secret_path": "/",
+      "allowed_keys": []
+    }
+  },
+  "proxy_routes": {}
+}
