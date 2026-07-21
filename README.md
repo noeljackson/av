@@ -51,6 +51,12 @@ origin. Redirect and credential-bearing response headers are never forwarded.
 There is no arbitrary destination parameter. Hetzner is intentionally not part
 of the initial route set.
 
+All `/v1/*` requests pass through a bounded in-process token bucket before
+authentication or connector work. The defaults allow 50 requests per second
+with a burst of 100 per AV process. Keep an ingress per-client limit as the
+outer layer; the application limit is a global circuit breaker, not a
+distributed client quota.
+
 ## Authentication
 
 Production mode is `oidc` or `oidc_or_basic`. OIDC discovery, an explicit
@@ -62,6 +68,8 @@ callback, normally `https://av.tail.noel.sh/`.
 
 Basic auth is optional and static: usernames are config and mounted files hold
 Argon2id PHC hashes, never plaintext passwords. Hashes are validated at startup.
+AV accepts only bounded Argon2id v19 parameters (19–64 MiB, 2–6 iterations,
+parallelism 1–4), and password verification is limited to two concurrent jobs.
 There is no sign-up endpoint. Disabled auth is rejected unless the listener is loopback and
 `AV_ALLOW_INSECURE_AUTH=1` is explicitly set.
 

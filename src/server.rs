@@ -9,8 +9,9 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{any, get},
 };
@@ -19,7 +20,10 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 use serde::Serialize;
-use tokio::sync::Semaphore;
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::Instant,
+};
 use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
@@ -38,7 +42,47 @@ struct AppState {
     auth: Authenticator,
     connectors: Arc<BTreeMap<String, Connector>>,
     connector_slots: Arc<Semaphore>,
+    api_rate_limiter: ApiRateLimiter,
     proxy_client: reqwest::Client,
+}
+
+#[derive(Clone)]
+struct ApiRateLimiter {
+    rate_per_second: f64,
+    capacity: f64,
+    state: Arc<Mutex<ApiRateLimitState>>,
+}
+
+struct ApiRateLimitState {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl ApiRateLimiter {
+    fn new(rate_per_second: u32, burst: u32) -> Self {
+        Self {
+            rate_per_second: f64::from(rate_per_second),
+            capacity: f64::from(burst),
+            state: Arc::new(Mutex::new(ApiRateLimitState {
+                tokens: f64::from(burst),
+                last_refill: Instant::now(),
+            })),
+        }
+    }
+
+    async fn try_acquire(&self) -> bool {
+        let mut state = self.state.lock().await;
+        let now = Instant::now();
+        state.tokens = (state.tokens
+            + now.duration_since(state.last_refill).as_secs_f64() * self.rate_per_second)
+            .min(self.capacity);
+        state.last_refill = now;
+        if state.tokens < 1.0 {
+            return false;
+        }
+        state.tokens -= 1.0;
+        true
+    }
 }
 
 #[derive(Serialize)]
@@ -58,6 +102,8 @@ struct PublicStatus {
     connectors: Vec<PublicConnector>,
     profile_count: usize,
     proxy_routes: Vec<String>,
+    api_rate_limit_per_second: u32,
+    api_rate_limit_burst: u32,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -87,6 +133,10 @@ pub async fn run(config: Config) -> Result<()> {
         auth,
         connectors: Arc::new(connectors),
         connector_slots: Arc::new(Semaphore::new(config.max_connector_concurrency)),
+        api_rate_limiter: ApiRateLimiter::new(
+            config.api_rate_limit_per_second,
+            config.api_rate_limit_burst,
+        ),
         proxy_client,
     };
     let ui_dir = PathBuf::from(&config.ui_dir);
@@ -103,6 +153,10 @@ pub async fn run(config: Config) -> Result<()> {
             ServeDir::new(&ui_dir).not_found_service(ServeFile::new(ui_dir.join("index.html"))),
         )
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            enforce_api_rate_limit,
+        ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-store"),
@@ -157,6 +211,22 @@ async fn api_not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "api endpoint not found\n")
 }
 
+async fn enforce_api_rate_limit(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path().starts_with("/v1/") && !state.api_rate_limiter.try_acquire().await {
+        let mut response =
+            (StatusCode::TOO_MANY_REQUESTS, "api rate limit exceeded\n").into_response();
+        response
+            .headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        return no_store(response);
+    }
+    next.run(request).await
+}
+
 async fn auth_config(State(state): State<AppState>) -> impl IntoResponse {
     no_store(axum::Json(state.auth.public_config()).into_response())
 }
@@ -184,6 +254,8 @@ fn public_status(config: &Config) -> PublicStatus {
             .collect(),
         profile_count: config.profiles.len(),
         proxy_routes: config.proxy_routes.keys().cloned().collect(),
+        api_rate_limit_per_second: config.api_rate_limit_per_second,
+        api_rate_limit_burst: config.api_rate_limit_burst,
     }
 }
 
@@ -756,12 +828,22 @@ mod tests {
         );
         assert_eq!(status.profile_count, 0);
         assert!(status.proxy_routes.is_empty());
+        assert_eq!(status.api_rate_limit_per_second, 50);
+        assert_eq!(status.api_rate_limit_burst, 100);
         let policy = content_security_policy(&config).unwrap();
         let policy = policy.to_str().unwrap();
         assert_eq!(
             policy,
             "default-src 'self'; connect-src 'self' https://identity.example.com; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
         );
+    }
+
+    #[tokio::test]
+    async fn application_rate_limiter_enforces_its_burst_capacity() {
+        let limiter = ApiRateLimiter::new(1, 2);
+        assert!(limiter.try_acquire().await);
+        assert!(limiter.try_acquire().await);
+        assert!(!limiter.try_acquire().await);
     }
 
     #[test]
