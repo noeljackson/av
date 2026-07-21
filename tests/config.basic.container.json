@@ -8,12 +8,13 @@
     "client_id": "",
     "audiences": [],
     "scopes": [],
+    "signing_algorithms": ["RS256"],
     "allowed_groups": [],
     "group_claim": "groups",
     "basic_users": [
       {
         "username": "operator",
-        "password_file": "/run/av/password"
+        "password_hash_file": "/run/av/password.argon2id"
       }
     ]
   },

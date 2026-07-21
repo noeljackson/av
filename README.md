@@ -9,13 +9,14 @@ switching a profile between them does not change the CLI or proxy contract.
 
 | Tier | `av` behavior | Credential exposure |
 |---|---|---|
-| 1 — dynamic | OpenBao reads, including dynamic-secret response data | Generated values are limited by the backend lease |
-| 2 — proxy | Fixed HTTPS origin, method/path allowlist, server-side header injection | Credential never enters the caller |
+| 1 — dynamic | Reserved for lease-aware OpenBao engines | Not enabled until AV can revoke and renew leases |
+| 2 — proxy | Fixed HTTPS origin and explicit method/path/query/header/content policy | Credential never enters the caller |
 | 3 — process environment | Authenticated profile lease followed by local child-process execution | Only the `av` process and its child receive values |
 
 An Infisical profile maps directly to an existing project, environment, and
-path; no dedicated `av` project is required. OpenBao profiles map to an API
-secret path such as `secret/data/infra` or `database/creds/read-only`.
+path; no dedicated `av` project is required. OpenBao profiles currently map to
+non-leased KV API paths such as `secret/data/infra`. Responses carrying a lease
+are rejected until AV implements lease ownership and revocation.
 
 ## Daily use
 
@@ -43,23 +44,25 @@ For Tier 2, callers use a named route:
 https://av.tail.noel.sh/v1/proxy/cloudflare-dns/zones/<zone>/dns_records
 ```
 
-The caller supplies its OIDC bearer token. `av` strips caller authorization,
-cookies, hop-by-hop headers, and redirects; checks the configured method/path;
-then injects the Infisical credential at the fixed upstream origin. There is no
-arbitrary destination parameter. Hetzner is intentionally not part of the
-initial route set.
+The caller supplies its OIDC bearer token. `av` forwards only explicitly
+allowlisted headers and query keys, checks method, canonical path, content type,
+and body size, then inserts exactly one credential header at the fixed upstream
+origin. Redirect and credential-bearing response headers are never forwarded.
+There is no arbitrary destination parameter. Hetzner is intentionally not part
+of the initial route set.
 
 ## Authentication
 
-Production mode is `oidc` or `oidc_or_basic`. OIDC discovery, JWT signature,
-issuer, audience, expiry, and group membership are verified by the server. The
+Production mode is `oidc` or `oidc_or_basic`. OIDC discovery, an explicit
+asymmetric signing-algorithm allowlist, JWT signature, issuer, audience, expiry,
+and group membership are verified by the server. The
 browser UI uses Authorization Code + PKCE; the CLI uses Device Authorization.
 Configure both grants on the Zitadel public client and register the exact UI
 callback, normally `https://av.tail.noel.sh/`.
 
-Basic auth is optional and static: usernames are config, password values are
-read from mounted files on every request. There is no sign-up endpoint. Disabled
-auth is rejected unless the listener is loopback and
+Basic auth is optional and static: usernames are config and mounted files hold
+Argon2id PHC hashes, never plaintext passwords. Hashes are validated at startup.
+There is no sign-up endpoint. Disabled auth is rejected unless the listener is loopback and
 `AV_ALLOW_INSECURE_AUTH=1` is explicitly set.
 
 ## Configuration
@@ -95,12 +98,15 @@ cargo clippy --locked --all-targets -- -D warnings
 supplychain verify-bun --minimum-age-days=30 --baseline=../.supplychain/bun-baseline.json ui
 helm lint chart/av
 tests/connector-integration.sh
+tests/security-scan.sh
 ```
 
 The integration runner starts separate pinned containers for AV, Infisical,
 Postgres, Redis, OpenBao, and a credential-aware upstream. It bootstraps only
 disposable test data on an internal Docker network, verifies both connector
-reads plus Tier 2 injection, and removes containers and volumes on exit.
+reads plus hostile Tier 2 behavior, and removes containers and volumes on exit.
+The security runner adds a pinned, isolated ZAP passive scan. See
+[`SECURITY.md`](SECURITY.md) for the trust boundaries and test procedure.
 
 Install or update the CLI repeatedly from an attested release without a
 `curl | sh` path:

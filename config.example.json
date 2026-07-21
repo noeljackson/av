@@ -7,13 +7,14 @@
     "issuer": "https://zitadel.example.com",
     "client_id": "av-public-client",
     "audiences": ["av-public-client"],
-    "scopes": ["openid", "profile", "email", "groups"],
+    "scopes": ["openid", "groups"],
+    "signing_algorithms": ["RS256"],
     "allowed_groups": ["av-users"],
     "group_claim": "groups",
     "basic_users": [
       {
         "username": "break-glass",
-        "password_file": "/var/run/av/basic/password"
+        "password_hash_file": "/var/run/av/basic/password.argon2id"
       }
     ]
   },
@@ -75,7 +76,13 @@
       "header": "Authorization",
       "header_prefix": "Bearer ",
       "allowed_methods": ["GET", "POST", "PUT", "PATCH"],
-      "allowed_path_prefixes": ["/zones/"]
+      "allowed_path_prefixes": ["/zones/"],
+      "allowed_request_headers": ["accept", "content-type", "if-match", "if-none-match"],
+      "allowed_response_headers": ["content-type", "etag", "last-modified", "retry-after"],
+      "allowed_query_parameters": ["page", "per_page", "type", "name"],
+      "allowed_content_types": ["application/json"],
+      "max_body_bytes": 1048576
     }
-  }
+  },
+  "max_connector_concurrency": 16
 }

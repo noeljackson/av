@@ -35,6 +35,12 @@ struct AuthDetails {
 #[derive(Deserialize)]
 struct SecretResponse {
     data: Value,
+    #[serde(default)]
+    lease_id: String,
+    #[serde(default)]
+    renewable: bool,
+    #[serde(default)]
+    lease_duration: u64,
 }
 
 impl OpenBaoConnector {
@@ -75,7 +81,7 @@ impl OpenBaoConnector {
             );
         }
         let response: SecretResponse = response.json().await.context("decode OpenBao response")?;
-        decode_secret_data(response.data, &profile.allowed_keys)
+        decode_secret_response(response, &profile.allowed_keys)
     }
 
     async fn authenticate(&self) -> Result<String> {
@@ -151,6 +157,16 @@ impl OpenBaoConnector {
     }
 }
 
+fn decode_secret_response(
+    response: SecretResponse,
+    allowed_keys: &[String],
+) -> Result<BTreeMap<String, String>> {
+    if !response.lease_id.is_empty() || response.renewable || response.lease_duration > 0 {
+        bail!("OpenBao dynamic secret leases are not supported yet");
+    }
+    decode_secret_data(response.data, allowed_keys)
+}
+
 fn decode_secret_data(data: Value, allowed_keys: &[String]) -> Result<BTreeMap<String, String>> {
     let root = data
         .as_object()
@@ -204,12 +220,14 @@ mod tests {
     }
 
     #[test]
-    fn decodes_dynamic_secret_data() {
-        let data = serde_json::json!({"username": "leased-user", "ttl": 60, "active": true});
-        let secrets = decode_secret_data(data, &[]).unwrap();
-        assert_eq!(secrets.get("username").unwrap(), "leased-user");
-        assert_eq!(secrets.get("ttl").unwrap(), "60");
-        assert_eq!(secrets.get("active").unwrap(), "true");
+    fn rejects_unmanaged_dynamic_secret_leases() {
+        let response = SecretResponse {
+            data: serde_json::json!({"username": "leased-user", "password": "synthetic"}),
+            lease_id: "database/creds/example/lease".into(),
+            renewable: true,
+            lease_duration: 60,
+        };
+        assert!(decode_secret_response(response, &[]).is_err());
     }
 
     #[test]

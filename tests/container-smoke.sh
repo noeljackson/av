@@ -6,15 +6,15 @@ container="av-container-smoke-$$"
 workdir=$(mktemp -d)
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$workdir"' EXIT
 
-printf '%s\n' 'correct-horse-test-only' >"$workdir/password"
-chmod 0444 "$workdir/password"
+printf '%s\n' '$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc' >"$workdir/password.argon2id"
+chmod 0444 "$workdir/password.argon2id"
 
 [[ $(docker image inspect "$image" --format '{{.Config.User}}') == "65532:65532" ]]
 
 docker run --detach --name "$container" \
   --publish 127.0.0.1::14322 \
   --mount "type=bind,src=$PWD/tests/config.basic.container.json,dst=/etc/av/config.json,readonly" \
-  --mount "type=bind,src=$workdir/password,dst=/run/av/password,readonly" \
+  --mount "type=bind,src=$workdir/password.argon2id,dst=/run/av/password.argon2id,readonly" \
   "$image" serve --config /etc/av/config.json >/dev/null
 
 port=$(docker port "$container" 14322/tcp | awk -F: 'NR == 1 {print $NF}')
@@ -38,7 +38,7 @@ do
 done
 
 status=$(curl --silent --output "$workdir/profiles" --write-out '%{http_code}' \
-  --user 'operator:correct-horse-test-only' "$base_url/v1/profiles") # gitleaks:allow -- synthetic smoke-test credential
+  --user 'operator:password' "$base_url/v1/profiles") # gitleaks:allow -- synthetic smoke-test credential
 [[ "$status" == "200" ]]
 grep --quiet '"name":"container-smoke"' "$workdir/profiles"
 
@@ -53,7 +53,7 @@ status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/
 [[ "$status" == "401" ]]
 
 status=$(curl --silent --output "$workdir/status" --write-out '%{http_code}' \
-  --user 'operator:correct-horse-test-only' "$base_url/v1/status") # gitleaks:allow -- synthetic smoke-test credential
+  --user 'operator:password' "$base_url/v1/status") # gitleaks:allow -- synthetic smoke-test credential
 [[ "$status" == "200" ]]
 grep --quiet '"basicEnabled":true' "$workdir/status"
 grep --quiet '"persistenceEnabled":false' "$workdir/status"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
+import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -10,13 +11,34 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.end_headers()
             return
-        authorized = self.headers.get("Authorization") == "Bearer openbao-ok"
+        authorization = self.headers.get_all("Authorization") or []
+        authorized = authorization == ["Bearer openbao+ok"]
         query_preserved = target.query == "source=integration"
-        status = 200 if target.path == "/verify" and authorized and query_preserved else 403
+        forbidden_headers_absent = not any(
+            self.headers.get(name)
+            for name in ("X-Forwarded-Host", "X-HTTP-Method-Override", "X-Original-URL")
+        )
+        if target.path == "/verify":
+            status = 200 if authorized and query_preserved and forbidden_headers_absent else 403
+            body = b'{"injection":"accepted"}' if status == 200 else b'{"error":"forbidden"}'
+        elif target.path == "/x-header":
+            api_keys = self.headers.get_all("X-Api-Key") or []
+            status = 200 if api_keys == ["openbao+ok"] and forbidden_headers_absent else 403
+            body = b'{"singleHeader":"accepted"}' if status == 200 else b'{"error":"forbidden"}'
+        elif target.path == "/encoded" and authorized:
+            encoded = base64.b64encode(b"openbao+ok").decode()
+            percent = quote("openbao+ok", safe="")
+            status = 200
+            body = f"openbao+ok|{encoded}|{percent}".encode()
+        else:
+            status = 403
+            body = b'{"error":"forbidden"}'
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json" if body.startswith(b"{") else "text/plain")
+        self.send_header("Location", "https://hostile.example/openbao+ok")
+        self.send_header("X-Reflected-Secret", "Bearer openbao+ok")
         self.end_headers()
-        self.wfile.write(b'{"injection":"accepted"}' if status == 200 else b'{"error":"forbidden"}')
+        self.wfile.write(body)
 
     def log_message(self, _format, *_args):
         pass

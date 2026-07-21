@@ -135,7 +135,7 @@ def bootstrap_openbao():
     bao_request(
         "/v1/secret/data/av-integration",
         method="POST",
-        payload={"data": {"OPENBAO_MARKER": "openbao-ok"}},
+        payload={"data": {"OPENBAO_MARKER": "openbao+ok"}},
     )
     bao_request(
         "/v1/auth/approle/role/av-integration",
@@ -156,8 +156,10 @@ def bootstrap_openbao():
 
 
 def write_config(project_id, environment):
-    password = "integration-only-av-password"
-    write_secret("av-password", password)
+    write_secret(
+        "av-password.argon2id",
+        "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc",
+    )
     config = {
         "listen": "0.0.0.0:14322",
         "public_url": "http://127.0.0.1:14322",
@@ -168,10 +170,14 @@ def write_config(project_id, environment):
             "client_id": "",
             "audiences": [],
             "scopes": [],
+            "signing_algorithms": ["RS256"],
             "allowed_groups": [],
             "group_claim": "groups",
             "basic_users": [
-                {"username": "operator", "password_file": "/state/av-password"}
+                {
+                    "username": "operator",
+                    "password_hash_file": "/state/av-password.argon2id",
+                }
             ],
         },
         "connectors": {
@@ -212,9 +218,29 @@ def write_config(project_id, environment):
                 "header": "Authorization",
                 "header_prefix": "Bearer ",
                 "allowed_methods": ["GET"],
-                "allowed_path_prefixes": ["/verify"],
-            }
+                "allowed_path_prefixes": ["/verify", "/encoded"],
+                "allowed_request_headers": ["accept"],
+                "allowed_response_headers": ["content-type", "x-reflected-secret"],
+                "allowed_query_parameters": ["source"],
+                "allowed_content_types": [],
+                "max_body_bytes": 1024,
+            },
+            "openbao-x-api": {
+                "profile": "openbao-integration",
+                "base_url": "http://upstream:8081",
+                "secret_key": "OPENBAO_MARKER",
+                "header": "X-Api-Key",
+                "header_prefix": "",
+                "allowed_methods": ["GET"],
+                "allowed_path_prefixes": ["/x-header"],
+                "allowed_request_headers": ["accept"],
+                "allowed_response_headers": ["content-type"],
+                "allowed_query_parameters": [],
+                "allowed_content_types": [],
+                "max_body_bytes": 1024,
+            },
         },
+        "max_connector_concurrency": 4,
     }
     path = STATE / "config.json"
     path.write_text(json.dumps(config, separators=(",", ":")), encoding="utf-8")

@@ -1,0 +1,43 @@
+name: Security
+
+on:
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  adversarial:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Repository and dependency policy
+        uses: noeljackson/supplychain@dbf85be2f2efa1b265d96562d7c173b66ea08ec1
+        with:
+          path: .
+          policy: strict
+      - name: Build isolated test image
+        run: docker build --tag av:security .
+      - name: Scan AV image
+        uses: noeljackson/supplychain@dbf85be2f2efa1b265d96562d7c173b66ea08ec1
+        with:
+          scan-source: "false"
+          image: av:security
+          fail-on-severity: high
+      - name: Audit pinned ZAP test image
+        # ZAP is an untrusted, non-production test tool. Keep its upstream
+        # findings visible while its runtime boundary contains their blast radius.
+        continue-on-error: true
+        uses: noeljackson/supplychain@dbf85be2f2efa1b265d96562d7c173b66ea08ec1
+        with:
+          scan-source: "false"
+          image: ghcr.io/zaproxy/zaproxy:bare@sha256:627781353231d056d5a6305ec1f2092f54735cc654915f533d2e8d5d9d41bcb2
+          fail-on-severity: critical
+      - name: Hostile connector and authenticated DAST
+        env:
+          AV_IMAGE: av:security
+        run: tests/security-scan.sh
