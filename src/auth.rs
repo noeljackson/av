@@ -1,14 +1,19 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::http::{HeaderMap, header};
 use base64::{Engine, engine::general_purpose::STANDARD};
-use jsonwebtoken::{DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::Deserialize;
-use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::Instant,
+};
 
-use crate::config::{AuthConfig, AuthMode, PublicAuthConfig};
+use crate::config::{AuthConfig, AuthMode, OidcSigningAlgorithm, PublicAuthConfig};
+
+const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
 
 #[derive(Clone)]
 pub struct Authenticator {
@@ -16,6 +21,19 @@ pub struct Authenticator {
     client: reqwest::Client,
     discovery: Option<Discovery>,
     jwks: Arc<RwLock<Option<JwkSet>>>,
+    jwks_refresh: Arc<Mutex<JwksRefreshState>>,
+    basic_credentials: Arc<Vec<BasicCredential>>,
+}
+
+#[derive(Default)]
+struct JwksRefreshState {
+    last_attempt: Option<Instant>,
+}
+
+#[derive(Clone)]
+struct BasicCredential {
+    username: String,
+    password_hash: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -42,6 +60,7 @@ pub struct Identity {
 
 impl Authenticator {
     pub async fn new(config: AuthConfig) -> Result<Self> {
+        let basic_credentials = load_basic_credentials(&config)?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .https_only(!config.issuer.starts_with("http://127.0.0.1"))
@@ -74,9 +93,11 @@ impl Authenticator {
             client,
             discovery,
             jwks: Arc::new(RwLock::new(None)),
+            jwks_refresh: Arc::new(Mutex::new(JwksRefreshState::default())),
+            basic_credentials: Arc::new(basic_credentials),
         };
         if authenticator.discovery.is_some() {
-            authenticator.refresh_jwks().await?;
+            authenticator.refresh_jwks(true).await?;
         }
         Ok(authenticator)
     }
@@ -94,12 +115,7 @@ impl Authenticator {
             issuer: self.config.issuer.clone(),
             client_id: self.config.client_id.clone(),
             scopes: if self.config.scopes.is_empty() {
-                vec![
-                    "openid".into(),
-                    "profile".into(),
-                    "email".into(),
-                    "groups".into(),
-                ]
+                vec!["openid".into()]
             } else {
                 self.config.scopes.clone()
             },
@@ -129,23 +145,38 @@ impl Authenticator {
         if let Some(encoded) = authorization.strip_prefix("Basic ")
             && matches!(self.config.mode, AuthMode::Basic | AuthMode::OidcOrBasic)
         {
-            return self.authorize_basic(encoded);
+            return self.authorize_basic(encoded).await;
         }
         bail!("unsupported authentication scheme")
     }
 
     async fn authorize_oidc(&self, token: &str) -> Result<Identity> {
         let header = decode_header(token).context("invalid bearer token header")?;
+        let allowed_algorithms: Vec<_> = self
+            .config
+            .signing_algorithms
+            .iter()
+            .copied()
+            .map(oidc_algorithm)
+            .collect();
+        let default_algorithm = allowed_algorithms
+            .first()
+            .copied()
+            .context("OIDC has no trusted signing algorithms")?;
+        if !allowed_algorithms.contains(&header.alg) {
+            bail!("bearer token uses an untrusted signing algorithm");
+        }
         let kid = header.kid.context("bearer token has no key id")?;
 
         let mut jwk = self.find_jwk(&kid).await;
         if jwk.is_none() {
-            self.refresh_jwks().await?;
+            self.refresh_jwks(false).await?;
             jwk = self.find_jwk(&kid).await;
         }
         let jwk = jwk.context("bearer token key is not trusted")?;
         let key = DecodingKey::from_jwk(&jwk).context("unsupported OIDC signing key")?;
-        let mut validation = Validation::new(header.alg);
+        let mut validation = Validation::new(default_algorithm);
+        validation.algorithms = allowed_algorithms;
         validation.set_issuer(std::slice::from_ref(&self.config.issuer));
         let audiences = if self.config.audiences.is_empty() {
             vec![self.config.client_id.clone()]
@@ -168,7 +199,7 @@ impl Authenticator {
         })
     }
 
-    fn authorize_basic(&self, encoded: &str) -> Result<Identity> {
+    async fn authorize_basic(&self, encoded: &str) -> Result<Identity> {
         let decoded = STANDARD
             .decode(encoded)
             .context("invalid Basic authorization")?;
@@ -176,18 +207,30 @@ impl Authenticator {
         let (username, password) = decoded
             .split_once(':')
             .context("invalid Basic authorization payload")?;
-        for user in &self.config.basic_users {
-            if user.username != username {
-                continue;
-            }
-            let expected = std::fs::read_to_string(&user.password_file)
-                .with_context(|| format!("read password file for {username}"))?;
-            let expected = expected.trim_end().as_bytes();
-            if expected.len() == password.len() && expected.ct_eq(password.as_bytes()).into() {
-                return Ok(Identity {
-                    subject: format!("basic:{username}"),
-                });
-            }
+        let requested = self
+            .basic_credentials
+            .iter()
+            .find(|credential| credential.username == username);
+        let comparison = requested
+            .or_else(|| self.basic_credentials.first())
+            .context("Basic authentication has no configured credentials")?;
+        let password = password.to_owned();
+        let password_hash = comparison.password_hash.clone();
+        let valid = tokio::task::spawn_blocking(move || {
+            let hash = PasswordHash::new(&password_hash)
+                .map_err(|error| anyhow::anyhow!("parse Argon2id password hash: {error}"))?;
+            Ok::<_, anyhow::Error>(
+                Argon2::default()
+                    .verify_password(password.as_bytes(), &hash)
+                    .is_ok(),
+            )
+        })
+        .await
+        .context("join Basic password verification")??;
+        if valid && requested.is_some() {
+            return Ok(Identity {
+                subject: format!("basic:{username}"),
+            });
         }
         bail!("invalid Basic credentials")
     }
@@ -201,7 +244,16 @@ impl Authenticator {
             .cloned()
     }
 
-    async fn refresh_jwks(&self) -> Result<()> {
+    async fn refresh_jwks(&self, force: bool) -> Result<()> {
+        let mut refresh = self.jwks_refresh.lock().await;
+        if !force
+            && refresh
+                .last_attempt
+                .is_some_and(|attempt| attempt.elapsed() < JWKS_REFRESH_COOLDOWN)
+        {
+            return Ok(());
+        }
+        refresh.last_attempt = Some(Instant::now());
         let uri = &self
             .discovery
             .as_ref()
@@ -220,6 +272,45 @@ impl Authenticator {
             .context("decode OIDC signing keys")?;
         *self.jwks.write().await = Some(set);
         Ok(())
+    }
+}
+
+fn load_basic_credentials(config: &AuthConfig) -> Result<Vec<BasicCredential>> {
+    config
+        .basic_users
+        .iter()
+        .map(|user| {
+            let password_hash = std::fs::read_to_string(&user.password_hash_file)
+                .with_context(|| format!("read password hash file for {}", user.username))?;
+            let password_hash = password_hash.trim().to_owned();
+            let parsed = PasswordHash::new(&password_hash).map_err(|error| {
+                anyhow::anyhow!(
+                    "parse Argon2id password hash for {}: {error}",
+                    user.username
+                )
+            })?;
+            if parsed.algorithm.as_str() != "argon2id" {
+                bail!("password hash for {} must use Argon2id", user.username);
+            }
+            Ok(BasicCredential {
+                username: user.username.clone(),
+                password_hash,
+            })
+        })
+        .collect()
+}
+
+fn oidc_algorithm(algorithm: OidcSigningAlgorithm) -> Algorithm {
+    match algorithm {
+        OidcSigningAlgorithm::Rs256 => Algorithm::RS256,
+        OidcSigningAlgorithm::Rs384 => Algorithm::RS384,
+        OidcSigningAlgorithm::Rs512 => Algorithm::RS512,
+        OidcSigningAlgorithm::Ps256 => Algorithm::PS256,
+        OidcSigningAlgorithm::Ps384 => Algorithm::PS384,
+        OidcSigningAlgorithm::Ps512 => Algorithm::PS512,
+        OidcSigningAlgorithm::Es256 => Algorithm::ES256,
+        OidcSigningAlgorithm::Es384 => Algorithm::ES384,
+        OidcSigningAlgorithm::EdDsa => Algorithm::EdDSA,
     }
 }
 
@@ -243,28 +334,55 @@ mod tests {
     use super::*;
     use crate::config::BasicUserConfig;
     use axum::http::HeaderValue;
+    use jsonwebtoken::{EncodingKey, Header, encode};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    fn oidc_test_authenticator() -> Authenticator {
+        Authenticator {
+            config: AuthConfig {
+                mode: AuthMode::Oidc,
+                issuer: "https://identity.example".into(),
+                client_id: "av".into(),
+                audiences: vec!["av-project".into()],
+                scopes: vec!["openid".into()],
+                signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
+                allowed_groups: vec!["av-users".into()],
+                group_claim: "roles".into(),
+                basic_users: vec![],
+            },
+            client: reqwest::Client::new(),
+            discovery: None,
+            jwks: Arc::new(RwLock::new(None)),
+            jwks_refresh: Arc::new(Mutex::new(JwksRefreshState::default())),
+            basic_credentials: Arc::new(Vec::new()),
+        }
+    }
+
     #[tokio::test]
-    async fn basic_login_accepts_only_the_configured_password_file() {
+    async fn basic_login_accepts_only_the_configured_argon2id_hash() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let password_file =
+        let password_hash_file =
             std::env::temp_dir().join(format!("av-basic-auth-{}-{nonce}", std::process::id()));
-        std::fs::write(&password_file, "correct-horse\n").unwrap();
+        std::fs::write(
+            &password_hash_file,
+            "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc\n",
+        )
+        .unwrap();
         let authenticator = Authenticator::new(AuthConfig {
             mode: AuthMode::Basic,
             issuer: String::new(),
             client_id: String::new(),
             audiences: vec![],
             scopes: vec![],
+            signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
             allowed_groups: vec![],
             group_claim: "groups".into(),
             basic_users: vec![BasicUserConfig {
                 username: "operator".into(),
-                password_file: password_file.display().to_string(),
+                password_hash_file: password_hash_file.display().to_string(),
             }],
         })
         .await
@@ -273,11 +391,8 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(
             header::AUTHORIZATION,
-            HeaderValue::from_str(&format!(
-                "Basic {}",
-                STANDARD.encode("operator:correct-horse")
-            ))
-            .unwrap(),
+            HeaderValue::from_str(&format!("Basic {}", STANDARD.encode("operator:password")))
+                .unwrap(),
         );
         assert_eq!(
             authenticator.authorize(&headers).await.unwrap().subject,
@@ -289,7 +404,40 @@ mod tests {
             HeaderValue::from_str(&format!("Basic {}", STANDARD.encode("operator:wrong"))).unwrap(),
         );
         assert!(authenticator.authorize(&headers).await.is_err());
-        std::fs::remove_file(password_file).unwrap();
+        std::fs::remove_file(password_hash_file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn oidc_rejects_unconfigured_signing_algorithms_before_key_lookup() {
+        let authenticator = oidc_test_authenticator();
+        let mut header = Header::new(Algorithm::HS256);
+        header.kid = Some("attacker-key".into());
+        let token = encode(
+            &header,
+            &serde_json::json!({
+                "sub": "attacker",
+                "exp": 4102444800_u64,
+                "aud": "av-project",
+                "iss": "https://identity.example",
+                "roles": ["av-users"]
+            }),
+            &EncodingKey::from_secret(b"integration-only"),
+        )
+        .unwrap();
+        let error = authenticator.authorize_oidc(&token).await.unwrap_err();
+        assert!(error.to_string().contains("untrusted signing algorithm"));
+    }
+
+    #[tokio::test]
+    async fn repeated_unknown_keys_do_not_bypass_the_jwks_refresh_cooldown() {
+        let authenticator = oidc_test_authenticator();
+        let attempt = Instant::now();
+        authenticator.jwks_refresh.lock().await.last_attempt = Some(attempt);
+        authenticator.refresh_jwks(false).await.unwrap();
+        assert_eq!(
+            authenticator.jwks_refresh.lock().await.last_attempt,
+            Some(attempt)
+        );
     }
 
     #[test]

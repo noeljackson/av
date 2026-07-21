@@ -131,6 +131,32 @@ services:
       - ./verify.py:/test/verify.py:ro
     networks: [connectors]
 
+  zap:
+    profiles: [security]
+    image: ghcr.io/zaproxy/zaproxy:bare@sha256:627781353231d056d5a6305ec1f2092f54735cc654915f533d2e8d5d9d41bcb2
+    command:
+      - /zap/zap.sh
+      - -cmd
+      - -autorun
+      - /zap/wrk/zap.yaml
+    environment:
+      ZAP_AUTH_HEADER: Authorization
+      ZAP_AUTH_HEADER_SITE: av:14322
+      ZAP_AUTH_HEADER_VALUE: Basic b3BlcmF0b3I6cGFzc3dvcmQ= # synthetic integration credential
+    read_only: true
+    tmpfs:
+      - /tmp:uid=1000,gid=1000,mode=1770
+      - /home/zap:uid=1000,gid=1000,mode=1770
+    volumes:
+      - ./zap.yaml:/zap/wrk/zap.yaml:ro
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      av:
+        condition: service_started
+    networks: [connectors]
+
 networks:
   connectors:
     internal: true

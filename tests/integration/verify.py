@@ -2,18 +2,16 @@
 import base64
 import json
 import os
-import pathlib
 import time
 import urllib.error
 import urllib.request
 
 AV_URL = os.environ["AV_URL"].rstrip("/")
-PASSWORD = pathlib.Path("/state/av-password").read_text(encoding="utf-8").strip()
-AUTH = "Basic " + base64.b64encode(f"operator:{PASSWORD}".encode()).decode()
+AUTH = "Basic " + base64.b64encode(b"operator:password").decode()
 
 
-def request(path, method="GET", auth=True, origin=None, body=None, accepted=(200,)):
-    headers = {}
+def request(path, method="GET", auth=True, origin=None, body=None, headers=None, accepted=(200,)):
+    headers = dict(headers or {})
     if auth:
         headers["Authorization"] = AUTH
     if origin:
@@ -30,8 +28,10 @@ def request(path, method="GET", auth=True, origin=None, body=None, accepted=(200
         response_headers = dict(error.headers.items())
     if status not in accepted:
         raise RuntimeError(f"{method} {path} returned HTTP {status}")
-    content = json.loads(raw) if raw and raw.lstrip().startswith((b"{", b"[")) else raw
-    return status, content, {key.lower(): value for key, value in response_headers.items()}
+    normalized_headers = {key.lower(): value for key, value in response_headers.items()}
+    content_type = normalized_headers.get("content-type", "").split(";", 1)[0]
+    content = json.loads(raw) if raw and content_type == "application/json" else raw
+    return status, content, normalized_headers
 
 
 def wait_for_av():
@@ -68,10 +68,39 @@ def main():
     _, infisical, _ = request("/v1/profiles/infisical-integration/secrets")
     assert infisical == {"INFISICAL_MARKER": "infisical-ok"}
     _, openbao, _ = request("/v1/profiles/openbao-integration/secrets")
-    assert openbao == {"OPENBAO_MARKER": "openbao-ok"}
+    assert openbao == {"OPENBAO_MARKER": "openbao+ok"}
 
-    _, proxy, _ = request("/v1/proxy/openbao-upstream/verify?source=integration")
+    _, proxy, proxy_headers = request(
+        "/v1/proxy/openbao-upstream/verify?source=integration",
+        headers={
+            "X-Forwarded-Host": "hostile.example",
+            "X-HTTP-Method-Override": "DELETE",
+            "X-Original-URL": "/admin",
+        },
+    )
     assert proxy == {"injection": "accepted"}
+    assert proxy_headers["x-reflected-secret"] == "Bearer [REDACTED]"
+    assert "location" not in proxy_headers
+    _, x_header, _ = request(
+        "/v1/proxy/openbao-x-api/x-header",
+        headers={"X-Api-Key": "attacker-controlled"},
+    )
+    assert x_header == {"singleHeader": "accepted"}
+    _, encoded, _ = request(
+        "/v1/proxy/openbao-upstream/encoded?source=integration"
+    )
+    assert b"openbao+ok" not in encoded
+    assert base64.b64encode(b"openbao+ok") not in encoded
+    assert b"openbao%2Bok" not in encoded
+    assert encoded.count(b"[REDACTED]") == 3
+    request(
+        "/v1/proxy/openbao-upstream/verify?undeclared=value",
+        accepted=(403,),
+    )
+    request(
+        "/v1/proxy/openbao-upstream/verify?source=one&source=two",
+        accepted=(403,),
+    )
     request(
         "/v1/proxy/openbao-upstream/verify?source=integration",
         method="POST",
@@ -90,6 +119,11 @@ def main():
     request(
         "/v1/proxy/openbao-upstream/verify?source=integration",
         origin="https://hostile.example",
+        accepted=(403,),
+    )
+    request(
+        "/v1/proxy/openbao-upstream/verify?source=integration",
+        headers={"Sec-Fetch-Site": "same-site"},
         accepted=(403,),
     )
     print("connector_integration=ok")

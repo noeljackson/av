@@ -1,0 +1,43 @@
+---
+env:
+  contexts:
+    - name: av
+      urls:
+        - http://av:14322
+      includePaths:
+        - http://av:14322.*
+  parameters:
+    failOnError: true
+    failOnWarning: false
+    continueOnFailure: false
+    progressToStdout: true
+
+jobs:
+  - type: passiveScan-config
+    parameters:
+      maxAlertsPerRule: 10
+      scanOnlyInScope: true
+      maxBodySizeInBytesToScan: 1048576
+
+  - type: spider
+    parameters:
+      context: av
+      url: http://av:14322
+      maxDuration: 2
+      maxDepth: 10
+      maxChildren: 100
+    tests:
+      - name: Authenticated application was crawled
+        type: stats
+        statistic: automation.spider.urls.added
+        operator: ">="
+        value: 1
+        onFail: error
+
+  - type: passiveScan-wait
+    parameters:
+      maxDuration: 2
+
+  - type: exitStatus
+    parameters:
+      errorLevel: Medium

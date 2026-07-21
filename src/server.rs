@@ -1,4 +1,9 @@
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::PathBuf,
+    sync::Arc,
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -9,7 +14,12 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get},
 };
+use base64::{
+    Engine,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use serde::Serialize;
+use tokio::sync::Semaphore;
 use tower_http::{
     services::{ServeDir, ServeFile},
     set_header::SetResponseHeaderLayer,
@@ -27,6 +37,7 @@ struct AppState {
     config: Arc<Config>,
     auth: Authenticator,
     connectors: Arc<BTreeMap<String, Connector>>,
+    connector_slots: Arc<Semaphore>,
     proxy_client: reqwest::Client,
 }
 
@@ -57,6 +68,7 @@ struct PublicConnector {
 
 pub async fn run(config: Config) -> Result<()> {
     let auth = Authenticator::new(config.auth.clone()).await?;
+    let content_security_policy = content_security_policy(&config)?;
     let mut connectors = BTreeMap::new();
     let allow_insecure_http = config.allow_insecure_connector_http();
     for (name, connector) in &config.connectors {
@@ -74,6 +86,7 @@ pub async fn run(config: Config) -> Result<()> {
         config: Arc::new(config.clone()),
         auth,
         connectors: Arc::new(connectors),
+        connector_slots: Arc::new(Semaphore::new(config.max_connector_concurrency)),
         proxy_client,
     };
     let ui_dir = PathBuf::from(&config.ui_dir);
@@ -96,9 +109,7 @@ pub async fn run(config: Config) -> Result<()> {
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             HeaderName::from_static("content-security-policy"),
-            HeaderValue::from_static(
-                "default-src 'self'; connect-src 'self' https:; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self' https:",
-            ),
+            content_security_policy,
         ))
         .layer(SetResponseHeaderLayer::if_not_present(
             header::X_CONTENT_TYPE_OPTIONS,
@@ -123,6 +134,19 @@ pub async fn run(config: Config) -> Result<()> {
         .with_graceful_shutdown(shutdown())
         .await?;
     Ok(())
+}
+
+fn content_security_policy(config: &Config) -> Result<HeaderValue> {
+    let mut connect_src = "'self'".to_owned();
+    if matches!(config.auth.mode, AuthMode::Oidc | AuthMode::OidcOrBasic) {
+        let issuer = url::Url::parse(&config.auth.issuer).context("parse OIDC issuer for CSP")?;
+        connect_src.push(' ');
+        connect_src.push_str(issuer.origin().ascii_serialization().as_str());
+    }
+    HeaderValue::from_str(&format!(
+        "default-src 'self'; connect-src {connect_src}; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    ))
+    .context("build Content-Security-Policy")
 }
 
 async fn health() -> impl IntoResponse {
@@ -227,11 +251,29 @@ async fn proxy(
             return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();
         }
     };
+    if body.len() > route.max_body_bytes {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "proxy request is too large\n",
+        )
+            .into_response();
+    }
+    if let Err(error) = enforce_proxy_content_type(route, &headers, body.len()) {
+        tracing::warn!(subject = %identity.subject, route = route_name, error = %error, "proxy request content type rejected by route policy");
+        return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();
+    }
+    let query = match validate_proxy_query(route, uri.query()) {
+        Ok(query) => query,
+        Err(error) => {
+            tracing::warn!(subject = %identity.subject, route = route_name, error = %error, "proxy request query rejected by route policy");
+            return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();
+        }
+    };
     match proxy_request(
         &state,
         route,
         &normalized_path,
-        uri.query(),
+        &query,
         method,
         headers,
         body,
@@ -253,7 +295,7 @@ async fn proxy_request(
     state: &AppState,
     route: &ProxyRouteConfig,
     normalized_path: &str,
-    query: Option<&str>,
+    query: &[(String, String)],
     method: Method,
     headers: HeaderMap,
     body: Bytes,
@@ -267,25 +309,31 @@ async fn proxy_request(
     let secret = secrets
         .get(&route.secret_key)
         .context("proxy credential is unavailable")?;
-    let mut target = format!(
-        "{}{}",
-        route.base_url.trim_end_matches('/'),
-        normalized_path
-    );
-    if let Some(query) = query {
-        target.push('?');
-        target.push_str(query);
+    let mut target =
+        url::Url::parse(&route.base_url).context("proxy route base URL disappeared")?;
+    let target_path = format!("{}{}", target.path().trim_end_matches('/'), normalized_path);
+    target.set_path(&target_path);
+    target.set_query(None);
+    if !query.is_empty() {
+        target.query_pairs_mut().extend_pairs(query);
     }
-    let mut request = state.proxy_client.request(method, target).body(body);
-    for (name, value) in &headers {
-        if is_forwardable_request_header(name) {
-            request = request.header(name, value);
+    let mut outbound_headers = HeaderMap::new();
+    for configured in &route.allowed_request_headers {
+        let name = HeaderName::from_bytes(configured.as_bytes())?;
+        if let Some(value) = headers.get(&name) {
+            outbound_headers.insert(name, value.clone());
         }
     }
     let injection_name = HeaderName::from_bytes(route.header.as_bytes())?;
-    let injection_value = HeaderValue::from_str(&format!("{}{}", route.header_prefix, secret))?;
-    let mut upstream = request
-        .header(injection_name, injection_value)
+    outbound_headers.remove(&injection_name);
+    let mut injection_value = HeaderValue::from_str(&format!("{}{}", route.header_prefix, secret))?;
+    injection_value.set_sensitive(true);
+    outbound_headers.insert(injection_name, injection_value);
+    let mut upstream = state
+        .proxy_client
+        .request(method, target)
+        .headers(outbound_headers)
+        .body(body)
         .send()
         .await?;
     let status = upstream.status();
@@ -305,8 +353,11 @@ async fn proxy_request(
     }
     let bytes = redact(&bytes, secret.as_bytes());
     let mut response = Response::builder().status(status);
-    for (name, value) in &upstream_headers {
-        if is_forwardable_response_header(name) {
+    for configured in &route.allowed_response_headers {
+        let name = HeaderName::from_bytes(configured.as_bytes())?;
+        if let Some(value) = upstream_headers.get(&name)
+            && let Some(value) = redact_header(value, secret.as_bytes())
+        {
             response = response.header(name, value);
         }
     }
@@ -323,11 +374,10 @@ fn enforce_proxy_policy(route: &ProxyRouteConfig, path: &str, method: &Method) -
     }
 
     let normalized_path = format!("/{}", path.trim_start_matches('/'));
-    let suspicious = normalized_path.to_ascii_lowercase();
     if normalized_path.contains('\\')
-        || suspicious.contains("%2e")
-        || suspicious.contains("%2f")
-        || suspicious.contains("%5c")
+        || normalized_path.contains('%')
+        || normalized_path.contains("//")
+        || normalized_path.chars().any(char::is_control)
         || normalized_path
             .split('/')
             .any(|segment| matches!(segment, "." | ".."))
@@ -357,16 +407,25 @@ fn path_matches_prefix(path: &str, configured_prefix: &str) -> bool {
 }
 
 fn is_trusted_browser_origin(headers: &HeaderMap, public_url: &str) -> bool {
-    headers
+    let origin_allowed = headers
         .get(header::ORIGIN)
         .and_then(|origin| origin.to_str().ok())
-        .is_none_or(|origin| origin == public_url)
+        .is_none_or(|origin| origin == public_url);
+    let fetch_site_allowed = headers
+        .get(HeaderName::from_static("sec-fetch-site"))
+        .and_then(|value| value.to_str().ok())
+        .is_none_or(|value| matches!(value, "same-origin" | "none"));
+    origin_allowed && fetch_site_allowed
 }
 
 async fn fetch_secrets(
     state: &AppState,
     profile: &ProfileConfig,
 ) -> Result<BTreeMap<String, String>> {
+    let _permit = tokio::time::timeout(Duration::from_secs(5), state.connector_slots.acquire())
+        .await
+        .context("connector concurrency queue timed out")?
+        .context("connector concurrency limiter is closed")?;
     state
         .connectors
         .get(&profile.connector)
@@ -375,29 +434,88 @@ async fn fetch_secrets(
         .await
 }
 
-fn is_forwardable_request_header(name: &HeaderName) -> bool {
-    !matches!(
-        name.as_str().to_ascii_lowercase().as_str(),
-        "authorization"
-            | "cookie"
-            | "connection"
-            | "host"
-            | "proxy-authorization"
-            | "te"
-            | "trailer"
-            | "transfer-encoding"
-            | "upgrade"
-    )
+fn enforce_proxy_content_type(
+    route: &ProxyRouteConfig,
+    headers: &HeaderMap,
+    body_len: usize,
+) -> Result<()> {
+    if body_len == 0 {
+        return Ok(());
+    }
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .context("request body requires a valid Content-Type")?;
+    if !route
+        .allowed_content_types
+        .iter()
+        .any(|allowed| allowed == &content_type)
+    {
+        bail!("request Content-Type is not allowed");
+    }
+    Ok(())
 }
 
-fn is_forwardable_response_header(name: &HeaderName) -> bool {
-    !matches!(
-        name.as_str().to_ascii_lowercase().as_str(),
-        "connection" | "set-cookie" | "transfer-encoding" | "upgrade"
-    )
+fn validate_proxy_query(
+    route: &ProxyRouteConfig,
+    query: Option<&str>,
+) -> Result<Vec<(String, String)>> {
+    let Some(query) = query.filter(|query| !query.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    validate_percent_encoding(query)?;
+    let mut names = BTreeSet::new();
+    let mut validated = Vec::new();
+    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
+        if name.chars().any(char::is_control) || value.chars().any(char::is_control) {
+            bail!("query contains control characters");
+        }
+        if !route
+            .allowed_query_parameters
+            .iter()
+            .any(|allowed| allowed == name.as_ref())
+        {
+            bail!("query parameter is not allowed");
+        }
+        if !names.insert(name.to_string()) {
+            bail!("duplicate query parameters are not allowed");
+        }
+        validated.push((name.into_owned(), value.into_owned()));
+    }
+    Ok(validated)
+}
+
+fn validate_percent_encoding(value: &str) -> Result<()> {
+    let bytes = value.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                bail!("query contains invalid percent encoding");
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    Ok(())
 }
 
 fn redact(body: &[u8], secret: &[u8]) -> Vec<u8> {
+    let mut output = body.to_vec();
+    for encoding in credential_encodings(secret) {
+        output = redact_exact(&output, &encoding);
+    }
+    output
+}
+
+fn redact_exact(body: &[u8], secret: &[u8]) -> Vec<u8> {
     if secret.is_empty() || body.len() < secret.len() {
         return body.to_vec();
     }
@@ -414,6 +532,47 @@ fn redact(body: &[u8], secret: &[u8]) -> Vec<u8> {
     }
     output.extend_from_slice(&body[offset..]);
     output
+}
+
+fn credential_encodings(secret: &[u8]) -> Vec<Vec<u8>> {
+    let percent_encoded = url::form_urlencoded::byte_serialize(secret).collect::<String>();
+    let mut encodings = vec![
+        secret.to_vec(),
+        STANDARD.encode(secret).into_bytes(),
+        STANDARD_NO_PAD.encode(secret).into_bytes(),
+        URL_SAFE.encode(secret).into_bytes(),
+        URL_SAFE_NO_PAD.encode(secret).into_bytes(),
+        percent_encoded.as_bytes().to_vec(),
+        lowercase_percent_hex(&percent_encoded).into_bytes(),
+    ];
+    if let Ok(secret) = std::str::from_utf8(secret)
+        && let Ok(json) = serde_json::to_string(secret)
+    {
+        encodings.push(json.as_bytes()[1..json.len() - 1].to_vec());
+    }
+    encodings.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    encodings.dedup();
+    encodings
+}
+
+fn lowercase_percent_hex(value: &str) -> String {
+    let mut bytes = value.as_bytes().to_vec();
+    let mut index = 0;
+    while index + 2 < bytes.len() {
+        if bytes[index] == b'%' {
+            bytes[index + 1].make_ascii_lowercase();
+            bytes[index + 2].make_ascii_lowercase();
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    String::from_utf8(bytes).expect("percent encoding is ASCII")
+}
+
+fn redact_header(value: &HeaderValue, secret: &[u8]) -> Option<HeaderValue> {
+    let redacted = redact(value.as_bytes(), secret);
+    HeaderValue::from_bytes(&redacted).ok()
 }
 
 fn unauthorized(error: anyhow::Error) -> Response {
@@ -476,6 +635,11 @@ mod tests {
             header_prefix: "Bearer ".into(),
             allowed_methods: methods.iter().map(|value| (*value).into()).collect(),
             allowed_path_prefixes: prefixes.iter().map(|value| (*value).into()).collect(),
+            allowed_request_headers: vec!["accept".into(), "content-type".into()],
+            allowed_response_headers: vec!["content-type".into()],
+            allowed_query_parameters: vec!["source".into()],
+            allowed_content_types: vec!["application/json".into()],
+            max_body_bytes: 1024,
         }
     }
 
@@ -539,6 +703,15 @@ mod tests {
             &headers,
             "https://av.example.com"
         ));
+        headers.remove(header::ORIGIN);
+        headers.insert(
+            HeaderName::from_static("sec-fetch-site"),
+            HeaderValue::from_static("same-site"),
+        );
+        assert!(!is_trusted_browser_origin(
+            &headers,
+            "https://av.example.com"
+        ));
     }
 
     #[test]
@@ -552,7 +725,7 @@ mod tests {
                 "issuer": "https://identity.example.com",
                 "client_id": "public-client",
                 "allowed_groups": ["av-users"],
-                "basic_users": [{"username": "fallback", "password_file": "/run/secret"}]
+                "basic_users": [{"username": "fallback", "password_hash_file": "/run/secret"}]
             },
             "connectors": {
                 "infisical": {
@@ -583,20 +756,46 @@ mod tests {
         );
         assert_eq!(status.profile_count, 0);
         assert!(status.proxy_routes.is_empty());
-    }
-
-    #[test]
-    fn proxy_response_redacts_exact_credential_bytes() {
+        let policy = content_security_policy(&config).unwrap();
+        let policy = policy.to_str().unwrap();
         assert_eq!(
-            redact(b"before secret-token after", b"secret-token"),
-            b"before [REDACTED] after"
+            policy,
+            "default-src 'self'; connect-src 'self' https://identity.example.com; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
         );
     }
 
     #[test]
-    fn authorization_and_cookies_never_forward() {
-        assert!(!is_forwardable_request_header(&header::AUTHORIZATION));
-        assert!(!is_forwardable_request_header(&header::COOKIE));
-        assert!(is_forwardable_request_header(&header::CONTENT_TYPE));
+    fn proxy_response_redacts_common_credential_encodings() {
+        assert_eq!(
+            redact(b"before secret-token after", b"secret-token"),
+            b"before [REDACTED] after"
+        );
+        assert_eq!(redact(b"c2VjcmV0LXRva2Vu", b"secret-token"), b"[REDACTED]");
+        assert_eq!(redact(b"secret%2Btoken", b"secret+token"), b"[REDACTED]");
+    }
+
+    #[test]
+    fn proxy_query_requires_declared_unique_parameters() {
+        let route = proxy_route(&["GET"], &["/zones"]);
+        assert_eq!(
+            validate_proxy_query(&route, Some("source=integration")).unwrap(),
+            [("source".into(), "integration".into())]
+        );
+        assert!(validate_proxy_query(&route, Some("other=value")).is_err());
+        assert!(validate_proxy_query(&route, Some("source=one&source=two")).is_err());
+        assert!(validate_proxy_query(&route, Some("source=%ZZ")).is_err());
+    }
+
+    #[test]
+    fn proxy_body_requires_an_allowed_content_type() {
+        let route = proxy_route(&["POST"], &["/zones"]);
+        let mut headers = HeaderMap::new();
+        assert!(enforce_proxy_content_type(&route, &headers, 0).is_ok());
+        assert!(enforce_proxy_content_type(&route, &headers, 1).is_err());
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json; charset=utf-8"),
+        );
+        assert!(enforce_proxy_content_type(&route, &headers, 1).is_ok());
     }
 }

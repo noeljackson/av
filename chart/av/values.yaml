@@ -49,13 +49,15 @@ config:
     issuer: "https://zitadel.example.com"
     client_id: "replace-me"
     audiences: ["replace-me"]
-    scopes: ["openid", "profile", "email", "groups"]
+    scopes: ["openid", "groups"]
+    signing_algorithms: ["RS256"]
     allowed_groups: ["av-users"]
     group_claim: groups
     basic_users: []
   connectors: {}
   profiles: {}
   proxy_routes: {}
+  max_connector_concurrency: 16
 
 resources:
   requests:

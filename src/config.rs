@@ -24,6 +24,8 @@ pub struct Config {
     pub profiles: BTreeMap<String, ProfileConfig>,
     #[serde(default)]
     pub proxy_routes: BTreeMap<String, ProxyRouteConfig>,
+    #[serde(default = "default_max_connector_concurrency")]
+    pub max_connector_concurrency: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -47,6 +49,8 @@ pub struct AuthConfig {
     pub audiences: Vec<String>,
     #[serde(default)]
     pub scopes: Vec<String>,
+    #[serde(default = "default_oidc_signing_algorithms")]
+    pub signing_algorithms: Vec<OidcSigningAlgorithm>,
     #[serde(default)]
     pub allowed_groups: Vec<String>,
     #[serde(default = "default_group_claim")]
@@ -59,7 +63,29 @@ pub struct AuthConfig {
 #[serde(deny_unknown_fields)]
 pub struct BasicUserConfig {
     pub username: String,
-    pub password_file: String,
+    pub password_hash_file: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub enum OidcSigningAlgorithm {
+    #[serde(rename = "RS256")]
+    Rs256,
+    #[serde(rename = "RS384")]
+    Rs384,
+    #[serde(rename = "RS512")]
+    Rs512,
+    #[serde(rename = "PS256")]
+    Ps256,
+    #[serde(rename = "PS384")]
+    Ps384,
+    #[serde(rename = "PS512")]
+    Ps512,
+    #[serde(rename = "ES256")]
+    Es256,
+    #[serde(rename = "ES384")]
+    Es384,
+    #[serde(rename = "EdDSA")]
+    EdDsa,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -185,6 +211,16 @@ pub struct ProxyRouteConfig {
     pub allowed_methods: Vec<String>,
     #[serde(default)]
     pub allowed_path_prefixes: Vec<String>,
+    #[serde(default = "default_allowed_request_headers")]
+    pub allowed_request_headers: Vec<String>,
+    #[serde(default = "default_allowed_response_headers")]
+    pub allowed_response_headers: Vec<String>,
+    #[serde(default)]
+    pub allowed_query_parameters: Vec<String>,
+    #[serde(default)]
+    pub allowed_content_types: Vec<String>,
+    #[serde(default = "default_proxy_max_body_bytes")]
+    pub max_body_bytes: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -274,9 +310,18 @@ impl Config {
             if !basic_usernames.insert(&user.username) {
                 bail!("basic auth usernames must be unique");
             }
-            if !Path::new(&user.password_file).is_absolute() {
-                bail!("basic auth password files must use absolute paths");
+            if !Path::new(&user.password_hash_file).is_absolute() {
+                bail!("basic auth password hash files must use absolute paths");
             }
+        }
+
+        if matches!(self.auth.mode, AuthMode::Oidc | AuthMode::OidcOrBasic)
+            && self.auth.signing_algorithms.is_empty()
+        {
+            bail!("OIDC requires at least one asymmetric signing_algorithm");
+        }
+        if !(1..=256).contains(&self.max_connector_concurrency) {
+            bail!("max_connector_concurrency must be between 1 and 256");
         }
 
         let allow_insecure_connector_http = self.allow_insecure_connector_http();
@@ -355,12 +400,10 @@ impl Config {
                 bail!("proxy route {name} contains a non-CRUD HTTP method");
             }
             if route.allowed_path_prefixes.iter().any(|prefix| {
-                let lower = prefix.to_ascii_lowercase();
                 !prefix.starts_with('/')
-                    || prefix.contains(['?', '#', '\\'])
-                    || lower.contains("%2e")
-                    || lower.contains("%2f")
-                    || lower.contains("%5c")
+                    || prefix.contains(['?', '#', '\\', '%'])
+                    || prefix.contains("//")
+                    || prefix.chars().any(char::is_control)
                     || prefix
                         .split('/')
                         .any(|segment| matches!(segment, "." | ".."))
@@ -374,6 +417,44 @@ impl Config {
             }
             if axum::http::HeaderName::from_bytes(route.header.as_bytes()).is_err() {
                 bail!("proxy route {name} injection header is invalid");
+            }
+            validate_proxy_header_allowlist(
+                name,
+                "request",
+                &route.allowed_request_headers,
+                Some(&route.header),
+            )?;
+            validate_proxy_header_allowlist(
+                name,
+                "response",
+                &route.allowed_response_headers,
+                None,
+            )?;
+            validate_string_allowlist(
+                name,
+                "query parameter",
+                &route.allowed_query_parameters,
+                |value| {
+                    !value.is_empty()
+                        && value.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                        })
+                },
+            )?;
+            validate_string_allowlist(
+                name,
+                "content type",
+                &route.allowed_content_types,
+                |value| {
+                    !value.is_empty()
+                        && value == value.to_ascii_lowercase()
+                        && !value.contains(';')
+                        && value.split_once('/').is_some()
+                        && axum::http::HeaderValue::from_str(value).is_ok()
+                },
+            )?;
+            if !(1..=4 * 1024 * 1024).contains(&route.max_body_bytes) {
+                bail!("proxy route {name} max_body_bytes must be between 1 and 4194304");
             }
         }
 
@@ -444,6 +525,74 @@ fn validate_connector_auth(name: &str, connector: &ConnectorConfig) -> Result<()
         .any(|path| !Path::new(path).is_absolute())
     {
         bail!("connector {name} credential files must use absolute paths");
+    }
+    Ok(())
+}
+
+fn validate_proxy_header_allowlist(
+    route_name: &str,
+    direction: &str,
+    headers: &[String],
+    injection_header: Option<&str>,
+) -> Result<()> {
+    const FORBIDDEN: &[&str] = &[
+        "authorization",
+        "connection",
+        "content-length",
+        "cookie",
+        "forwarded",
+        "host",
+        "location",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "set-cookie",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "user-agent",
+        "www-authenticate",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-forwarded-port",
+        "x-forwarded-proto",
+        "x-http-method-override",
+        "x-method-override",
+        "x-original-url",
+        "x-real-ip",
+        "x-rewrite-url",
+    ];
+    let mut unique = BTreeSet::new();
+    for configured in headers {
+        let lower = configured.to_ascii_lowercase();
+        if configured != &lower
+            || axum::http::HeaderName::from_bytes(configured.as_bytes()).is_err()
+            || FORBIDDEN.contains(&lower.as_str())
+            || injection_header.is_some_and(|header| header.eq_ignore_ascii_case(configured))
+        {
+            bail!("proxy route {route_name} contains unsafe {direction} header {configured:?}");
+        }
+        if !unique.insert(lower) {
+            bail!("proxy route {route_name} repeats {direction} header {configured:?}");
+        }
+    }
+    Ok(())
+}
+
+fn validate_string_allowlist(
+    route_name: &str,
+    kind: &str,
+    values: &[String],
+    valid: impl Fn(&str) -> bool,
+) -> Result<()> {
+    let mut unique = BTreeSet::new();
+    for value in values {
+        if !valid(value) {
+            bail!("proxy route {route_name} contains invalid {kind} {value:?}");
+        }
+        if !unique.insert(value) {
+            bail!("proxy route {route_name} repeats {kind} {value:?}");
+        }
     }
     Ok(())
 }
@@ -534,6 +683,32 @@ fn default_group_claim() -> String {
     "groups".into()
 }
 
+fn default_oidc_signing_algorithms() -> Vec<OidcSigningAlgorithm> {
+    vec![OidcSigningAlgorithm::Rs256]
+}
+
+fn default_max_connector_concurrency() -> usize {
+    16
+}
+
+fn default_allowed_request_headers() -> Vec<String> {
+    ["accept", "content-type", "if-match", "if-none-match"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn default_allowed_response_headers() -> Vec<String> {
+    ["content-type", "etag", "last-modified", "retry-after"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+fn default_proxy_max_body_bytes() -> usize {
+    1024 * 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,6 +727,7 @@ mod tests {
                 client_id: String::new(),
                 audiences: vec![],
                 scopes: vec![],
+                signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
                 allowed_groups: vec![],
                 group_claim: "groups".into(),
                 basic_users: vec![],
@@ -559,6 +735,7 @@ mod tests {
             connectors: BTreeMap::new(),
             profiles: BTreeMap::new(),
             proxy_routes: BTreeMap::new(),
+            max_connector_concurrency: 16,
         }
     }
 
@@ -605,8 +782,30 @@ mod tests {
                 header_prefix: "Bearer ".into(),
                 allowed_methods: vec![],
                 allowed_path_prefixes: vec![],
+                allowed_request_headers: default_allowed_request_headers(),
+                allowed_response_headers: default_allowed_response_headers(),
+                allowed_query_parameters: vec![],
+                allowed_content_types: vec![],
+                max_body_bytes: default_proxy_max_body_bytes(),
             },
         );
+        assert!(config.validate().is_err());
+
+        {
+            let route = config.proxy_routes.get_mut("unsafe").unwrap();
+            route.base_url = "https://api.example.com".into();
+            route.header = "X-Api-Key".into();
+            route.allowed_methods = vec!["GET".into()];
+            route.allowed_path_prefixes = vec!["/zones".into()];
+            route.allowed_request_headers = vec!["x-api-key".into()];
+        }
+        assert!(config.validate().is_err());
+
+        {
+            let route = config.proxy_routes.get_mut("unsafe").unwrap();
+            route.allowed_request_headers = vec!["accept".into()];
+            route.allowed_response_headers = vec!["location".into()];
+        }
         assert!(config.validate().is_err());
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
     }
