@@ -241,6 +241,8 @@ def write_config(project_id, environment):
             },
         },
         "max_connector_concurrency": 4,
+        "api_rate_limit_per_second": 100,
+        "api_rate_limit_burst": 200,
     }
     path = STATE / "config.json"
     path.write_text(json.dumps(config, separators=(",", ":")), encoding="utf-8")

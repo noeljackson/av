@@ -20,6 +20,8 @@
     connectors: Connector[];
     profileCount: number;
     proxyRoutes: string[];
+    apiRateLimitPerSecond: number;
+    apiRateLimitBurst: number;
   };
 
   let auth: AuthConfig | undefined;
@@ -232,6 +234,7 @@
               <div><span>registration</span><strong class:on={runtime.registrationEnabled}>{runtime.registrationEnabled ? "enabled" : "disabled"}</strong></div>
               <div><span>profiles</span><strong class:on={runtime.profileCount > 0}>{runtime.profileCount} exposed</strong></div>
               <div><span>tier 2 proxy</span><strong class:on={runtime.proxyRoutes.length > 0}>{runtime.proxyRoutes.length > 0 ? `${runtime.proxyRoutes.length} enabled` : "disabled"}</strong></div>
+              <div><span>api limiter</span><strong class:on={runtime.apiRateLimitPerSecond > 0}>{runtime.apiRateLimitPerSecond}/s // burst {runtime.apiRateLimitBurst}</strong></div>
             </div>
             <div class="connector-line">
               <span>connectors</span>

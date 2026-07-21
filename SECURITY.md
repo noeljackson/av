@@ -28,6 +28,9 @@ keeping a provider credential out of the caller.
   and AppRole files are compatibility options, not the preferred deployment.
 - Keep ingress private, enable rate limiting, and default-deny egress except DNS,
   the identity provider, connector backends, and named Tier 2 providers.
+- Keep both layers of rate limiting: ingress enforces per-client quotas and AV's
+  bounded token bucket protects each process if ingress is bypassed. Basic auth
+  separately bounds Argon2id parameters and concurrent verification work.
 - Give connector identities access only to the projects, paths, and keys exposed
   by configured profiles. Provider credentials must be scoped independently of
   AV's route policy.

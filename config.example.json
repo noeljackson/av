@@ -84,5 +84,7 @@
       "max_body_bytes": 1048576
     }
   },
-  "max_connector_concurrency": 16
+  "max_connector_concurrency": 16,
+  "api_rate_limit_per_second": 50,
+  "api_rate_limit_burst": 100
 }

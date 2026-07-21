@@ -1,19 +1,26 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
-use argon2::{Argon2, PasswordHash, PasswordVerifier};
+use argon2::{Argon2, Params, PasswordHash, PasswordVerifier};
 use axum::http::{HeaderMap, header};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::Deserialize;
 use tokio::{
-    sync::{Mutex, RwLock},
+    sync::{Mutex, RwLock, Semaphore},
     time::Instant,
 };
 
 use crate::config::{AuthConfig, AuthMode, OidcSigningAlgorithm, PublicAuthConfig};
 
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
+const BASIC_AUTH_MAX_CONCURRENCY: usize = 2;
+const BASIC_AUTH_QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+const BASIC_AUTH_MIN_MEMORY_KIB: u32 = 19 * 1024;
+const BASIC_AUTH_MAX_MEMORY_KIB: u32 = 64 * 1024;
+const BASIC_AUTH_MIN_ITERATIONS: u32 = 2;
+const BASIC_AUTH_MAX_ITERATIONS: u32 = 6;
+const BASIC_AUTH_MAX_PARALLELISM: u32 = 4;
 
 #[derive(Clone)]
 pub struct Authenticator {
@@ -23,6 +30,7 @@ pub struct Authenticator {
     jwks: Arc<RwLock<Option<JwkSet>>>,
     jwks_refresh: Arc<Mutex<JwksRefreshState>>,
     basic_credentials: Arc<Vec<BasicCredential>>,
+    basic_slots: Arc<Semaphore>,
 }
 
 #[derive(Default)]
@@ -95,6 +103,7 @@ impl Authenticator {
             jwks: Arc::new(RwLock::new(None)),
             jwks_refresh: Arc::new(Mutex::new(JwksRefreshState::default())),
             basic_credentials: Arc::new(basic_credentials),
+            basic_slots: Arc::new(Semaphore::new(BASIC_AUTH_MAX_CONCURRENCY)),
         };
         if authenticator.discovery.is_some() {
             authenticator.refresh_jwks(true).await?;
@@ -214,6 +223,10 @@ impl Authenticator {
         let comparison = requested
             .or_else(|| self.basic_credentials.first())
             .context("Basic authentication has no configured credentials")?;
+        let _permit = tokio::time::timeout(BASIC_AUTH_QUEUE_TIMEOUT, self.basic_slots.acquire())
+            .await
+            .context("Basic authentication queue timed out")?
+            .context("Basic authentication limiter is closed")?;
         let password = password.to_owned();
         let password_hash = comparison.password_hash.clone();
         let valid = tokio::task::spawn_blocking(move || {
@@ -292,6 +305,25 @@ fn load_basic_credentials(config: &AuthConfig) -> Result<Vec<BasicCredential>> {
             if parsed.algorithm.as_str() != "argon2id" {
                 bail!("password hash for {} must use Argon2id", user.username);
             }
+            if parsed.version != Some(19) || parsed.salt.is_none() || parsed.hash.is_none() {
+                bail!(
+                    "password hash for {} must be a complete Argon2id v19 PHC string",
+                    user.username
+                );
+            }
+            let params = Params::try_from(&parsed).map_err(|error| {
+                anyhow::anyhow!("parse Argon2id parameters for {}: {error}", user.username)
+            })?;
+            if !(BASIC_AUTH_MIN_MEMORY_KIB..=BASIC_AUTH_MAX_MEMORY_KIB).contains(&params.m_cost())
+                || !(BASIC_AUTH_MIN_ITERATIONS..=BASIC_AUTH_MAX_ITERATIONS)
+                    .contains(&params.t_cost())
+                || !(1..=BASIC_AUTH_MAX_PARALLELISM).contains(&params.p_cost())
+            {
+                bail!(
+                    "password hash for {} uses Argon2id parameters outside AV's safety bounds",
+                    user.username
+                );
+            }
             Ok(BasicCredential {
                 username: user.username.clone(),
                 password_hash,
@@ -355,6 +387,7 @@ mod tests {
             jwks: Arc::new(RwLock::new(None)),
             jwks_refresh: Arc::new(Mutex::new(JwksRefreshState::default())),
             basic_credentials: Arc::new(Vec::new()),
+            basic_slots: Arc::new(Semaphore::new(BASIC_AUTH_MAX_CONCURRENCY)),
         }
     }
 
@@ -404,6 +437,40 @@ mod tests {
             HeaderValue::from_str(&format!("Basic {}", STANDARD.encode("operator:wrong"))).unwrap(),
         );
         assert!(authenticator.authorize(&headers).await.is_err());
+        std::fs::remove_file(password_hash_file).unwrap();
+    }
+
+    #[tokio::test]
+    async fn basic_login_rejects_unsafe_argon2id_parameters_at_startup() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let password_hash_file = std::env::temp_dir().join(format!(
+            "av-unsafe-basic-auth-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::write(
+            &password_hash_file,
+            "$argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc\n",
+        )
+        .unwrap();
+        let result = Authenticator::new(AuthConfig {
+            mode: AuthMode::Basic,
+            issuer: String::new(),
+            client_id: String::new(),
+            audiences: vec![],
+            scopes: vec![],
+            signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
+            allowed_groups: vec![],
+            group_claim: "groups".into(),
+            basic_users: vec![BasicUserConfig {
+                username: "operator".into(),
+                password_hash_file: password_hash_file.display().to_string(),
+            }],
+        })
+        .await;
+        assert!(result.is_err());
         std::fs::remove_file(password_hash_file).unwrap();
     }
 

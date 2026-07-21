@@ -26,6 +26,10 @@ pub struct Config {
     pub proxy_routes: BTreeMap<String, ProxyRouteConfig>,
     #[serde(default = "default_max_connector_concurrency")]
     pub max_connector_concurrency: usize,
+    #[serde(default = "default_api_rate_limit_per_second")]
+    pub api_rate_limit_per_second: u32,
+    #[serde(default = "default_api_rate_limit_burst")]
+    pub api_rate_limit_burst: u32,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -322,6 +326,12 @@ impl Config {
         }
         if !(1..=256).contains(&self.max_connector_concurrency) {
             bail!("max_connector_concurrency must be between 1 and 256");
+        }
+        if !(1..=10_000).contains(&self.api_rate_limit_per_second) {
+            bail!("api_rate_limit_per_second must be between 1 and 10000");
+        }
+        if !(1..=50_000).contains(&self.api_rate_limit_burst) {
+            bail!("api_rate_limit_burst must be between 1 and 50000");
         }
 
         let allow_insecure_connector_http = self.allow_insecure_connector_http();
@@ -691,6 +701,14 @@ fn default_max_connector_concurrency() -> usize {
     16
 }
 
+fn default_api_rate_limit_per_second() -> u32 {
+    50
+}
+
+fn default_api_rate_limit_burst() -> u32 {
+    100
+}
+
 fn default_allowed_request_headers() -> Vec<String> {
     ["accept", "content-type", "if-match", "if-none-match"]
         .into_iter()
@@ -736,6 +754,8 @@ mod tests {
             profiles: BTreeMap::new(),
             proxy_routes: BTreeMap::new(),
             max_connector_concurrency: 16,
+            api_rate_limit_per_second: 50,
+            api_rate_limit_burst: 100,
         }
     }
 
