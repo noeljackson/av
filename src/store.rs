@@ -29,6 +29,12 @@ pub struct BasicUser {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProfileGrant {
+    pub profile: String,
+    pub subject: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuditEvent {
     pub created_unix_seconds: i64,
     pub actor: String,
@@ -190,6 +196,124 @@ impl Store {
         Ok(affected == 1)
     }
 
+    pub async fn profile_allowed(&self, subject: &str, profile: &str) -> Result<bool> {
+        let count: i64 =
+            match self {
+                Self::Postgres(pool) => sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM av_profile_grants WHERE subject = $1 AND profile = $2",
+                )
+                .bind(subject)
+                .bind(profile)
+                .fetch_one(pool)
+                .await?,
+                Self::Sqlite(pool) => {
+                    sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM av_profile_grants WHERE subject = ? AND profile = ?",
+                    )
+                    .bind(subject)
+                    .bind(profile)
+                    .fetch_one(pool)
+                    .await?
+                }
+            };
+        Ok(count > 0)
+    }
+
+    pub async fn list_allowed_profiles(&self, subject: &str) -> Result<Vec<String>> {
+        match self {
+            Self::Postgres(pool) => sqlx::query_scalar(
+                "SELECT profile FROM av_profile_grants WHERE subject = $1 ORDER BY profile",
+            )
+            .bind(subject)
+            .fetch_all(pool)
+            .await
+            .context("list managed profile grants"),
+            Self::Sqlite(pool) => sqlx::query_scalar(
+                "SELECT profile FROM av_profile_grants WHERE subject = ? ORDER BY profile",
+            )
+            .bind(subject)
+            .fetch_all(pool)
+            .await
+            .context("list managed profile grants"),
+        }
+    }
+
+    pub async fn list_profile_grants(&self, profile: &str) -> Result<Vec<ProfileGrant>> {
+        let subjects: Vec<String> = match self {
+            Self::Postgres(pool) => {
+                sqlx::query_scalar(
+                    "SELECT subject FROM av_profile_grants WHERE profile = $1 ORDER BY subject",
+                )
+                .bind(profile)
+                .fetch_all(pool)
+                .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar(
+                    "SELECT subject FROM av_profile_grants WHERE profile = ? ORDER BY subject",
+                )
+                .bind(profile)
+                .fetch_all(pool)
+                .await?
+            }
+        };
+        Ok(subjects
+            .into_iter()
+            .map(|subject| ProfileGrant {
+                profile: profile.into(),
+                subject,
+            })
+            .collect())
+    }
+
+    pub async fn grant_profile(&self, subject: &str, profile: &str) -> Result<()> {
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query(
+                    "INSERT INTO av_profile_grants (subject, profile) VALUES ($1, $2) \
+                     ON CONFLICT (subject, profile) DO NOTHING",
+                )
+                .bind(subject)
+                .bind(profile)
+                .execute(pool)
+                .await?;
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO av_profile_grants (subject, profile) VALUES (?, ?) \
+                     ON CONFLICT (subject, profile) DO NOTHING",
+                )
+                .bind(subject)
+                .bind(profile)
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn revoke_profile(&self, subject: &str, profile: &str) -> Result<bool> {
+        let affected = match self {
+            Self::Postgres(pool) => {
+                sqlx::query("DELETE FROM av_profile_grants WHERE subject = $1 AND profile = $2")
+                    .bind(subject)
+                    .bind(profile)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query("DELETE FROM av_profile_grants WHERE subject = ? AND profile = ?")
+                    .bind(subject)
+                    .bind(profile)
+                    .execute(pool)
+                    .await?
+                    .rows_affected()
+            }
+        };
+        Ok(affected == 1)
+    }
+
     pub async fn list_audit_events(&self, limit: i64) -> Result<Vec<AuditEvent>> {
         let limit = limit.clamp(1, 500);
         let rows: Vec<AuditRow> = match self {
@@ -286,6 +410,11 @@ impl Store {
             password_hash TEXT NOT NULL,\
             enabled BOOLEAN NOT NULL\
         )";
+        const CREATE_PROFILE_GRANTS: &str = "CREATE TABLE IF NOT EXISTS av_profile_grants (\
+            subject TEXT NOT NULL,\
+            profile TEXT NOT NULL,\
+            PRIMARY KEY (subject, profile)\
+        )";
         const CREATE_AUDIT_EVENTS: &str = "CREATE TABLE IF NOT EXISTS av_audit_events (\
             created_unix_seconds BIGINT NOT NULL,\
             actor TEXT NOT NULL,\
@@ -301,6 +430,7 @@ impl Store {
                 sqlx::query(CREATE_OWNERS).execute(pool).await?;
                 sqlx::query(CREATE_OWNER_BOOTSTRAP).execute(pool).await?;
                 sqlx::query(CREATE_BASIC_USERS).execute(pool).await?;
+                sqlx::query(CREATE_PROFILE_GRANTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_EVENTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_INDEX).execute(pool).await?;
             }
@@ -308,6 +438,7 @@ impl Store {
                 sqlx::query(CREATE_OWNERS).execute(pool).await?;
                 sqlx::query(CREATE_OWNER_BOOTSTRAP).execute(pool).await?;
                 sqlx::query(CREATE_BASIC_USERS).execute(pool).await?;
+                sqlx::query(CREATE_PROFILE_GRANTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_EVENTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_INDEX).execute(pool).await?;
             }
@@ -456,6 +587,51 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn profile_grants_are_exact_and_revocable() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = sqlite_store(&directory, "").await;
+        store
+            .grant_profile("oidc:developer", "infra-dev")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .profile_allowed("oidc:developer", "infra-dev")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .profile_allowed("oidc:developer", "infra-prod")
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.list_allowed_profiles("oidc:developer").await.unwrap(),
+            vec!["infra-dev"]
+        );
+        assert_eq!(
+            store.list_profile_grants("infra-dev").await.unwrap(),
+            vec![ProfileGrant {
+                profile: "infra-dev".into(),
+                subject: "oidc:developer".into(),
+            }]
+        );
+        assert!(
+            store
+                .revoke_profile("oidc:developer", "infra-dev")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .profile_allowed("oidc:developer", "infra-dev")
+                .await
+                .unwrap()
         );
     }
 }

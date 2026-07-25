@@ -1,7 +1,9 @@
 # AV security model
 
-AV is a credential boundary, not a sandbox for its callers. An identity with the
-configured `allowed_groups` role can use every configured profile and route.
+AV is a credential boundary, not a sandbox for its callers. In static mode, an
+identity with the configured `allowed_groups` role can use every configured
+profile and route. In managed mode, that role establishes authentication only:
+each profile and its Tier 2 routes require a separate exact-subject grant.
 Profile endpoints intentionally return Tier 3 values to the calling process;
 that process can print or transmit them. Tier 2 routes are the mechanism for
 keeping a provider credential out of the caller.
@@ -44,6 +46,10 @@ keeping a provider credential out of the caller.
   AV inserts it only when the owner table is empty; a later configuration change
   cannot silently transfer ownership. Use an explicit database recovery process
   to recover an abandoned owner.
+- Managed profile grants are deny-by-default, exact subject-to-profile records.
+  They govern profile enumeration, Tier 3 reads, and Tier 2 routes. Owners can
+  manage grants but do not implicitly receive secret access; grant an owner a
+  profile explicitly when that is intended.
 
 ## Verification
 
