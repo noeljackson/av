@@ -50,7 +50,7 @@ def main():
     _, _, _ = request("/v1/status", auth=False, accepted=(401,))
     _, status, headers = request("/v1/status")
     assert status["basicEnabled"] is True
-    assert status["persistenceEnabled"] is False
+    assert status["persistenceEnabled"] is True
     assert status["registrationEnabled"] is False
     assert status["connectors"] == [
         {"name": "infisical", "kind": "infisical"},
@@ -62,6 +62,11 @@ def main():
 
     _, _, unauthorized_headers = request("/v1/profiles", auth=False, accepted=(401,))
     assert "Basic" in unauthorized_headers["www-authenticate"]
+    _, profiles, _ = request("/v1/profiles")
+    assert profiles == [
+        {"name": "infisical-integration", "environment": "dev", "path": "/"},
+        {"name": "openbao-integration", "environment": "", "path": "secret/data/av-integration"},
+    ]
     _, missing_api, _ = request("/v1/register", auth=False, accepted=(404,))
     assert b"api endpoint not found" in missing_api
 
@@ -69,6 +74,7 @@ def main():
     assert infisical == {"INFISICAL_MARKER": "infisical-ok"}
     _, openbao, _ = request("/v1/profiles/openbao-integration/secrets")
     assert openbao == {"OPENBAO_MARKER": "openbao+ok"}
+    request("/v1/profiles/ungranted-integration/secrets", accepted=(403,))
 
     _, proxy, proxy_headers = request(
         "/v1/proxy/openbao-upstream/verify?source=integration",
@@ -86,6 +92,7 @@ def main():
         headers={"X-Api-Key": "attacker-controlled"},
     )
     assert x_header == {"singleHeader": "accepted"}
+    request("/v1/proxy/ungranted-upstream/verify", accepted=(403,))
     _, encoded, _ = request(
         "/v1/proxy/openbao-upstream/encoded?source=integration"
     )

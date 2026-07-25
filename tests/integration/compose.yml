@@ -117,6 +117,30 @@ services:
       - connector-state:/state:ro
     networks: [connectors]
 
+  managed-seed:
+    image: docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579
+    command:
+      - sh
+      - -ec
+      - |
+        database_url="$$(cat /state/av-control-plane-url)"
+        password_hash="$$(cat /state/av-password.argon2id)"
+        until psql "$$database_url" -tAc "SELECT to_regclass('av_basic_users')" | grep -qx av_basic_users; do sleep 1; done
+        psql "$$database_url" -v ON_ERROR_STOP=1 -v password_hash="$$password_hash" <<'SQL'
+        INSERT INTO av_basic_users (username, password_hash, enabled)
+        VALUES ('operator', :'password_hash', TRUE)
+        ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash, enabled = TRUE;
+        INSERT INTO av_profile_grants (subject, profile)
+        VALUES
+          ('basic:operator', 'infisical-integration'),
+          ('basic:operator', 'openbao-integration')
+        ON CONFLICT (subject, profile) DO NOTHING;
+        SQL
+    read_only: true
+    volumes:
+      - connector-state:/state:ro
+    networks: [connectors]
+
   verify:
     image: docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
     command: ["python", "/test/verify.py"]
@@ -124,6 +148,8 @@ services:
     depends_on:
       av:
         condition: service_started
+      managed-seed:
+        condition: service_completed_successfully
     environment:
       AV_URL: http://av:14322
     volumes:

@@ -19,6 +19,8 @@ else
 fi
 "${compose[@]}" up --detach --wait postgres redis infisical openbao upstream
 "${compose[@]}" up --detach av
+"${compose[@]}" up --detach --no-deps managed-seed
+"${compose[@]}" wait managed-seed
 "${compose[@]}" run --no-deps --rm verify
 
 # Exercise the release CLI, not just AV's HTTP API. The CLI runs in a

@@ -160,10 +160,19 @@ def write_config(project_id, environment):
         "av-password.argon2id",
         "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc",
     )
+    write_secret(
+        "av-control-plane-url",
+        "postgres://infisical:integration-only@postgres:5432/infisical",
+    )
     config = {
         "listen": "0.0.0.0:14322",
         "public_url": "http://127.0.0.1:14322",
         "ui_dir": "/app/ui",
+        "mode": "managed",
+        "managed": {
+            "database_url_file": "/state/av-control-plane-url",
+            "initial_owner_oidc_subject": "oidc:integration-owner",
+        },
         "auth": {
             "mode": "basic",
             "issuer": "",
@@ -173,12 +182,7 @@ def write_config(project_id, environment):
             "signing_algorithms": ["RS256"],
             "allowed_groups": [],
             "group_claim": "groups",
-            "basic_users": [
-                {
-                    "username": "operator",
-                    "password_hash_file": "/state/av-password.argon2id",
-                }
-            ],
+            "basic_users": [],
         },
         "connectors": {
             "infisical": {
@@ -209,6 +213,11 @@ def write_config(project_id, environment):
                 "secret_path": "secret/data/av-integration",
                 "allowed_keys": ["OPENBAO_MARKER"],
             },
+            "ungranted-integration": {
+                "connector": "openbao",
+                "secret_path": "secret/data/av-integration",
+                "allowed_keys": ["OPENBAO_MARKER"],
+            },
         },
         "proxy_routes": {
             "openbao-upstream": {
@@ -234,6 +243,20 @@ def write_config(project_id, environment):
                 "allowed_methods": ["GET"],
                 "allowed_path_prefixes": ["/x-header"],
                 "allowed_request_headers": ["accept"],
+                "allowed_response_headers": ["content-type"],
+                "allowed_query_parameters": [],
+                "allowed_content_types": [],
+                "max_body_bytes": 1024,
+            },
+            "ungranted-upstream": {
+                "profile": "ungranted-integration",
+                "base_url": "http://upstream:8081",
+                "secret_key": "OPENBAO_MARKER",
+                "header": "Authorization",
+                "header_prefix": "Bearer ",
+                "allowed_methods": ["GET"],
+                "allowed_path_prefixes": ["/verify"],
+                "allowed_request_headers": [],
                 "allowed_response_headers": ["content-type"],
                 "allowed_query_parameters": [],
                 "allowed_content_types": [],
