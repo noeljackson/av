@@ -1,6 +1,9 @@
 use std::{
     collections::BTreeMap,
+    env,
     ffi::OsString,
+    fs,
+    path::Path,
     path::PathBuf,
     process::{Command as ProcessCommand, ExitCode},
     time::{Duration, Instant},
@@ -8,13 +11,17 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use av::{
-    config::{Config, PublicAuthConfig},
+    av::v1::{
+        AuthConfig as RpcAuthConfig, GetAuthConfigRequest, GetProfileEnvironmentRequest,
+        ListProfilesRequest, ListProfilesResponse, ProfileEnvironment,
+    },
+    config::{AuthConfig, AuthMode, Config, ConfigMode, ManagedConfig, OidcSigningAlgorithm},
     keyring, server,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{CommandFactory, Parser, Subcommand};
 use reqwest::{Client, StatusCode, header};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tracing_subscriber::EnvFilter;
 use url::Url;
 
@@ -40,9 +47,33 @@ enum Command {
     Logout,
     /// List profiles available to the current identity.
     Profiles,
+    /// Initialize a local managed AV instance under XDG directories.
+    Local {
+        #[command(subcommand)]
+        command: LocalCommand,
+    },
     /// An unknown first word is treated as a profile: av example-dev -- cargo test.
     #[command(external_subcommand)]
     Profile(Vec<OsString>),
+}
+
+#[derive(Subcommand)]
+enum LocalCommand {
+    /// Create a local SQLite-backed configuration. It never creates or stores connector credentials.
+    Init {
+        #[arg(long)]
+        issuer: String,
+        #[arg(long)]
+        client_id: String,
+        #[arg(long, value_name = "ROLE")]
+        allowed_role: String,
+        #[arg(long, value_name = "SUBJECT")]
+        owner_subject: String,
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -65,13 +96,6 @@ struct TokenResponse {
 #[derive(Deserialize)]
 struct OAuthError {
     error: String,
-}
-
-#[derive(Deserialize)]
-struct ProfileSummary {
-    name: String,
-    environment: String,
-    path: String,
 }
 
 #[tokio::main]
@@ -106,6 +130,26 @@ async fn run() -> Result<u8> {
             list_profiles(&cli.api_url).await?;
             Ok(0)
         }
+        Some(Command::Local { command }) => match command {
+            LocalCommand::Init {
+                issuer,
+                client_id,
+                allowed_role,
+                owner_subject,
+                config,
+                force,
+            } => {
+                local_init(
+                    config,
+                    force,
+                    issuer,
+                    client_id,
+                    allowed_role,
+                    owner_subject,
+                )?;
+                Ok(0)
+            }
+        },
         Some(Command::Profile(arguments)) => run_profile(&cli.api_url, arguments).await,
         None => {
             Cli::command().print_help()?;
@@ -115,20 +159,164 @@ async fn run() -> Result<u8> {
     }
 }
 
+fn local_init(
+    config_path: Option<PathBuf>,
+    force: bool,
+    issuer: String,
+    client_id: String,
+    allowed_role: String,
+    owner_subject: String,
+) -> Result<()> {
+    if issuer.is_empty()
+        || client_id.is_empty()
+        || allowed_role.is_empty()
+        || owner_subject.is_empty()
+    {
+        bail!("issuer, client-id, allowed-role, and owner-subject must be non-empty");
+    }
+    let config_root = xdg_path("XDG_CONFIG_HOME", ".config").join("av");
+    let state_root = xdg_path("XDG_STATE_HOME", ".local/state").join("av");
+    let data_root = xdg_path("XDG_DATA_HOME", ".local/share").join("av");
+    let config_path = config_path.unwrap_or_else(|| config_root.join("bootstrap.json"));
+    if config_path.exists() && !force {
+        bail!(
+            "{} already exists; use --force only after reviewing the existing configuration",
+            config_path.display()
+        );
+    }
+    for directory in [
+        &config_root,
+        &state_root,
+        &data_root,
+        &data_root.join("secrets"),
+    ] {
+        fs::create_dir_all(directory).with_context(|| format!("create {}", directory.display()))?;
+        restrict_directory(directory)?;
+    }
+    let database_url_file = data_root.join("secrets/database-url");
+    let database_path = state_root.join("av.sqlite3");
+    write_private_file(
+        &database_url_file,
+        format!("sqlite:{}", database_path.display()).as_bytes(),
+    )?;
+    let config = Config {
+        listen: "127.0.0.1:14322".into(),
+        public_url: "http://127.0.0.1:14322".into(),
+        ui_dir: "ui/dist".into(),
+        mode: ConfigMode::Managed,
+        managed: Some(ManagedConfig {
+            database_url_file: database_url_file.display().to_string(),
+            initial_owner_oidc_subject: owner_subject,
+        }),
+        auth: AuthConfig {
+            mode: AuthMode::Oidc,
+            issuer,
+            client_id: client_id.clone(),
+            audiences: vec![client_id],
+            scopes: vec!["openid".into(), "profile".into(), "email".into()],
+            signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
+            allowed_groups: vec![allowed_role],
+            group_claim: "urn:zitadel:iam:org:project:roles".into(),
+            basic_users: vec![],
+        },
+        connectors: BTreeMap::new(),
+        profiles: BTreeMap::new(),
+        proxy_routes: BTreeMap::new(),
+        max_connector_concurrency: 16,
+        api_rate_limit_per_second: 50,
+        api_rate_limit_burst: 100,
+    };
+    config.validate()?;
+    let rendered = serde_json::to_vec_pretty(&serde_json::json!({
+        "listen": config.listen,
+        "public_url": config.public_url,
+        "ui_dir": config.ui_dir,
+        "mode": "managed",
+        "managed": {
+            "database_url_file": database_url_file,
+            "initial_owner_oidc_subject": config.managed.as_ref().expect("local config has managed settings").initial_owner_oidc_subject,
+        },
+        "auth": {
+            "mode": "oidc",
+            "issuer": config.auth.issuer,
+            "client_id": config.auth.client_id,
+            "audiences": config.auth.audiences,
+            "scopes": config.auth.scopes,
+            "signing_algorithms": ["RS256"],
+            "allowed_groups": config.auth.allowed_groups,
+            "group_claim": config.auth.group_claim,
+            "basic_users": [],
+        },
+        "connectors": {},
+        "profiles": {},
+        "proxy_routes": {},
+        "max_connector_concurrency": config.max_connector_concurrency,
+        "api_rate_limit_per_second": config.api_rate_limit_per_second,
+        "api_rate_limit_burst": config.api_rate_limit_burst,
+    }))
+    .context("serialize local AV configuration")?;
+    write_private_file(&config_path, &rendered)?;
+    println!("local AV initialized at {}", config_path.display());
+    println!("start it with: av serve --config {}", config_path.display());
+    Ok(())
+}
+
+fn xdg_path(variable: &str, fallback_suffix: &str) -> PathBuf {
+    env::var_os(variable).map(PathBuf::from).unwrap_or_else(|| {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(fallback_suffix)
+    })
+}
+
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+        restrict_directory(parent)?;
+    }
+    fs::write(path, contents).with_context(|| format!("write {}", path.display()))?;
+    restrict_file(path)
+}
+
+#[cfg(unix)]
+fn restrict_directory(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("restrict {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_directory(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn restrict_file(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("restrict {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn restrict_file(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 async fn login(api_url: &str) -> Result<()> {
     let client = client(api_url)?;
-    let auth: PublicAuthConfig = client
-        .get(format!("{}/v1/auth/config", api_url.trim_end_matches('/')))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    let device_endpoint = auth
-        .device_authorization_endpoint
+    let auth: RpcAuthConfig = connect_request(
+        api_url,
+        "av.v1.SessionService/GetAuthConfig",
+        &GetAuthConfigRequest::default(),
+        false,
+    )
+    .await?;
+    let device_endpoint = (!auth.device_authorization_endpoint.is_empty())
+        .then_some(auth.device_authorization_endpoint.as_str())
         .context("the configured OIDC client does not expose device authorization")?;
-    let token_endpoint = auth
-        .token_endpoint
+    let token_endpoint = (!auth.token_endpoint.is_empty())
+        .then_some(auth.token_endpoint.as_str())
         .context("OIDC token endpoint is unavailable")?;
     let response = client
         .post(device_endpoint)
@@ -157,7 +345,7 @@ async fn login(api_url: &str) -> Result<()> {
     while Instant::now() < deadline {
         tokio::time::sleep(Duration::from_secs(interval)).await;
         let token_response = client
-            .post(&token_endpoint)
+            .post(token_endpoint)
             .form(&[
                 ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                 ("device_code", response.device_code.as_str()),
@@ -190,12 +378,17 @@ async fn login(api_url: &str) -> Result<()> {
 }
 
 async fn list_profiles(api_url: &str) -> Result<()> {
-    let response = authenticated_get(api_url, "/v1/profiles").await?;
-    let profiles: Vec<ProfileSummary> = response.json().await?;
-    for profile in profiles {
+    let profiles: ListProfilesResponse = connect_request(
+        api_url,
+        "av.v1.SessionService/ListProfiles",
+        &ListProfilesRequest::default(),
+        true,
+    )
+    .await?;
+    for profile in profiles.profiles {
         println!(
             "{}\t{}\t{}",
-            profile.name, profile.environment, profile.path
+            profile.name, profile.environment, profile.secret_path
         );
     }
     Ok(())
@@ -215,14 +408,37 @@ async fn run_profile(api_url: &str, mut arguments: Vec<OsString>) -> Result<u8> 
     if arguments.is_empty() {
         bail!("usage: av <profile> -- <command> [args...]");
     }
-    let path = format!("/v1/profiles/{profile}/secrets");
-    let secrets: BTreeMap<String, String> = authenticated_get(api_url, &path).await?.json().await?;
+    let executable = arguments.remove(0);
+    let executable_basename = Path::new(&executable)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("command name must be valid UTF-8")?
+        .to_owned();
+    let environment: ProfileEnvironment = connect_request(
+        api_url,
+        "av.v1.SessionService/GetProfileEnvironment",
+        &GetProfileEnvironmentRequest {
+            profile,
+            executable_basename,
+            ..Default::default()
+        },
+        true,
+    )
+    .await?;
+    let mut secrets = BTreeMap::new();
+    for value in environment.values {
+        if secrets.insert(value.name.clone(), value.value).is_some() {
+            bail!(
+                "profile returned duplicate environment variable {}",
+                value.name
+            );
+        }
+    }
     for key in secrets.keys() {
         if !valid_env_name(key) {
             bail!("profile contains a key that is not a valid environment variable: {key}");
         }
     }
-    let executable = arguments.remove(0);
     let status = profile_command(executable, arguments, secrets)
         .status()
         .context("start child process")?;
@@ -249,32 +465,52 @@ fn profile_command(
     command
 }
 
-async fn authenticated_get(api_url: &str, path: &str) -> Result<reqwest::Response> {
+async fn connect_request<Request, Response>(
+    api_url: &str,
+    procedure: &str,
+    body: &Request,
+    authenticated: bool,
+) -> Result<Response>
+where
+    Request: Serialize,
+    Response: DeserializeOwned,
+{
     let client = client(api_url)?;
-    let mut request = client.get(format!("{}{}", api_url.trim_end_matches('/'), path));
-    if let Ok(token) = std::env::var("AV_TOKEN") {
-        request = request.bearer_auth(token);
-    } else if let (Ok(username), Ok(password)) = (
-        std::env::var("AV_BASIC_USER"),
-        std::env::var("AV_BASIC_PASSWORD"),
-    ) {
-        request = request.header(
-            header::AUTHORIZATION,
-            format!(
-                "Basic {}",
-                STANDARD.encode(format!("{username}:{password}"))
-            ),
-        );
-    } else if let Some(token) = keyring::load()? {
-        request = request.bearer_auth(token);
-    } else {
-        bail!("not logged in; run `av login` or set AV_TOKEN");
+    let mut request = client
+        .post(format!("{}/{}", api_url.trim_end_matches('/'), procedure))
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("connect-protocol-version", "1")
+        .json(body);
+    if authenticated {
+        request = authenticate_request(request)?;
     }
     let response = request.send().await?;
     if response.status() == StatusCode::UNAUTHORIZED {
         bail!("session is unauthorized or expired; run `av login`");
     }
-    Ok(response.error_for_status()?)
+    Ok(response.error_for_status()?.json().await?)
+}
+
+fn authenticate_request(request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+    if let Ok(token) = std::env::var("AV_TOKEN") {
+        return Ok(request.bearer_auth(token));
+    }
+    if let (Ok(username), Ok(password)) = (
+        std::env::var("AV_BASIC_USER"),
+        std::env::var("AV_BASIC_PASSWORD"),
+    ) {
+        return Ok(request.header(
+            header::AUTHORIZATION,
+            format!(
+                "Basic {}",
+                STANDARD.encode(format!("{username}:{password}"))
+            ),
+        ));
+    }
+    if let Some(token) = keyring::load()? {
+        return Ok(request.bearer_auth(token));
+    }
+    bail!("not logged in; run `av login` or set AV_TOKEN")
 }
 
 fn client(api_url: &str) -> Result<Client> {

@@ -40,6 +40,19 @@ credentialSecrets: []
 #   secretName: av-basic
 #   mountPath: /var/run/av/basic
 
+# Static mode is the portable, Git-managed configuration. Managed mode keeps
+# the same immutable connector bootstrap here, while owner-managed policy and
+# audit records live in an existing PostgreSQL database. AV never installs or
+# creates that database or its Secret.
+controlPlane:
+  mode: static # static | managed
+  existingDatabaseSecret:
+    name: ""
+    key: database-url
+  # Exact OIDC `sub` for the first owner of an empty database. This is an
+  # identifier, not a credential. It is ignored in static mode.
+  initialOwnerOidcSubject: ""
+
 config:
   listen: "0.0.0.0:14322"
   public_url: "https://av.example.com"

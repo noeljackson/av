@@ -6,6 +6,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use argon2::{
+    Algorithm, Argon2, Params, Version,
+    password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
+};
 use axum::{
     Router,
     body::Bytes,
@@ -29,11 +33,22 @@ use tower_http::{
     set_header::SetResponseHeaderLayer,
     trace::TraceLayer,
 };
+use zeroize::Zeroizing;
 
 use crate::{
     auth::Authenticator,
-    config::{AuthMode, Config, ProfileConfig, ProxyRouteConfig},
+    av::v1::{
+        AuditEvent as RpcAuditEvent, AuthConfig as RpcAuthConfig, BasicUser as RpcBasicUser,
+        Connector as RpcConnector, ControlService, ControlServiceExt, EnvironmentValue,
+        GetAuthConfigRequest, GetProfileEnvironmentRequest, GetStatusRequest,
+        ListAuditEventsRequest, ListAuditEventsResponse, ListBasicUsersRequest,
+        ListBasicUsersResponse, ListProfilesRequest, ListProfilesResponse, Profile as RpcProfile,
+        ProfileEnvironment, SessionService, SessionServiceExt, SetBasicUserEnabledRequest,
+        Status as RpcStatus, UpsertBasicUserRequest,
+    },
+    config::{AuthMode, Config, ConfigMode, ProfileConfig, ProxyRouteConfig},
     connector::Connector,
+    store::Store,
 };
 
 #[derive(Clone)]
@@ -44,6 +59,350 @@ struct AppState {
     connector_slots: Arc<Semaphore>,
     api_rate_limiter: ApiRateLimiter,
     proxy_client: reqwest::Client,
+    store: Option<Store>,
+}
+
+#[derive(Clone)]
+struct ConnectSessionService {
+    state: AppState,
+}
+
+#[derive(Clone)]
+struct ConnectControlService {
+    state: AppState,
+}
+
+#[allow(refining_impl_trait)]
+impl ControlService for ConnectControlService {
+    async fn list_basic_users(
+        &self,
+        ctx: connectrpc::RequestContext,
+        _request: connectrpc::ServiceRequest<'_, ListBasicUsersRequest>,
+    ) -> connectrpc::ServiceResult<ListBasicUsersResponse> {
+        require_owner(&self.state, ctx.headers()).await?;
+        let store = managed_store(&self.state)?;
+        let users = store
+            .list_basic_users()
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+        connectrpc::Response::ok(ListBasicUsersResponse {
+            users: users
+                .into_iter()
+                .map(|user| RpcBasicUser {
+                    username: user.username,
+                    enabled: user.enabled,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn upsert_basic_user(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, UpsertBasicUserRequest>,
+    ) -> connectrpc::ServiceResult<RpcBasicUser> {
+        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let username = request.username;
+        if !valid_basic_username(username) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid Basic username",
+            ));
+        }
+        if request.password.len() < 12 || request.password.len() > 1024 {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "Basic passwords must be between 12 and 1024 characters",
+            ));
+        }
+        let password = request.password.to_owned();
+        let password_hash = tokio::task::spawn_blocking(move || hash_basic_password(password))
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("password hashing failed"))?
+            .map_err(|_| connectrpc::ConnectError::internal("password hashing failed"))?;
+        let store = managed_store(&self.state)?;
+        store
+            .upsert_basic_user(username, &password_hash)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "basic_user_upsert",
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(RpcBasicUser {
+            username: username.to_owned(),
+            enabled: true,
+            ..Default::default()
+        })
+    }
+
+    async fn set_basic_user_enabled(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, SetBasicUserEnabledRequest>,
+    ) -> connectrpc::ServiceResult<RpcBasicUser> {
+        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let username = request.username;
+        if !valid_basic_username(username) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid Basic username",
+            ));
+        }
+        let store = managed_store(&self.state)?;
+        let enabled = request.enabled;
+        if !store
+            .set_basic_user_enabled(username, enabled)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        {
+            return Err(connectrpc::ConnectError::not_found("Basic user not found"));
+        }
+        audit_event(
+            &self.state,
+            &identity.subject,
+            if enabled {
+                "basic_user_enabled"
+            } else {
+                "basic_user_disabled"
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(RpcBasicUser {
+            username: username.to_owned(),
+            enabled,
+            ..Default::default()
+        })
+    }
+
+    async fn list_audit_events(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, ListAuditEventsRequest>,
+    ) -> connectrpc::ServiceResult<ListAuditEventsResponse> {
+        require_owner(&self.state, ctx.headers()).await?;
+        let store = managed_store(&self.state)?;
+        let limit = if request.limit == 0 {
+            100
+        } else {
+            request.limit
+        };
+        let events = store
+            .list_audit_events(i64::from(limit))
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+        connectrpc::Response::ok(ListAuditEventsResponse {
+            events: events
+                .into_iter()
+                .map(|event| RpcAuditEvent {
+                    created_unix_seconds: event.created_unix_seconds,
+                    actor: event.actor,
+                    action: event.action,
+                    profile: event.profile.unwrap_or_default(),
+                    route: event.route.unwrap_or_default(),
+                    executable_basename: event.executable_basename.unwrap_or_default(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+}
+
+fn managed_store(state: &AppState) -> std::result::Result<&Store, connectrpc::ConnectError> {
+    state.store.as_ref().ok_or_else(|| {
+        connectrpc::ConnectError::failed_precondition("managed control plane is disabled")
+    })
+}
+
+async fn require_owner(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<crate::auth::Identity, connectrpc::ConnectError> {
+    let identity = authorize_connect(state, headers).await?;
+    let store = managed_store(state)?;
+    if !store
+        .is_owner(&identity.subject)
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+    {
+        return Err(connectrpc::ConnectError::permission_denied(
+            "owner access required",
+        ));
+    }
+    Ok(identity)
+}
+
+fn valid_basic_username(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && !value.contains(':')
+        && !value.chars().any(char::is_control)
+}
+
+fn hash_basic_password(password: String) -> Result<String> {
+    let password = Zeroizing::new(password);
+    let salt = SaltString::generate(&mut OsRng);
+    let params = Params::new(19 * 1024, 2, 1, None)
+        .map_err(|error| anyhow::anyhow!("configure Argon2id: {error}"))?;
+    let hash = Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|error| anyhow::anyhow!("hash Basic password: {error}"))?
+        .to_string();
+    Ok(hash)
+}
+
+#[allow(refining_impl_trait)]
+impl SessionService for ConnectSessionService {
+    async fn get_auth_config(
+        &self,
+        _ctx: connectrpc::RequestContext,
+        _request: connectrpc::ServiceRequest<'_, GetAuthConfigRequest>,
+    ) -> connectrpc::ServiceResult<RpcAuthConfig> {
+        let auth = self.state.auth.public_config();
+        connectrpc::Response::ok(RpcAuthConfig {
+            mode: auth.mode,
+            issuer: auth.issuer,
+            client_id: auth.client_id,
+            scopes: auth.scopes,
+            authorization_endpoint: auth.authorization_endpoint.unwrap_or_default(),
+            token_endpoint: auth.token_endpoint.unwrap_or_default(),
+            device_authorization_endpoint: auth.device_authorization_endpoint.unwrap_or_default(),
+            ..Default::default()
+        })
+    }
+
+    async fn get_status(
+        &self,
+        ctx: connectrpc::RequestContext,
+        _request: connectrpc::ServiceRequest<'_, GetStatusRequest>,
+    ) -> connectrpc::ServiceResult<RpcStatus> {
+        authorize_connect(&self.state, ctx.headers()).await?;
+        let status = public_status(&self.state.config);
+        connectrpc::Response::ok(RpcStatus {
+            oidc_enabled: status.oidc_enabled,
+            basic_enabled: status.basic_enabled,
+            persistence_enabled: status.persistence_enabled,
+            registration_enabled: status.registration_enabled,
+            connectors: status
+                .connectors
+                .into_iter()
+                .map(|connector| RpcConnector {
+                    name: connector.name,
+                    kind: connector.kind,
+                    ..Default::default()
+                })
+                .collect(),
+            profile_count: status.profile_count as u32,
+            proxy_routes: status.proxy_routes,
+            api_rate_limit_per_second: status.api_rate_limit_per_second,
+            api_rate_limit_burst: status.api_rate_limit_burst,
+            ..Default::default()
+        })
+    }
+
+    async fn list_profiles(
+        &self,
+        ctx: connectrpc::RequestContext,
+        _request: connectrpc::ServiceRequest<'_, ListProfilesRequest>,
+    ) -> connectrpc::ServiceResult<ListProfilesResponse> {
+        authorize_connect(&self.state, ctx.headers()).await?;
+        let profiles = self
+            .state
+            .config
+            .profiles
+            .iter()
+            .map(|(name, profile)| RpcProfile {
+                name: name.clone(),
+                environment: profile.environment.clone(),
+                secret_path: profile.secret_path.clone(),
+                ..Default::default()
+            })
+            .collect();
+        connectrpc::Response::ok(ListProfilesResponse {
+            profiles,
+            ..Default::default()
+        })
+    }
+
+    async fn get_profile_environment(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, GetProfileEnvironmentRequest>,
+    ) -> connectrpc::ServiceResult<ProfileEnvironment> {
+        let identity = authorize_connect(&self.state, ctx.headers()).await?;
+        let profile_name = request.profile;
+        let Some(profile) = self.state.config.profiles.get(profile_name) else {
+            return Err(connectrpc::ConnectError::not_found("profile not found"));
+        };
+        let executable = request.executable_basename;
+        if !valid_executable_basename(executable) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "executable_basename must be a basename without control characters",
+            ));
+        }
+        let secrets = fetch_secrets(&self.state, profile)
+            .await
+            .map_err(|error| {
+                tracing::warn!(subject = %identity.subject, profile = profile_name, error = %error, "profile environment unavailable");
+                connectrpc::ConnectError::internal("profile environment unavailable")
+            })?;
+        tracing::info!(
+            subject = %identity.subject,
+            profile = profile_name,
+            executable,
+            key_count = secrets.len(),
+            "profile leased"
+        );
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "profile_lease",
+            Some(profile_name),
+            None,
+            Some(executable),
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(ProfileEnvironment {
+            values: secrets
+                .into_iter()
+                .map(|(name, value)| EnvironmentValue {
+                    name,
+                    value,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+}
+
+async fn authorize_connect(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<crate::auth::Identity, connectrpc::ConnectError> {
+    state
+        .auth
+        .authorize(headers)
+        .await
+        .map_err(|_| connectrpc::ConnectError::unauthenticated("authentication required"))
+}
+
+fn valid_executable_basename(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !value.contains(['/', '\\'])
+        && !value.chars().any(char::is_control)
 }
 
 #[derive(Clone)]
@@ -113,7 +472,19 @@ struct PublicConnector {
 }
 
 pub async fn run(config: Config) -> Result<()> {
-    let auth = Authenticator::new(config.auth.clone()).await?;
+    let store = match config.mode {
+        ConfigMode::Static => None,
+        ConfigMode::Managed => Some(
+            Store::connect(
+                config
+                    .managed
+                    .as_ref()
+                    .expect("managed configuration is validated before server startup"),
+            )
+            .await?,
+        ),
+    };
+    let auth = Authenticator::new(config.auth.clone(), store.clone()).await?;
     let content_security_policy = content_security_policy(&config)?;
     let mut connectors = BTreeMap::new();
     let allow_insecure_http = config.allow_insecure_connector_http();
@@ -138,7 +509,21 @@ pub async fn run(config: Config) -> Result<()> {
             config.api_rate_limit_burst,
         ),
         proxy_client,
+        store,
     };
+    // Register every service before translating into Axum: each translated
+    // Connect router has a fallback, and Axum correctly refuses to merge two
+    // routers that would otherwise compete for unknown RPC paths.
+    let connect_router = Arc::new(ConnectControlService {
+        state: state.clone(),
+    })
+    .register(connectrpc::Router::new());
+    let connect_router = Arc::new(ConnectSessionService {
+        state: state.clone(),
+    })
+    .register(connect_router)
+    .into_axum_router()
+    .with_state::<AppState>(());
     let ui_dir = PathBuf::from(&config.ui_dir);
     let app = Router::new()
         .route("/healthz", get(health))
@@ -149,6 +534,7 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/v1/profiles/{profile}/secrets", get(profile_secrets))
         .route("/v1/proxy/{route}/{*path}", any(proxy))
         .route("/v1/{*path}", any(api_not_found))
+        .merge(connect_router)
         .fallback_service(
             ServeDir::new(&ui_dir).not_found_service(ServeFile::new(ui_dir.join("index.html"))),
         )
@@ -216,7 +602,9 @@ async fn enforce_api_rate_limit(
     request: Request,
     next: Next,
 ) -> Response {
-    if request.uri().path().starts_with("/v1/") && !state.api_rate_limiter.try_acquire().await {
+    if (request.uri().path().starts_with("/v1/") || request.uri().path().starts_with("/av.v1."))
+        && !state.api_rate_limiter.try_acquire().await
+    {
         let mut response =
             (StatusCode::TOO_MANY_REQUESTS, "api rate limit exceeded\n").into_response();
         response
@@ -242,7 +630,7 @@ fn public_status(config: &Config) -> PublicStatus {
     PublicStatus {
         oidc_enabled: matches!(config.auth.mode, AuthMode::Oidc | AuthMode::OidcOrBasic),
         basic_enabled: matches!(config.auth.mode, AuthMode::Basic | AuthMode::OidcOrBasic),
-        persistence_enabled: false,
+        persistence_enabled: config.mode == ConfigMode::Managed,
         registration_enabled: false,
         connectors: config
             .connectors
@@ -291,6 +679,18 @@ async fn profile_secrets(
     match fetch_secrets(&state, profile_config).await {
         Ok(secrets) => {
             tracing::info!(subject = %identity.subject, profile, key_count = secrets.len(), "profile leased");
+            if let Err(error) = audit_event(
+                &state,
+                &identity.subject,
+                "profile_lease",
+                Some(&profile),
+                None,
+                Some("legacy-api"),
+            )
+            .await
+            {
+                return internal_error(error);
+            }
             no_store(axum::Json(secrets).into_response())
         }
         Err(error) => internal_error(error),
@@ -341,6 +741,18 @@ async fn proxy(
             return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();
         }
     };
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        "proxy_request_started",
+        Some(&route.profile),
+        Some(&route_name),
+        None,
+    )
+    .await
+    {
+        return internal_error(error);
+    }
     match proxy_request(
         &state,
         route,
@@ -361,6 +773,22 @@ async fn proxy(
             (StatusCode::BAD_GATEWAY, "proxy request failed\n").into_response()
         }
     }
+}
+
+async fn audit_event(
+    state: &AppState,
+    actor: &str,
+    action: &str,
+    profile: Option<&str>,
+    route: Option<&str>,
+    executable_basename: Option<&str>,
+) -> Result<()> {
+    if let Some(store) = &state.store {
+        store
+            .record_audit(actor, action, profile, route, executable_basename)
+            .await?;
+    }
+    Ok(())
 }
 
 async fn proxy_request(

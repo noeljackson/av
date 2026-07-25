@@ -14,6 +14,10 @@ keeping a provider credential out of the caller.
   processes are untrusted.
 - Connector credentials exist only in mounted files or AV memory. Configuration
   contains paths and public identifiers, never credential values.
+- In managed mode, the PostgreSQL URL is an existing Secret mounted as a file;
+  it is never read from Helm values, emitted into a ConfigMap, or stored in AV's
+  tables. The tables contain owner subjects, Argon2id password hashes, and
+  redacted audit metadata only.
 - OpenBao KV reads are supported. AV rejects leased dynamic-secret responses
   until it can return lease metadata and revoke or renew the lease correctly.
 - Tier 2 assumes the configured provider is not intentionally malicious. AV
@@ -36,6 +40,10 @@ keeping a provider credential out of the caller.
   AV's route policy.
 - Keep production logs outside the AV pod. Logs contain subject, profile/route,
   status, and key count, but never values.
+- Treat the first managed-mode OIDC subject as a one-time database bootstrap.
+  AV inserts it only when the owner table is empty; a later configuration change
+  cannot silently transfer ownership. Use an explicit database recovery process
+  to recover an abandoned owner.
 
 ## Verification
 

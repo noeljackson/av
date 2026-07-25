@@ -6,6 +6,7 @@ container="av-container-smoke-$$"
 workdir=$(mktemp -d)
 trap 'docker rm -f "$container" >/dev/null 2>&1 || true; rm -rf "$workdir"' EXIT
 
+# shellcheck disable=SC2016 # literal synthetic Argon2id PHC test fixture
 printf '%s\n' '$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc' >"$workdir/password.argon2id"
 chmod 0444 "$workdir/password.argon2id"
 
@@ -47,6 +48,23 @@ status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
 [[ "$status" == "401" ]]
 
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/profiles")
+[[ "$status" == "401" ]]
+
+# The generated Connect contract is the preferred control-plane surface. Keep
+# this at HTTP level so the release image, routing, JSON codec, and auth all
+# get exercised together.
+status=$(curl --silent --output "$workdir/connect-profiles" --write-out '%{http_code}' \
+  --header 'Content-Type: application/json' \
+  --header 'Connect-Protocol-Version: 1' \
+  --data '{}' \
+  --user 'operator:password' "$base_url/av.v1.SessionService/ListProfiles") # gitleaks:allow -- synthetic smoke-test credential
+[[ "$status" == "200" ]]
+grep --quiet '"name":"container-smoke"' "$workdir/connect-profiles"
+
+status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --header 'Content-Type: application/json' \
+  --header 'Connect-Protocol-Version: 1' \
+  --data '{}' "$base_url/av.v1.SessionService/ListProfiles")
 [[ "$status" == "401" ]]
 
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/status")

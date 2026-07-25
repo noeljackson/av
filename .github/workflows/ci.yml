@@ -25,7 +25,7 @@ jobs:
         with:
           path: ui
           policy: strict
-          minimum-release-age-days: "30"
+          minimum-release-age-days: "7"
           baseline: ../.supplychain/bun-baseline.json
       - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
