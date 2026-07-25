@@ -1,7 +1,6 @@
 {
   "listen": "127.0.0.1:14322",
   "public_url": "http://127.0.0.1:14322",
-  "ui_dir": "ui/dist",
   "auth": {
     "mode": "disabled",
     "issuer": "",

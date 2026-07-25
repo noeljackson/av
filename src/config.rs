@@ -15,8 +15,6 @@ pub struct Config {
     pub listen: String,
     #[serde(default = "default_public_url")]
     pub public_url: String,
-    #[serde(default = "default_ui_dir")]
-    pub ui_dir: String,
     #[serde(default)]
     pub mode: ConfigMode,
     #[serde(default)]
@@ -710,10 +708,6 @@ fn default_public_url() -> String {
     "http://127.0.0.1:14322".into()
 }
 
-fn default_ui_dir() -> String {
-    "ui/dist".into()
-}
-
 fn default_secret_path() -> String {
     "/".into()
 }
@@ -779,7 +773,6 @@ mod tests {
         Config {
             listen: "127.0.0.1:14322".into(),
             public_url: "http://127.0.0.1:14322".into(),
-            ui_dir: "ui/dist".into(),
             mode: ConfigMode::Static,
             managed: None,
             auth: AuthConfig {

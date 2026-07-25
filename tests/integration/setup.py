@@ -167,7 +167,6 @@ def write_config(project_id, environment):
     config = {
         "listen": "0.0.0.0:14322",
         "public_url": "http://127.0.0.1:14322",
-        "ui_dir": "/app/ui",
         "mode": "managed",
         "managed": {
             "database_url_file": "/state/av-control-plane-url",

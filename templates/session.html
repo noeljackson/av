@@ -1,0 +1,31 @@
+<section class="runtime-matrix" aria-label="Runtime capabilities">
+  <header><span>runtime matrix</span><span>authorized view</span></header>
+  <div class="capabilities">
+    <div><span>oidc</span><strong class="{% if status.oidc_enabled %}on{% endif %}">{% if status.oidc_enabled %}enabled{% else %}disabled{% endif %}</strong></div>
+    <div><span>basic fallback</span><strong class="{% if status.basic_enabled %}on{% endif %}">{% if status.basic_enabled %}enabled{% else %}disabled{% endif %}</strong></div>
+    <div><span>persistence</span><strong class="{% if status.persistence_enabled %}on{% endif %}">{% if status.persistence_enabled %}enabled{% else %}disabled{% endif %}</strong></div>
+    <div><span>registration</span><strong>disabled</strong></div>
+    <div><span>profiles</span><strong class="{% if status.profile_count > 0 %}on{% endif %}">{{ status.profile_count }} exposed</strong></div>
+    <div><span>tier 2 proxy</span><strong class="{% if status.proxy_routes.len() > 0 %}on{% endif %}">{% if status.proxy_routes.len() > 0 %}{{ status.proxy_routes.len() }} enabled{% else %}disabled{% endif %}</strong></div>
+    <div><span>api limiter</span><strong class="on">{{ status.api_rate_limit_per_second }}/s // burst {{ status.api_rate_limit_burst }}</strong></div>
+  </div>
+  <div class="connector-line">
+    <span>connectors</span>
+    {% for connector in status.connectors %}<code><i></i>{{ connector.name }} / {{ connector.kind }}</code>{% else %}<code class="offline">none</code>{% endfor %}
+  </div>
+  {% if status.proxy_routes.len() > 0 %}
+  <div class="connector-line routes"><span>proxy routes</span>{% for route in status.proxy_routes %}<code><i></i>{{ route }}</code>{% endfor %}</div>
+  {% endif %}
+</section>
+<div class="terminal-body connected">
+  <div class="session-row"><div><p class="command"><span>$</span> av profiles --available</p><p class="output"><span class="verified">verified</span> // ephemeral session active</p></div></div>
+  <div class="profiles">
+    {% for profile in profiles %}
+    <article class="profile">
+      <div class="profile-index">{{ loop.index | fmt("{0:02}") }}</div>
+      <div class="profile-name"><h2>{{ profile.name }}</h2><p>{{ profile.environment }} // {{ profile.path }}</p></div>
+      <code>av {{ profile.name }} -- command</code>
+    </article>
+    {% else %}<p class="empty">no profiles available_</p>{% endfor %}
+  </div>
+</div>

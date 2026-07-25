@@ -136,11 +136,10 @@ AV_ALLOW_INSECURE_AUTH=1 cargo run -- serve --config config.local.json
 
 ## Supply-chain posture
 
-- Rust and JavaScript dependency versions are exact and committed in locks.
-- The UI uses Bun with lifecycle scripts disabled, an isolated linker, and a
-  7-day minimum release age for direct and transitive packages.
-- `.supplychain/bun-baseline.json` records reviewed integrity, maintainer, and
-  advertised provenance metadata.
+- Rust dependency versions are exact and committed in `Cargo.lock`.
+- The UI is compiled into the Rust binary: Askama renders HTML fragments and a
+  small first-party browser module performs direct PKCE. There is no Node,
+  Bun, package lock, or browser-side dependency install in the release image.
 - CI uses `noeljackson/supplychain` pinned to an immutable commit.
 - Release artifacts and container images are built by GitHub Actions and receive
   GitHub artifact attestations.
@@ -150,8 +149,6 @@ Run the local gates with:
 ```bash
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
-(cd ui && /usr/bin/bun install --frozen-lockfile && /usr/bin/bun run check && /usr/bin/bun run build)
-supplychain verify-bun --minimum-age-days=7 --baseline=../.supplychain/bun-baseline.json ui
 helm lint chart/av
 tests/connector-integration.sh
 tests/security-scan.sh

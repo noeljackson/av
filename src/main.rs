@@ -202,7 +202,6 @@ fn local_init(
     let config = Config {
         listen: "127.0.0.1:14322".into(),
         public_url: "http://127.0.0.1:14322".into(),
-        ui_dir: "ui/dist".into(),
         mode: ConfigMode::Managed,
         managed: Some(ManagedConfig {
             database_url_file: database_url_file.display().to_string(),
@@ -230,7 +229,6 @@ fn local_init(
     let rendered = serde_json::to_vec_pretty(&serde_json::json!({
         "listen": config.listen,
         "public_url": config.public_url,
-        "ui_dir": config.ui_dir,
         "mode": "managed",
         "managed": {
             "database_url_file": database_url_file,

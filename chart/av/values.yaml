@@ -56,7 +56,6 @@ controlPlane:
 config:
   listen: "0.0.0.0:14322"
   public_url: "https://av.example.com"
-  ui_dir: "/app/ui"
   auth:
     mode: oidc
     issuer: "https://zitadel.example.com"

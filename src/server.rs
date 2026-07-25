@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    path::PathBuf,
     sync::Arc,
     time::Duration,
 };
@@ -10,13 +9,14 @@ use argon2::{
     Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
 };
+use askama::Template;
 use axum::{
     Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     routing::{any, get},
 };
 use base64::{
@@ -28,11 +28,7 @@ use tokio::{
     sync::{Mutex, Semaphore},
     time::Instant,
 };
-use tower_http::{
-    services::{ServeDir, ServeFile},
-    set_header::SetResponseHeaderLayer,
-    trace::TraceLayer,
-};
+use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -618,6 +614,17 @@ struct PublicConnector {
     kind: String,
 }
 
+#[derive(Template)]
+#[template(path = "index.html")]
+struct IndexTemplate;
+
+#[derive(Template)]
+#[template(path = "session.html")]
+struct SessionTemplate<'a> {
+    status: PublicStatus,
+    profiles: Vec<ProfileSummary<'a>>,
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let store = match config.mode {
         ConfigMode::Static => None,
@@ -670,8 +677,10 @@ pub async fn run(config: Config) -> Result<()> {
     })
     .register(connect_router)
     .into_axum_service();
-    let ui_dir = PathBuf::from(&config.ui_dir);
     let app = Router::new()
+        .route("/", get(ui_index))
+        .route("/assets/av.css", get(ui_css))
+        .route("/assets/av.js", get(ui_js))
         .route("/healthz", get(health))
         .route("/readyz", get(health))
         .route("/v1/auth/config", get(auth_config))
@@ -679,12 +688,11 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/v1/profiles", get(profiles))
         .route("/v1/profiles/{profile}/secrets", get(profile_secrets))
         .route("/v1/proxy/{route}/{*path}", any(proxy))
+        .route("/ui/session", get(ui_session))
         .route("/v1/{*path}", any(api_not_found))
         .route_service("/av.v1.SessionService/{*path}", connect_router.clone())
         .route_service("/av.v1.ControlService/{*path}", connect_router)
-        .fallback_service(
-            ServeDir::new(&ui_dir).not_found_service(ServeFile::new(ui_dir.join("index.html"))),
-        )
+        .fallback(get(ui_not_found))
         .layer(DefaultBodyLimit::max(4 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -740,6 +748,40 @@ async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
 }
 
+async fn ui_index() -> Response {
+    match IndexTemplate.render() {
+        Ok(page) => no_store(Html(page).into_response()),
+        Err(error) => {
+            tracing::error!(%error, "render UI index");
+            no_store((StatusCode::INTERNAL_SERVER_ERROR, "UI unavailable\n").into_response())
+        }
+    }
+}
+
+async fn ui_css() -> Response {
+    no_store(
+        (
+            [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+            include_str!("../assets/av.css"),
+        )
+            .into_response(),
+    )
+}
+
+async fn ui_js() -> Response {
+    no_store(
+        (
+            [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            include_str!("../assets/av.js"),
+        )
+            .into_response(),
+    )
+}
+
+async fn ui_not_found() -> Response {
+    no_store((StatusCode::NOT_FOUND, "not found\n").into_response())
+}
+
 async fn api_not_found() -> impl IntoResponse {
     (StatusCode::NOT_FOUND, "api endpoint not found\n")
 }
@@ -764,6 +806,40 @@ async fn enforce_api_rate_limit(
 
 async fn auth_config(State(state): State<AppState>) -> impl IntoResponse {
     no_store(axum::Json(state.auth.public_config()).into_response())
+}
+
+async fn ui_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let identity = match state.auth.authorize(&headers).await {
+        Ok(identity) => identity,
+        Err(error) => return unauthorized(error),
+    };
+    let allowed = match permitted_profile_names(&state, &identity.subject).await {
+        Ok(allowed) => allowed,
+        Err(error) => return internal_error(error),
+    };
+    let profiles = state
+        .config
+        .profiles
+        .iter()
+        .filter(|(name, _)| allowed.contains(*name))
+        .map(|(name, profile)| ProfileSummary {
+            name,
+            environment: &profile.environment,
+            path: &profile.secret_path,
+        })
+        .collect();
+    match (SessionTemplate {
+        status: public_status(&state.config),
+        profiles,
+    })
+    .render()
+    {
+        Ok(page) => no_store(Html(page).into_response()),
+        Err(error) => {
+            tracing::error!(%error, "render authenticated UI session");
+            no_store((StatusCode::INTERNAL_SERVER_ERROR, "UI unavailable\n").into_response())
+        }
+    }
 }
 
 async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1384,7 +1460,6 @@ mod tests {
         let config: Config = serde_json::from_value(serde_json::json!({
             "listen": "127.0.0.1:14322",
             "public_url": "http://127.0.0.1:14322",
-            "ui_dir": "ui/dist",
             "auth": {
                 "mode": "oidc_or_basic",
                 "issuer": "https://identity.example.com",
@@ -1429,6 +1504,46 @@ mod tests {
             policy,
             "default-src 'self'; connect-src 'self' https://identity.example.com; script-src 'self'; style-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
         );
+    }
+
+    #[test]
+    fn locked_ui_does_not_render_runtime_configuration() {
+        let page = IndexTemplate.render().unwrap();
+        assert!(page.contains("authentication required"));
+        assert!(!page.contains("connectors"));
+        assert!(!page.contains("profile"));
+        assert!(!page.contains("identity.example.com"));
+    }
+
+    #[test]
+    fn authenticated_ui_escapes_configuration_values() {
+        let page = SessionTemplate {
+            status: PublicStatus {
+                oidc_enabled: true,
+                basic_enabled: false,
+                persistence_enabled: true,
+                registration_enabled: false,
+                connectors: vec![PublicConnector {
+                    name: "<script>connector</script>".into(),
+                    kind: "infisical".into(),
+                }],
+                profile_count: 1,
+                proxy_routes: vec!["<script>route</script>".into()],
+                api_rate_limit_per_second: 50,
+                api_rate_limit_burst: 100,
+            },
+            profiles: vec![ProfileSummary {
+                name: "<script>profile</script>",
+                environment: "dev",
+                path: "/",
+            }],
+        }
+        .render()
+        .unwrap();
+        assert!(page.contains("&#60;script&#62;profile&#60;/script&#62;"));
+        assert!(page.contains("&#60;script&#62;connector&#60;/script&#62;"));
+        assert!(!page.contains("<script>profile</script>"));
+        assert!(!page.contains("<script>connector</script>"));
     }
 
     #[tokio::test]

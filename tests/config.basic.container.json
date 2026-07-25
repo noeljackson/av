@@ -1,7 +1,6 @@
 {
   "listen": "0.0.0.0:14322",
   "public_url": "http://127.0.0.1:17422",
-  "ui_dir": "/app/ui",
   "auth": {
     "mode": "basic",
     "issuer": "",

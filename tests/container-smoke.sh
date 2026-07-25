@@ -27,7 +27,7 @@ done
 curl --fail --silent "$base_url/healthz" >/dev/null
 
 curl --fail --silent --dump-header "$workdir/root-headers" \
-  --output /dev/null "$base_url/"
+  --output "$workdir/root" "$base_url/"
 for header in \
   cache-control \
   content-security-policy \
@@ -37,6 +37,20 @@ for header in \
 do
   grep --ignore-case --quiet "^${header}:" "$workdir/root-headers"
 done
+grep --quiet 'authentication required' "$workdir/root"
+grep --quiet 'src="/assets/av.js"' "$workdir/root"
+! grep --quiet 'container-smoke' "$workdir/root"
+
+curl --fail --silent --dump-header "$workdir/ui-asset-headers" \
+  --output "$workdir/ui-asset" "$base_url/assets/av.js"
+grep --ignore-case --quiet '^content-type: text/javascript' "$workdir/ui-asset-headers"
+grep --quiet 'code_challenge_method: "S256"' "$workdir/ui-asset"
+
+status=$(curl --silent --output "$workdir/ui-session" --write-out '%{http_code}' \
+  --user 'operator:password' "$base_url/ui/session") # gitleaks:allow -- synthetic smoke-test credential
+[[ "$status" == "200" ]]
+grep --quiet 'runtime matrix' "$workdir/ui-session"
+grep --quiet 'container-smoke' "$workdir/ui-session"
 
 status=$(curl --silent --output "$workdir/profiles" --write-out '%{http_code}' \
   --user 'operator:password' "$base_url/v1/profiles") # gitleaks:allow -- synthetic smoke-test credential

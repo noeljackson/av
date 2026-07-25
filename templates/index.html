@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="referrer" content="no-referrer">
+    <title>av</title>
+    <link rel="stylesheet" href="/assets/av.css">
+    <script type="module" src="/assets/av.js"></script>
+  </head>
+  <body>
+    <main>
+      <nav class="topline" aria-label="AV status">
+        <a class="brand" href="/" aria-label="AV home"><span>~/</span>av</a>
+        <div class="link-state" id="link-state"><span class="status-dot"></span><span id="link-label">identity required</span></div>
+      </nav>
+
+      <section class="secure-screen" id="locked-screen">
+        <header class="secure-heading">
+          <span class="lock-mark" aria-hidden="true">[::]</span>
+          <div>
+            <p class="kicker">restricted</p>
+            <h1>authentication required</h1>
+            <p>Sign in to continue. Workspace details are unavailable before authentication.</p>
+          </div>
+        </header>
+        <section class="terminal auth-terminal" aria-live="polite">
+          <header class="terminal-bar"><span>session://locked</span><span>access denied</span></header>
+          <div class="terminal-body auth" id="auth-panel">
+            <p class="command"><span>$</span> av auth</p>
+            <p class="output pulse" id="auth-progress">checking session_</p>
+            <p class="error output" id="auth-error" hidden></p>
+            <button class="primary" id="oidc-login" type="button" hidden><span>[</span> continue with identity provider <span>]</span></button>
+            <div id="basic-login" hidden>
+              <div class="divider" id="auth-divider" hidden><span>or</span></div>
+              <form class="fields" id="basic-form">
+                <label><span>user</span><input id="username" autocomplete="username" required></label>
+                <label><span>pass</span><input id="password" type="password" autocomplete="current-password" required></label>
+                <button type="submit"><span>[</span> sign in <span>]</span></button>
+              </form>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="dashboard" id="dashboard" aria-live="polite" hidden>
+        <header class="dashboard-heading">
+          <div><p class="kicker">authenticated session</p><h1>runtime</h1></div>
+          <button class="quiet" id="logout" type="button">disconnect</button>
+        </header>
+        <section class="terminal">
+          <div class="terminal-body compact" id="session-panel"><p class="output pulse">loading authorized workspace_</p></div>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>
