@@ -5,3 +5,6 @@ pub mod infisical;
 pub mod keyring;
 pub mod openbao;
 pub mod server;
+pub mod store;
+
+connectrpc::include_generated!();

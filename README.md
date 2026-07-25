@@ -1,9 +1,17 @@
 # av
 
-`av` is a stateless, OIDC-authenticated connector and credential proxy. It does
-not have registration, a user database, or an application-secret database.
-Infisical and OpenBao are connector backends; neither is embedded in `av`, and
-switching a profile between them does not change the CLI or proxy contract.
+`av` is an OIDC-authenticated connector and credential proxy. It does not have
+registration or an application-secret database. Infisical and OpenBao are
+connector backends; neither is embedded in `av`, and switching a profile
+between them does not change the CLI or proxy contract.
+
+AV has two deliberately separate operating modes:
+
+- **Static** (the default) has an immutable JSON policy and no database.
+- **Managed** retains the immutable connector bootstrap in JSON, but puts
+  owner-managed Basic users and redacted audit metadata in SQLite (local) or an
+  existing PostgreSQL database (Kubernetes). It never persists connector
+  credentials or fetched secret values.
 
 ## What it implements
 
@@ -66,12 +74,37 @@ browser UI uses Authorization Code + PKCE; the CLI uses Device Authorization.
 Configure both grants on the Zitadel public client and register the exact UI
 callback, normally `https://av.tail.noel.sh/`.
 
-Basic auth is optional and static: usernames are config and mounted files hold
-Argon2id PHC hashes, never plaintext passwords. Hashes are validated at startup.
+Basic auth is optional. In static mode, usernames are config and mounted files
+hold Argon2id PHC hashes, never plaintext passwords. In managed mode, the first
+configured OIDC subject is inserted only into an empty database and is the
+owner; that owner can manage enabled Basic users through the authenticated
+control API. Passwords are accepted only on the encrypted request, immediately
+hashed with AV's bounded Argon2id policy, and never returned or audited. Hashes
+are validated at startup in static mode.
 AV accepts only bounded Argon2id v19 parameters (19–64 MiB, 2–6 iterations,
 parallelism 1–4), and password verification is limited to two concurrent jobs.
 There is no sign-up endpoint. Disabled auth is rejected unless the listener is loopback and
 `AV_ALLOW_INSECURE_AUTH=1` is explicitly set.
+
+### Local managed AV
+
+`av local init` is a local-only control-plane bootstrap. It creates a
+mode-`0600` JSON file and database URL file under XDG directories and a SQLite
+database under XDG state. It does not start a service, register users, or store
+any connector credential.
+
+```bash
+av local init \
+  --issuer https://zitadel.example.com \
+  --client-id av-local \
+  --allowed-role av-users \
+  --owner-subject '<exact Zitadel OIDC sub>'
+av serve --config "${XDG_CONFIG_HOME:-$HOME/.config}/av/bootstrap.json"
+```
+
+Treat the `owner-subject` as an irreversible bootstrap value for a fresh local
+database: changing it in JSON later does not replace an existing owner. Remove
+the database explicitly if you intend to discard that local control plane.
 
 ## Configuration
 
@@ -112,7 +145,10 @@ tests/security-scan.sh
 The integration runner starts separate pinned containers for AV, Infisical,
 Postgres, Redis, OpenBao, and a credential-aware upstream. It bootstraps only
 disposable test data on an internal Docker network, verifies both connector
-reads plus hostile Tier 2 behavior, and removes containers and volumes on exit.
+reads plus hostile Tier 2 behavior, then copies the release CLI from the AV
+image and verifies `av profiles` and both `av <profile> -- <command>` paths.
+The CLI checks that wrapper credentials never reach its child process. The
+runner removes containers and volumes on exit.
 The security runner adds a pinned, isolated ZAP passive scan. See
 [`SECURITY.md`](SECURITY.md) for the trust boundaries and test procedure.
 
@@ -130,6 +166,25 @@ The chart never creates connector credentials. Mount an existing Kubernetes
 Secret with `credentialSecrets`, and put only file paths in `config`. Tailnet
 ingress/DNS policy belongs in downstream values, so the chart remains
 upstreamable.
+
+For one shared AV control plane in a cluster, select managed mode and reference
+an **existing** Secret whose selected key is a PostgreSQL URL. The URL is
+mounted only as `/var/run/av/control-plane/database-url`; Helm never places it
+in values, a ConfigMap, or the AV database. AV creates its own tables at
+startup, so no separately privileged migration Job is needed at this stage.
+
+```yaml
+controlPlane:
+  mode: managed
+  existingDatabaseSecret:
+    name: av-control-plane-postgres
+    key: database-url
+  initialOwnerOidcSubject: "<exact Zitadel OIDC sub>"
+```
+
+Managed mode refuses to render without both the existing Secret name and first
+owner subject. The database is your lifecycle, backup, and network-policy
+responsibility; AV's chart intentionally has no bundled PostgreSQL dependency.
 
 ```bash
 helm upgrade --install av oci://ghcr.io/noeljackson/charts/av \

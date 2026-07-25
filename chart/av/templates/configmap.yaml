@@ -1,3 +1,15 @@
+{{- $config := deepCopy .Values.config -}}
+{{- if eq .Values.controlPlane.mode "managed" -}}
+{{- $databaseSecretName := required "controlPlane.existingDatabaseSecret.name is required in managed mode" .Values.controlPlane.existingDatabaseSecret.name -}}
+{{- $ownerSubject := required "controlPlane.initialOwnerOidcSubject is required in managed mode" .Values.controlPlane.initialOwnerOidcSubject -}}
+{{- $_ := set $config "mode" "managed" -}}
+{{- $_ := set $config "managed" (dict "database_url_file" "/var/run/av/control-plane/database-url" "initial_owner_oidc_subject" $ownerSubject) -}}
+{{- else if eq .Values.controlPlane.mode "static" -}}
+{{- $_ := set $config "mode" "static" -}}
+{{- $_ := unset $config "managed" -}}
+{{- else -}}
+{{- fail "controlPlane.mode must be static or managed" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -5,4 +17,4 @@ metadata:
   labels:
     {{- include "av.labels" . | nindent 4 }}
 data:
-  config.json: {{ .Values.config | toJson | quote }}
+  config.json: {{ $config | toJson | quote }}

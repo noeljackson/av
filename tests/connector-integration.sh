@@ -3,9 +3,11 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 compose=(docker compose --project-name "av-connectors-${UID}-$$" --file "$root/tests/integration/compose.yml")
+workdir=$(mktemp -d "$root/.tmp.connector-cli.XXXXXX")
 
 cleanup() {
   "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
+  rm -rf "$workdir"
 }
 trap cleanup EXIT
 
@@ -18,3 +20,45 @@ fi
 "${compose[@]}" up --detach --wait postgres redis infisical openbao upstream
 "${compose[@]}" up --detach av
 "${compose[@]}" run --no-deps --rm verify
+
+# Exercise the release CLI, not just AV's HTTP API. The CLI runs in a
+# disposable, capability-free container sharing AV's network namespace. That
+# makes the test endpoint loopback without publishing a host port or adding a
+# production insecure-transport exception.
+av_container=$("${compose[@]}" ps --quiet av)
+docker cp "$av_container:/usr/local/bin/av" "$workdir/av"
+chmod 0755 "$workdir/av"
+run_cli() {
+  docker run --rm --pull never \
+    --network "container:$av_container" \
+    --read-only \
+    --cap-drop ALL \
+    --security-opt no-new-privileges:true \
+    --volume "$workdir/av:/usr/local/bin/av:ro" \
+    --env AV_URL=http://127.0.0.1:14322 \
+    --env AV_BASIC_USER=operator \
+    --env AV_BASIC_PASSWORD=password \
+    docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0 \
+    /usr/local/bin/av "$@"
+}
+
+run_cli profiles >"$workdir/profiles"
+grep --quiet '^infisical-integration' "$workdir/profiles"
+grep --quiet '^openbao-integration' "$workdir/profiles"
+
+# shellcheck disable=SC2016 # The child shell, not this harness, expands these variables.
+run_cli infisical-integration -- sh -eu -c '
+  test "${INFISICAL_MARKER:-}" = infisical-ok
+  test -z "${AV_TOKEN:-}"
+  test -z "${AV_BASIC_USER:-}"
+  test -z "${AV_BASIC_PASSWORD:-}"
+'
+# shellcheck disable=SC2016 # The child shell, not this harness, expands these variables.
+run_cli openbao-integration -- sh -eu -c '
+  test "${OPENBAO_MARKER:-}" = openbao+ok
+  test -z "${AV_TOKEN:-}"
+  test -z "${AV_BASIC_USER:-}"
+  test -z "${AV_BASIC_PASSWORD:-}"
+'
+
+printf 'connector_cli_integration=ok\n'

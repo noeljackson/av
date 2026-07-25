@@ -1,0 +1,112 @@
+syntax = "proto3";
+
+package av.v1;
+
+service SessionService {
+  rpc GetAuthConfig(GetAuthConfigRequest) returns (AuthConfig);
+  rpc GetStatus(GetStatusRequest) returns (Status);
+  rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
+  rpc GetProfileEnvironment(GetProfileEnvironmentRequest) returns (ProfileEnvironment);
+}
+
+service ControlService {
+  rpc ListBasicUsers(ListBasicUsersRequest) returns (ListBasicUsersResponse);
+  rpc UpsertBasicUser(UpsertBasicUserRequest) returns (BasicUser);
+  rpc SetBasicUserEnabled(SetBasicUserEnabledRequest) returns (BasicUser);
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
+}
+
+message GetAuthConfigRequest {}
+
+message AuthConfig {
+  string mode = 1;
+  string issuer = 2;
+  string client_id = 3;
+  repeated string scopes = 4;
+  string authorization_endpoint = 5;
+  string token_endpoint = 6;
+  string device_authorization_endpoint = 7;
+}
+
+message GetStatusRequest {}
+
+message Connector {
+  string name = 1;
+  string kind = 2;
+}
+
+message Status {
+  bool oidc_enabled = 1;
+  bool basic_enabled = 2;
+  bool persistence_enabled = 3;
+  bool registration_enabled = 4;
+  repeated Connector connectors = 5;
+  uint32 profile_count = 6;
+  repeated string proxy_routes = 7;
+  uint32 api_rate_limit_per_second = 8;
+  uint32 api_rate_limit_burst = 9;
+}
+
+message ListProfilesRequest {}
+
+message Profile {
+  string name = 1;
+  string environment = 2;
+  string secret_path = 3;
+}
+
+message ListProfilesResponse {
+  repeated Profile profiles = 1;
+}
+
+message GetProfileEnvironmentRequest {
+  string profile = 1;
+  string executable_basename = 2;
+}
+
+message EnvironmentValue {
+  string name = 1;
+  string value = 2;
+}
+
+message ProfileEnvironment {
+  repeated EnvironmentValue values = 1;
+}
+
+message ListBasicUsersRequest {}
+
+message BasicUser {
+  string username = 1;
+  bool enabled = 2;
+}
+
+message ListBasicUsersResponse {
+  repeated BasicUser users = 1;
+}
+
+message UpsertBasicUserRequest {
+  string username = 1;
+  string password = 2;
+}
+
+message SetBasicUserEnabledRequest {
+  string username = 1;
+  bool enabled = 2;
+}
+
+message ListAuditEventsRequest {
+  uint32 limit = 1;
+}
+
+message AuditEvent {
+  int64 created_unix_seconds = 1;
+  string actor = 2;
+  string action = 3;
+  string profile = 4;
+  string route = 5;
+  string executable_basename = 6;
+}
+
+message ListAuditEventsResponse {
+  repeated AuditEvent events = 1;
+}

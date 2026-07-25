@@ -17,6 +17,10 @@ pub struct Config {
     pub public_url: String,
     #[serde(default = "default_ui_dir")]
     pub ui_dir: String,
+    #[serde(default)]
+    pub mode: ConfigMode,
+    #[serde(default)]
+    pub managed: Option<ManagedConfig>,
     pub auth: AuthConfig,
     #[serde(default)]
     pub connectors: BTreeMap<String, ConnectorConfig>,
@@ -30,6 +34,26 @@ pub struct Config {
     pub api_rate_limit_per_second: u32,
     #[serde(default = "default_api_rate_limit_burst")]
     pub api_rate_limit_burst: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigMode {
+    #[default]
+    Static,
+    Managed,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedConfig {
+    /// Absolute file path mounted from an existing Secret. The database URL is
+    /// never accepted from Helm values or written to AV's database.
+    pub database_url_file: String,
+    /// Exact OIDC subject that becomes the first owner on an empty shared
+    /// control-plane database. Local Basic bootstrap is added by `av local init`.
+    #[serde(default)]
+    pub initial_owner_oidc_subject: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -263,6 +287,22 @@ impl Config {
             bail!("public_url must be an origin without credentials, query, fragment, or path");
         }
 
+        match (self.mode, &self.managed) {
+            (ConfigMode::Static, None) => {}
+            (ConfigMode::Static, Some(_)) => {
+                bail!("managed configuration is only valid when mode is managed")
+            }
+            (ConfigMode::Managed, Some(managed)) => {
+                if !Path::new(&managed.database_url_file).is_absolute() {
+                    bail!("managed.database_url_file must be an absolute path");
+                }
+                if managed.initial_owner_oidc_subject.trim().is_empty() {
+                    bail!("managed.initial_owner_oidc_subject must be non-empty");
+                }
+            }
+            (ConfigMode::Managed, None) => bail!("managed mode requires a managed configuration"),
+        }
+
         match self.auth.mode {
             AuthMode::Oidc | AuthMode::OidcOrBasic => {
                 if self.auth.issuer.is_empty() || self.auth.client_id.is_empty() {
@@ -300,6 +340,7 @@ impl Config {
 
         if matches!(self.auth.mode, AuthMode::Basic | AuthMode::OidcOrBasic)
             && self.auth.basic_users.is_empty()
+            && self.mode == ConfigMode::Static
         {
             bail!("basic auth mode requires basic_users");
         }
@@ -739,6 +780,8 @@ mod tests {
             listen: "127.0.0.1:14322".into(),
             public_url: "http://127.0.0.1:14322".into(),
             ui_dir: "ui/dist".into(),
+            mode: ConfigMode::Static,
+            managed: None,
             auth: AuthConfig {
                 mode: AuthMode::Disabled,
                 issuer: String::new(),
@@ -764,6 +807,24 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
         assert!(base_config().validate().is_err());
+    }
+
+    #[test]
+    fn managed_mode_requires_an_absolute_database_url_file_and_first_owner() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AV_ALLOW_INSECURE_AUTH", "1") };
+        let mut config = base_config();
+        config.mode = ConfigMode::Managed;
+        config.managed = Some(ManagedConfig {
+            database_url_file: "relative/database-url".into(),
+            initial_owner_oidc_subject: String::new(),
+        });
+        assert!(config.validate().is_err());
+        config.managed.as_mut().unwrap().database_url_file = "/run/av/database-url".into();
+        assert!(config.validate().is_err());
+        config.managed.as_mut().unwrap().initial_owner_oidc_subject = "oidc:owner".into();
+        assert!(config.validate().is_ok());
+        unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
     }
 
     #[test]

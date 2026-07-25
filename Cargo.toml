@@ -13,18 +13,26 @@ argon2 = "=0.5.3"
 axum = { version = "=0.8.8", features = ["http2", "json", "tokio"] }
 base64 = "=0.22.1"
 clap = { version = "=4.6.0", features = ["derive", "env"] }
+connectrpc = { version = "=0.8.1", default-features = false, features = ["axum", "gzip", "json", "server", "zstd"] }
+buffa = "=0.8.1"
 jsonwebtoken = { version = "=10.4.0", default-features = false, features = ["aws_lc_rs"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["http2", "json", "rustls-tls"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.149"
+sqlx = { version = "=0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "sqlite"] }
 tokio = { version = "=1.50.0", features = ["macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tower-http = { version = "=0.6.8", features = ["fs", "limit", "request-id", "set-header", "trace"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt", "json"] }
 url = "=2.5.8"
+zeroize = "=1.9.0"
 
 [dev-dependencies]
 tempfile = "=3.26.0"
+
+[build-dependencies]
+connectrpc-build = "=0.8.0"
+protoc-bin-vendored = "=3.2.0"
 
 [profile.release]
 codegen-units = 1

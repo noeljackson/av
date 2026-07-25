@@ -11,7 +11,10 @@ use tokio::{
     time::Instant,
 };
 
-use crate::config::{AuthConfig, AuthMode, OidcSigningAlgorithm, PublicAuthConfig};
+use crate::{
+    config::{AuthConfig, AuthMode, OidcSigningAlgorithm, PublicAuthConfig},
+    store::Store,
+};
 
 const JWKS_REFRESH_COOLDOWN: Duration = Duration::from_secs(60);
 const BASIC_AUTH_MAX_CONCURRENCY: usize = 2;
@@ -21,6 +24,8 @@ const BASIC_AUTH_MAX_MEMORY_KIB: u32 = 64 * 1024;
 const BASIC_AUTH_MIN_ITERATIONS: u32 = 2;
 const BASIC_AUTH_MAX_ITERATIONS: u32 = 6;
 const BASIC_AUTH_MAX_PARALLELISM: u32 = 4;
+const DUMMY_PASSWORD_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc";
 
 #[derive(Clone)]
 pub struct Authenticator {
@@ -31,6 +36,7 @@ pub struct Authenticator {
     jwks_refresh: Arc<Mutex<JwksRefreshState>>,
     basic_credentials: Arc<Vec<BasicCredential>>,
     basic_slots: Arc<Semaphore>,
+    store: Option<Store>,
 }
 
 #[derive(Default)]
@@ -67,7 +73,7 @@ pub struct Identity {
 }
 
 impl Authenticator {
-    pub async fn new(config: AuthConfig) -> Result<Self> {
+    pub async fn new(config: AuthConfig, store: Option<Store>) -> Result<Self> {
         let basic_credentials = load_basic_credentials(&config)?;
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
@@ -104,6 +110,7 @@ impl Authenticator {
             jwks_refresh: Arc::new(Mutex::new(JwksRefreshState::default())),
             basic_credentials: Arc::new(basic_credentials),
             basic_slots: Arc::new(Semaphore::new(BASIC_AUTH_MAX_CONCURRENCY)),
+            store,
         };
         if authenticator.discovery.is_some() {
             authenticator.refresh_jwks(true).await?;
@@ -216,19 +223,32 @@ impl Authenticator {
         let (username, password) = decoded
             .split_once(':')
             .context("invalid Basic authorization payload")?;
-        let requested = self
-            .basic_credentials
-            .iter()
-            .find(|credential| credential.username == username);
+        let managed_hash = match &self.store {
+            Some(store) => store.basic_password_hash(username).await?,
+            None => None,
+        };
+        let requested = if self.store.is_some() {
+            managed_hash.as_ref().map(|password_hash| BasicCredential {
+                username: username.to_owned(),
+                password_hash: password_hash.clone(),
+            })
+        } else {
+            self.basic_credentials
+                .iter()
+                .find(|credential| credential.username == username)
+                .cloned()
+        };
         let comparison = requested
-            .or_else(|| self.basic_credentials.first())
-            .context("Basic authentication has no configured credentials")?;
+            .as_ref()
+            .or_else(|| self.basic_credentials.first());
         let _permit = tokio::time::timeout(BASIC_AUTH_QUEUE_TIMEOUT, self.basic_slots.acquire())
             .await
             .context("Basic authentication queue timed out")?
             .context("Basic authentication limiter is closed")?;
         let password = password.to_owned();
-        let password_hash = comparison.password_hash.clone();
+        let password_hash = comparison
+            .map(|credential| credential.password_hash.clone())
+            .unwrap_or_else(|| DUMMY_PASSWORD_HASH.to_owned());
         let valid = tokio::task::spawn_blocking(move || {
             let hash = PasswordHash::new(&password_hash)
                 .map_err(|error| anyhow::anyhow!("parse Argon2id password hash: {error}"))?;
@@ -388,6 +408,7 @@ mod tests {
             jwks_refresh: Arc::new(Mutex::new(JwksRefreshState::default())),
             basic_credentials: Arc::new(Vec::new()),
             basic_slots: Arc::new(Semaphore::new(BASIC_AUTH_MAX_CONCURRENCY)),
+            store: None,
         }
     }
 
@@ -404,20 +425,23 @@ mod tests {
             "$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc\n",
         )
         .unwrap();
-        let authenticator = Authenticator::new(AuthConfig {
-            mode: AuthMode::Basic,
-            issuer: String::new(),
-            client_id: String::new(),
-            audiences: vec![],
-            scopes: vec![],
-            signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
-            allowed_groups: vec![],
-            group_claim: "groups".into(),
-            basic_users: vec![BasicUserConfig {
-                username: "operator".into(),
-                password_hash_file: password_hash_file.display().to_string(),
-            }],
-        })
+        let authenticator = Authenticator::new(
+            AuthConfig {
+                mode: AuthMode::Basic,
+                issuer: String::new(),
+                client_id: String::new(),
+                audiences: vec![],
+                scopes: vec![],
+                signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
+                allowed_groups: vec![],
+                group_claim: "groups".into(),
+                basic_users: vec![BasicUserConfig {
+                    username: "operator".into(),
+                    password_hash_file: password_hash_file.display().to_string(),
+                }],
+            },
+            None,
+        )
         .await
         .unwrap();
 
@@ -455,20 +479,23 @@ mod tests {
             "$argon2id$v=19$m=8,t=1,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc\n",
         )
         .unwrap();
-        let result = Authenticator::new(AuthConfig {
-            mode: AuthMode::Basic,
-            issuer: String::new(),
-            client_id: String::new(),
-            audiences: vec![],
-            scopes: vec![],
-            signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
-            allowed_groups: vec![],
-            group_claim: "groups".into(),
-            basic_users: vec![BasicUserConfig {
-                username: "operator".into(),
-                password_hash_file: password_hash_file.display().to_string(),
-            }],
-        })
+        let result = Authenticator::new(
+            AuthConfig {
+                mode: AuthMode::Basic,
+                issuer: String::new(),
+                client_id: String::new(),
+                audiences: vec![],
+                scopes: vec![],
+                signing_algorithms: vec![OidcSigningAlgorithm::Rs256],
+                allowed_groups: vec![],
+                group_claim: "groups".into(),
+                basic_users: vec![BasicUserConfig {
+                    username: "operator".into(),
+                    password_hash_file: password_hash_file.display().to_string(),
+                }],
+            },
+            None,
+        )
         .await;
         assert!(result.is_err());
         std::fs::remove_file(password_hash_file).unwrap();
