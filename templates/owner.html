@@ -1,0 +1,45 @@
+<section class="owner-panel" aria-label="Managed control plane">
+  <header class="owner-heading"><span>managed control plane</span><span>owner only</span></header>
+  <div class="owner-grid">
+    <section class="owner-section">
+      <h2>basic users</h2>
+      <p>Passwords are Argon2id-hashed by AV and never returned.</p>
+      <form class="owner-form" hx-post="/ui/owner/basic-users" hx-target="#owner-panel" hx-swap="innerHTML">
+        <label><span>user</span><input name="username" autocomplete="username" required></label>
+        <label><span>pass</span><input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="1024" required></label>
+        <button type="submit">add or rotate</button>
+      </form>
+      <div class="owner-list">
+        {% for user in basic_users %}
+        <article><code>{{ user.username }}</code><span class="{% if user.enabled %}enabled{% else %}disabled{% endif %}">{% if user.enabled %}enabled{% else %}disabled{% endif %}</span>
+          <form hx-post="/ui/owner/basic-users/enabled" hx-target="#owner-panel" hx-swap="innerHTML">
+            <input type="hidden" name="username" value="{{ user.username }}">
+            <input type="hidden" name="enabled" value="{% if user.enabled %}false{% else %}true{% endif %}">
+            <button class="quiet" type="submit">{% if user.enabled %}disable{% else %}enable{% endif %}</button>
+          </form>
+        </article>
+        {% else %}<p class="empty">no managed basic users_</p>{% endfor %}
+      </div>
+    </section>
+    <section class="owner-section">
+      <h2>profile grants</h2>
+      <p>Exact OIDC or <code>basic:&lt;username&gt;</code> subject grants only.</p>
+      <form class="owner-form" hx-post="/ui/owner/grants" hx-target="#owner-panel" hx-swap="innerHTML">
+        <label><span>subject</span><input name="subject" autocomplete="off" required></label>
+        <label><span>profile</span><select name="profile" required>{% for profile in profiles %}<option value="{{ profile }}">{{ profile }}</option>{% endfor %}</select></label>
+        <button type="submit">grant profile</button>
+      </form>
+      <div class="owner-list grants">
+        {% for grant in grants %}
+        <article><code>{{ grant.subject }}</code><span>{{ grant.profile }}</span>
+          <form hx-post="/ui/owner/grants/revoke" hx-target="#owner-panel" hx-swap="innerHTML">
+            <input type="hidden" name="subject" value="{{ grant.subject }}">
+            <input type="hidden" name="profile" value="{{ grant.profile }}">
+            <button class="quiet" type="submit">revoke</button>
+          </form>
+        </article>
+        {% else %}<p class="empty">no profile grants_</p>{% endfor %}
+      </div>
+    </section>
+  </div>
+</section>

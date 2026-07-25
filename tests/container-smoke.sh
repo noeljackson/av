@@ -39,12 +39,19 @@ do
 done
 grep --quiet 'authentication required' "$workdir/root"
 grep --quiet 'src="/assets/av.js"' "$workdir/root"
-! grep --quiet 'container-smoke' "$workdir/root"
+if grep --quiet 'container-smoke' "$workdir/root"; then
+  echo 'locked UI leaked runtime configuration' >&2
+  exit 1
+fi
 
 curl --fail --silent --dump-header "$workdir/ui-asset-headers" \
   --output "$workdir/ui-asset" "$base_url/assets/av.js"
 grep --ignore-case --quiet '^content-type: text/javascript' "$workdir/ui-asset-headers"
 grep --quiet 'code_challenge_method: "S256"' "$workdir/ui-asset"
+
+status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --user 'operator:password' "$base_url/ui/owner") # gitleaks:allow -- synthetic smoke-test credential
+[[ "$status" == "404" ]]
 
 status=$(curl --silent --output "$workdir/ui-session" --write-out '%{http_code}' \
   --user 'operator:password' "$base_url/ui/session") # gitleaks:allow -- synthetic smoke-test credential

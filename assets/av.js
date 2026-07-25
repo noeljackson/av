@@ -124,11 +124,19 @@ async function loadSession(candidate) {
   if (!response.ok) throw new Error(`authentication failed (${response.status})`);
   authorization = candidate;
   sessionPanel.innerHTML = await response.text();
+  window.htmx.process(sessionPanel);
   lockedScreen.hidden = true;
   dashboard.hidden = false;
   linkState.classList.add("linked");
   linkLabel.textContent = "identity linked";
+  window.htmx.ajax("GET", "/ui/owner", { target: "#owner-panel", swap: "innerHTML" });
 }
+
+document.body.addEventListener("htmx:configRequest", (event) => {
+  if (authorization && event.detail.path.startsWith("/ui/")) {
+    event.detail.headers.authorization = authorization;
+  }
+});
 
 function redirectUri() {
   return `${location.origin}/`;

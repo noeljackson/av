@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Vendored so the AV UI has no runtime CDN dependency or JavaScript package
+# manager. Keep the URL, filename, and published SRI hash together when
+# updating this file.
+version=2.0.10
+revision=bdc7d7d3e25d0390c7ee11049806e8279b075598
+url="https://raw.githubusercontent.com/bigskysoftware/htmx/${revision}/dist/htmx.min.js"
+expected_sha384='H5SrcfygHmAuTDZphMHqBJLc3FhssKjG7w/CeCpFReSfwBWDTKpkzPP8c+cLsK+V'
+destination="assets/vendor/htmx-${version}.min.js"
+
+mkdir -p "$(dirname "$destination")"
+curl --fail --location --proto '=https' --tlsv1.2 --retry 3 --output "$destination" "$url"
+actual_sha384=$(openssl dgst -sha384 -binary "$destination" | base64 | tr -d '\n')
+if [[ "$actual_sha384" != "$expected_sha384" ]]; then
+  echo "HTMX integrity check failed" >&2
+  exit 1
+fi

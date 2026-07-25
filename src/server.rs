@@ -13,17 +13,17 @@ use askama::Template;
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Request, State},
+    extract::{DefaultBodyLimit, Form, Path, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
-    routing::{any, get},
+    routing::{any, get, post},
 };
 use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{
     sync::{Mutex, Semaphore},
     time::Instant,
@@ -625,6 +625,42 @@ struct SessionTemplate<'a> {
     profiles: Vec<ProfileSummary<'a>>,
 }
 
+#[derive(Template)]
+#[template(path = "owner.html")]
+struct OwnerTemplate {
+    basic_users: Vec<OwnerBasicUser>,
+    profiles: Vec<String>,
+    grants: Vec<OwnerProfileGrant>,
+}
+
+struct OwnerBasicUser {
+    username: String,
+    enabled: bool,
+}
+
+struct OwnerProfileGrant {
+    profile: String,
+    subject: String,
+}
+
+#[derive(Deserialize)]
+struct BasicUserForm {
+    username: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct BasicUserEnabledForm {
+    username: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct ProfileGrantForm {
+    profile: String,
+    subject: String,
+}
+
 pub async fn run(config: Config) -> Result<()> {
     let store = match config.mode {
         ConfigMode::Static => None,
@@ -681,6 +717,7 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/", get(ui_index))
         .route("/assets/av.css", get(ui_css))
         .route("/assets/av.js", get(ui_js))
+        .route("/assets/htmx-2.0.10.min.js", get(ui_htmx))
         .route("/healthz", get(health))
         .route("/readyz", get(health))
         .route("/v1/auth/config", get(auth_config))
@@ -689,6 +726,14 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/v1/profiles/{profile}/secrets", get(profile_secrets))
         .route("/v1/proxy/{route}/{*path}", any(proxy))
         .route("/ui/session", get(ui_session))
+        .route("/ui/owner", get(ui_owner))
+        .route("/ui/owner/basic-users", post(ui_upsert_basic_user))
+        .route(
+            "/ui/owner/basic-users/enabled",
+            post(ui_set_basic_user_enabled),
+        )
+        .route("/ui/owner/grants", post(ui_grant_profile))
+        .route("/ui/owner/grants/revoke", post(ui_revoke_profile))
         .route("/v1/{*path}", any(api_not_found))
         .route_service("/av.v1.SessionService/{*path}", connect_router.clone())
         .route_service("/av.v1.ControlService/{*path}", connect_router)
@@ -778,6 +823,16 @@ async fn ui_js() -> Response {
     )
 }
 
+async fn ui_htmx() -> Response {
+    no_store(
+        (
+            [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+            include_str!("../assets/vendor/htmx-2.0.10.min.js"),
+        )
+            .into_response(),
+    )
+}
+
 async fn ui_not_found() -> Response {
     no_store((StatusCode::NOT_FOUND, "not found\n").into_response())
 }
@@ -840,6 +895,252 @@ async fn ui_session(State(state): State<AppState>, headers: HeaderMap) -> Respon
             no_store((StatusCode::INTERNAL_SERVER_ERROR, "UI unavailable\n").into_response())
         }
     }
+}
+
+async fn ui_owner(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = ui_require_owner(&state, &headers).await {
+        return response;
+    }
+    render_owner_panel(&state).await
+}
+
+async fn ui_upsert_basic_user(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<BasicUserForm>,
+) -> Response {
+    if !is_trusted_browser_origin(&headers, &state.config.public_url) {
+        return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
+    }
+    let identity = match ui_require_owner(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !valid_basic_username(&form.username) {
+        return ui_bad_request("invalid Basic username");
+    }
+    if form.password.len() < 12 || form.password.len() > 1024 {
+        return ui_bad_request("Basic passwords must be between 12 and 1024 characters");
+    }
+    let password_hash =
+        match tokio::task::spawn_blocking(move || hash_basic_password(form.password)).await {
+            Ok(Ok(hash)) => hash,
+            _ => return internal_error(anyhow::anyhow!("password hashing failed")),
+        };
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    if let Err(error) = store
+        .upsert_basic_user(&form.username, &password_hash)
+        .await
+    {
+        return internal_error(error);
+    }
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        "basic_user_upsert",
+        None,
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(&state).await
+}
+
+async fn ui_set_basic_user_enabled(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<BasicUserEnabledForm>,
+) -> Response {
+    if !is_trusted_browser_origin(&headers, &state.config.public_url) {
+        return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
+    }
+    let identity = match ui_require_owner(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !valid_basic_username(&form.username) {
+        return ui_bad_request("invalid Basic username");
+    }
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    match store
+        .set_basic_user_enabled(&form.username, form.enabled)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return ui_bad_request("Basic user not found"),
+        Err(error) => return internal_error(error),
+    }
+    let action = if form.enabled {
+        "basic_user_enabled"
+    } else {
+        "basic_user_disabled"
+    };
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        action,
+        None,
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(&state).await
+}
+
+async fn ui_grant_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProfileGrantForm>,
+) -> Response {
+    if !is_trusted_browser_origin(&headers, &state.config.public_url) {
+        return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
+    }
+    let identity = match ui_require_owner(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_known_profile(&state, &form.profile) {
+        return ui_bad_request(error.to_string());
+    }
+    if !valid_policy_subject(&form.subject) {
+        return ui_bad_request("invalid policy subject");
+    }
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    if let Err(error) = store.grant_profile(&form.subject, &form.profile).await {
+        return internal_error(error);
+    }
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        "profile_grant",
+        Some(&form.profile),
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(&state).await
+}
+
+async fn ui_revoke_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ProfileGrantForm>,
+) -> Response {
+    if !is_trusted_browser_origin(&headers, &state.config.public_url) {
+        return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
+    }
+    let identity = match ui_require_owner(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if let Err(error) = require_known_profile(&state, &form.profile) {
+        return ui_bad_request(error.to_string());
+    }
+    if !valid_policy_subject(&form.subject) {
+        return ui_bad_request("invalid policy subject");
+    }
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    match store.revoke_profile(&form.subject, &form.profile).await {
+        Ok(true) => {}
+        Ok(false) => return ui_bad_request("profile grant not found"),
+        Err(error) => return internal_error(error),
+    }
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        "profile_grant_revoked",
+        Some(&form.profile),
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(&state).await
+}
+
+async fn ui_require_owner(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<crate::auth::Identity, Response> {
+    let identity = state.auth.authorize(headers).await.map_err(unauthorized)?;
+    let Some(store) = state.store.as_ref() else {
+        return Err(ui_not_found().await);
+    };
+    match store.is_owner(&identity.subject).await {
+        Ok(true) => Ok(identity),
+        Ok(false) => Err(no_store(
+            (StatusCode::FORBIDDEN, "owner access required\n").into_response(),
+        )),
+        Err(error) => Err(internal_error(error)),
+    }
+}
+
+async fn render_owner_panel(state: &AppState) -> Response {
+    let Some(store) = state.store.as_ref() else {
+        return ui_not_found().await;
+    };
+    let basic_users = match store.list_basic_users().await {
+        Ok(users) => users
+            .into_iter()
+            .map(|user| OwnerBasicUser {
+                username: user.username,
+                enabled: user.enabled,
+            })
+            .collect(),
+        Err(error) => return internal_error(error),
+    };
+    let profiles: Vec<_> = state.config.profiles.keys().cloned().collect();
+    let mut grants = Vec::new();
+    for profile in &profiles {
+        let profile_grants = match store.list_profile_grants(profile).await {
+            Ok(grants) => grants,
+            Err(error) => return internal_error(error),
+        };
+        grants.extend(profile_grants.into_iter().map(|grant| OwnerProfileGrant {
+            profile: grant.profile,
+            subject: grant.subject,
+        }));
+    }
+    match (OwnerTemplate {
+        basic_users,
+        profiles,
+        grants,
+    })
+    .render()
+    {
+        Ok(page) => no_store(Html(page).into_response()),
+        Err(error) => {
+            tracing::error!(%error, "render managed owner UI");
+            no_store((StatusCode::INTERNAL_SERVER_ERROR, "UI unavailable\n").into_response())
+        }
+    }
+}
+
+fn ui_bad_request(message: impl AsRef<str>) -> Response {
+    no_store((StatusCode::BAD_REQUEST, format!("{}\n", message.as_ref())).into_response())
 }
 
 async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -1544,6 +1845,26 @@ mod tests {
         assert!(page.contains("&#60;script&#62;connector&#60;/script&#62;"));
         assert!(!page.contains("<script>profile</script>"));
         assert!(!page.contains("<script>connector</script>"));
+    }
+
+    #[test]
+    fn owner_ui_escapes_policy_subjects_and_usernames() {
+        let page = OwnerTemplate {
+            basic_users: vec![OwnerBasicUser {
+                username: "<script>user</script>".into(),
+                enabled: true,
+            }],
+            profiles: vec!["<script>profile</script>".into()],
+            grants: vec![OwnerProfileGrant {
+                profile: "<script>profile</script>".into(),
+                subject: "<script>subject</script>".into(),
+            }],
+        }
+        .render()
+        .unwrap();
+        assert!(page.contains("&#60;script&#62;user&#60;/script&#62;"));
+        assert!(page.contains("&#60;script&#62;subject&#60;/script&#62;"));
+        assert!(!page.contains("<script>subject</script>"));
     }
 
     #[tokio::test]

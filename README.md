@@ -113,9 +113,11 @@ Static mode preserves the simple model: every identity that passes the OIDC
 role check can use every configured profile and Tier 2 route. Managed mode is
 stricter: profiles and routes are unavailable until an owner grants the exact
 OIDC subject (or a `basic:<username>` subject) the named profile through the
-owner-only Connect control API. The same grant governs profile listing, Tier 3
-environment leases, and any Tier 2 route backed by that profile. Revoking the
-grant takes effect on the next request.
+owner-only Connect control API. The embedded web UI exposes the same owner-only
+Basic-user and profile-grant operations after browser PKCE; it is unavailable
+to non-owners and static deployments. The same grant governs profile listing,
+Tier 3 environment leases, and any Tier 2 route backed by that profile.
+Revoking the grant takes effect on the next request.
 
 Connector definitions and their credential-file references remain immutable
 bootstrap configuration; the control plane deliberately cannot add, edit, or
@@ -138,8 +140,9 @@ AV_ALLOW_INSECURE_AUTH=1 cargo run -- serve --config config.local.json
 
 - Rust dependency versions are exact and committed in `Cargo.lock`.
 - The UI is compiled into the Rust binary: Askama renders HTML fragments and a
-  small first-party browser module performs direct PKCE. There is no Node,
-  Bun, package lock, or browser-side dependency install in the release image.
+  small first-party browser module performs direct PKCE. Managed owner forms
+  use a vendored, SRI-verified HTMX release. There is no Node, Bun, package
+  lock, or browser-side dependency install in the release image.
 - CI uses `noeljackson/supplychain` pinned to an immutable commit.
 - Release artifacts and container images are built by GitHub Actions and receive
   GitHub artifact attestations.

@@ -135,6 +135,10 @@ services:
           ('basic:operator', 'infisical-integration'),
           ('basic:operator', 'openbao-integration')
         ON CONFLICT (subject, profile) DO NOTHING;
+        -- Test-only owner fixture: production bootstraps an OIDC subject.
+        INSERT INTO av_owners (subject)
+        VALUES ('basic:operator')
+        ON CONFLICT (subject) DO NOTHING;
         SQL
     read_only: true
     volumes:

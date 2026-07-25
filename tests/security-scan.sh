@@ -17,6 +17,8 @@ else
 fi
 "${compose[@]}" up --detach --wait postgres redis infisical openbao upstream
 "${compose[@]}" up --detach av
+"${compose[@]}" up --detach --no-deps managed-seed
+"${compose[@]}" wait managed-seed
 "${compose[@]}" run --no-deps --rm verify
 "${compose[@]}" run --no-deps --rm zap
 

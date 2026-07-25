@@ -3,6 +3,7 @@ import base64
 import json
 import os
 import time
+import urllib.parse
 import urllib.error
 import urllib.request
 
@@ -62,6 +63,42 @@ def main():
 
     _, _, unauthorized_headers = request("/v1/profiles", auth=False, accepted=(401,))
     assert "Basic" in unauthorized_headers["www-authenticate"]
+
+    request("/ui/owner", auth=False, accepted=(401,))
+    _, owner, _ = request("/ui/owner")
+    assert b"managed control plane" in owner
+    assert b"operator" in owner
+    assert b"integration-only" not in owner
+    form_headers = {"Content-Type": "application/x-www-form-urlencoded"}
+    ui_password = "managed-ui-password"
+    _, owner, _ = request(
+        "/ui/owner/basic-users",
+        method="POST",
+        body=urllib.parse.urlencode(
+            {"username": "managed-ui", "password": ui_password}
+        ).encode(),
+        headers=form_headers,
+    )
+    assert b"managed-ui" in owner
+    assert ui_password.encode() not in owner
+    request(
+        "/ui/owner/basic-users/enabled",
+        method="POST",
+        body=urllib.parse.urlencode(
+            {"username": "managed-ui", "enabled": "false"}
+        ).encode(),
+        headers=form_headers,
+    )
+    request(
+        "/ui/owner/basic-users/enabled",
+        method="POST",
+        origin="https://hostile.example",
+        body=urllib.parse.urlencode(
+            {"username": "managed-ui", "enabled": "true"}
+        ).encode(),
+        headers=form_headers,
+        accepted=(403,),
+    )
     _, profiles, _ = request("/v1/profiles")
     assert profiles == [
         {"name": "infisical-integration", "environment": "dev", "path": "/"},
@@ -74,6 +111,25 @@ def main():
     assert infisical == {"INFISICAL_MARKER": "infisical-ok"}
     _, openbao, _ = request("/v1/profiles/openbao-integration/secrets")
     assert openbao == {"OPENBAO_MARKER": "openbao+ok"}
+    request("/v1/profiles/ungranted-integration/secrets", accepted=(403,))
+    request(
+        "/ui/owner/grants",
+        method="POST",
+        body=urllib.parse.urlencode(
+            {"subject": "basic:operator", "profile": "ungranted-integration"}
+        ).encode(),
+        headers=form_headers,
+    )
+    _, granted, _ = request("/v1/profiles/ungranted-integration/secrets")
+    assert granted == {"OPENBAO_MARKER": "openbao+ok"}
+    request(
+        "/ui/owner/grants/revoke",
+        method="POST",
+        body=urllib.parse.urlencode(
+            {"subject": "basic:operator", "profile": "ungranted-integration"}
+        ).encode(),
+        headers=form_headers,
+    )
     request("/v1/profiles/ungranted-integration/secrets", accepted=(403,))
 
     _, proxy, proxy_headers = request(
