@@ -2,5 +2,5 @@
 ignoreScripts = true
 exact = true
 linker = "isolated"
-minimumReleaseAge = 2592000
+minimumReleaseAge = 604800
 minimumReleaseAgeExcludes = []

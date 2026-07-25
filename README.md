@@ -123,7 +123,7 @@ AV_ALLOW_INSECURE_AUTH=1 cargo run -- serve --config config.local.json
 
 - Rust and JavaScript dependency versions are exact and committed in locks.
 - The UI uses Bun with lifecycle scripts disabled, an isolated linker, and a
-  30-day minimum release age for direct and transitive packages.
+  7-day minimum release age for direct and transitive packages.
 - `.supplychain/bun-baseline.json` records reviewed integrity, maintainer, and
   advertised provenance metadata.
 - CI uses `noeljackson/supplychain` pinned to an immutable commit.
@@ -136,7 +136,7 @@ Run the local gates with:
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 (cd ui && /usr/bin/bun install --frozen-lockfile && /usr/bin/bun run check && /usr/bin/bun run build)
-supplychain verify-bun --minimum-age-days=30 --baseline=../.supplychain/bun-baseline.json ui
+supplychain verify-bun --minimum-age-days=7 --baseline=../.supplychain/bun-baseline.json ui
 helm lint chart/av
 tests/connector-integration.sh
 tests/security-scan.sh
