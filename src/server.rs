@@ -40,11 +40,12 @@ use crate::{
     av::v1::{
         AuditEvent as RpcAuditEvent, AuthConfig as RpcAuthConfig, BasicUser as RpcBasicUser,
         Connector as RpcConnector, ControlService, ControlServiceExt, EnvironmentValue,
-        GetAuthConfigRequest, GetProfileEnvironmentRequest, GetStatusRequest,
+        GetAuthConfigRequest, GetProfileEnvironmentRequest, GetStatusRequest, GrantProfileRequest,
         ListAuditEventsRequest, ListAuditEventsResponse, ListBasicUsersRequest,
-        ListBasicUsersResponse, ListProfilesRequest, ListProfilesResponse, Profile as RpcProfile,
-        ProfileEnvironment, SessionService, SessionServiceExt, SetBasicUserEnabledRequest,
-        Status as RpcStatus, UpsertBasicUserRequest,
+        ListBasicUsersResponse, ListProfileGrantsRequest, ListProfileGrantsResponse,
+        ListProfilesRequest, ListProfilesResponse, Profile as RpcProfile, ProfileEnvironment,
+        ProfileGrant as RpcProfileGrant, RevokeProfileRequest, SessionService, SessionServiceExt,
+        SetBasicUserEnabledRequest, Status as RpcStatus, UpsertBasicUserRequest,
     },
     config::{AuthMode, Config, ConfigMode, ProfileConfig, ProxyRouteConfig},
     connector::Connector,
@@ -216,6 +217,106 @@ impl ControlService for ConnectControlService {
             ..Default::default()
         })
     }
+
+    async fn list_profile_grants(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, ListProfileGrantsRequest>,
+    ) -> connectrpc::ServiceResult<ListProfileGrantsResponse> {
+        require_owner(&self.state, ctx.headers()).await?;
+        let profile = request.profile;
+        require_known_profile(&self.state, profile)?;
+        let grants = managed_store(&self.state)?
+            .list_profile_grants(profile)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+        connectrpc::Response::ok(ListProfileGrantsResponse {
+            grants: grants
+                .into_iter()
+                .map(|grant| RpcProfileGrant {
+                    profile: grant.profile,
+                    subject: grant.subject,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn grant_profile(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, GrantProfileRequest>,
+    ) -> connectrpc::ServiceResult<RpcProfileGrant> {
+        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let profile = request.profile;
+        let subject = request.subject;
+        require_known_profile(&self.state, profile)?;
+        if !valid_policy_subject(subject) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid policy subject",
+            ));
+        }
+        managed_store(&self.state)?
+            .grant_profile(subject, profile)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "profile_grant",
+            Some(profile),
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(RpcProfileGrant {
+            profile: profile.to_owned(),
+            subject: subject.to_owned(),
+            ..Default::default()
+        })
+    }
+
+    async fn revoke_profile(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, RevokeProfileRequest>,
+    ) -> connectrpc::ServiceResult<RpcProfileGrant> {
+        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let profile = request.profile;
+        let subject = request.subject;
+        require_known_profile(&self.state, profile)?;
+        if !valid_policy_subject(subject) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid policy subject",
+            ));
+        }
+        if !managed_store(&self.state)?
+            .revoke_profile(subject, profile)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        {
+            return Err(connectrpc::ConnectError::not_found(
+                "profile grant not found",
+            ));
+        }
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "profile_grant_revoked",
+            Some(profile),
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(RpcProfileGrant {
+            profile: profile.to_owned(),
+            subject: subject.to_owned(),
+            ..Default::default()
+        })
+    }
 }
 
 fn managed_store(state: &AppState) -> std::result::Result<&Store, connectrpc::ConnectError> {
@@ -247,6 +348,21 @@ fn valid_basic_username(value: &str) -> bool {
         && value.len() <= 128
         && !value.contains(':')
         && !value.chars().any(char::is_control)
+}
+
+fn valid_policy_subject(value: &str) -> bool {
+    !value.trim().is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
+}
+
+fn require_known_profile(
+    state: &AppState,
+    profile: &str,
+) -> std::result::Result<(), connectrpc::ConnectError> {
+    if state.config.profiles.contains_key(profile) {
+        Ok(())
+    } else {
+        Err(connectrpc::ConnectError::not_found("profile not found"))
+    }
 }
 
 fn hash_basic_password(password: String) -> Result<String> {
@@ -315,12 +431,16 @@ impl SessionService for ConnectSessionService {
         ctx: connectrpc::RequestContext,
         _request: connectrpc::ServiceRequest<'_, ListProfilesRequest>,
     ) -> connectrpc::ServiceResult<ListProfilesResponse> {
-        authorize_connect(&self.state, ctx.headers()).await?;
+        let identity = authorize_connect(&self.state, ctx.headers()).await?;
+        let allowed = permitted_profile_names(&self.state, &identity.subject)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
         let profiles = self
             .state
             .config
             .profiles
             .iter()
+            .filter(|(name, _)| allowed.contains(*name))
             .map(|(name, profile)| RpcProfile {
                 name: name.clone(),
                 environment: profile.environment.clone(),
@@ -344,6 +464,14 @@ impl SessionService for ConnectSessionService {
         let Some(profile) = self.state.config.profiles.get(profile_name) else {
             return Err(connectrpc::ConnectError::not_found("profile not found"));
         };
+        if !profile_permitted(&self.state, &identity.subject, profile_name)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        {
+            return Err(connectrpc::ConnectError::permission_denied(
+                "profile access is not granted",
+            ));
+        }
         let executable = request.executable_basename;
         if !valid_executable_basename(executable) {
             return Err(connectrpc::ConnectError::invalid_argument(
@@ -396,6 +524,25 @@ async fn authorize_connect(
         .authorize(headers)
         .await
         .map_err(|_| connectrpc::ConnectError::unauthenticated("authentication required"))
+}
+
+async fn permitted_profile_names(state: &AppState, subject: &str) -> Result<BTreeSet<String>> {
+    match &state.store {
+        None => Ok(state.config.profiles.keys().cloned().collect()),
+        Some(store) => Ok(store
+            .list_allowed_profiles(subject)
+            .await?
+            .into_iter()
+            .filter(|profile| state.config.profiles.contains_key(profile))
+            .collect()),
+    }
+}
+
+async fn profile_permitted(state: &AppState, subject: &str, profile: &str) -> Result<bool> {
+    match &state.store {
+        None => Ok(true),
+        Some(store) => store.profile_allowed(subject, profile).await,
+    }
 }
 
 fn valid_executable_basename(value: &str) -> bool {
@@ -648,13 +795,19 @@ fn public_status(config: &Config) -> PublicStatus {
 }
 
 async fn profiles(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(error) = state.auth.authorize(&headers).await {
-        return unauthorized(error);
-    }
+    let identity = match state.auth.authorize(&headers).await {
+        Ok(identity) => identity,
+        Err(error) => return unauthorized(error),
+    };
+    let allowed = match permitted_profile_names(&state, &identity.subject).await {
+        Ok(allowed) => allowed,
+        Err(error) => return internal_error(error),
+    };
     let profiles: Vec<_> = state
         .config
         .profiles
         .iter()
+        .filter(|(name, _)| allowed.contains(*name))
         .map(|(name, profile)| ProfileSummary {
             name,
             environment: &profile.environment,
@@ -676,6 +829,13 @@ async fn profile_secrets(
     let Some(profile_config) = state.config.profiles.get(&profile) else {
         return (StatusCode::NOT_FOUND, "profile not found\n").into_response();
     };
+    match profile_permitted(&state, &identity.subject, &profile).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return (StatusCode::FORBIDDEN, "profile access is not granted\n").into_response();
+        }
+        Err(error) => return internal_error(error),
+    }
     match fetch_secrets(&state, profile_config).await {
         Ok(secrets) => {
             tracing::info!(subject = %identity.subject, profile, key_count = secrets.len(), "profile leased");
@@ -712,6 +872,11 @@ async fn proxy(
     let Some(route) = state.config.proxy_routes.get(&route_name) else {
         return (StatusCode::NOT_FOUND, "proxy route not found\n").into_response();
     };
+    match profile_permitted(&state, &identity.subject, &route.profile).await {
+        Ok(true) => {}
+        Ok(false) => return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response(),
+        Err(error) => return internal_error(error),
+    }
     if !is_trusted_browser_origin(&headers, &state.config.public_url) {
         tracing::warn!(subject = %identity.subject, route = route_name, "proxy request rejected for untrusted browser origin");
         return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();

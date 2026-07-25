@@ -11,7 +11,8 @@ AV has two deliberately separate operating modes:
 - **Managed** retains the immutable connector bootstrap in JSON, but puts
   owner-managed Basic users and redacted audit metadata in SQLite (local) or an
   existing PostgreSQL database (Kubernetes). It never persists connector
-  credentials or fetched secret values.
+  credentials or fetched secret values. Managed profile access is
+  deny-by-default and granted to exact authenticated subjects.
 
 ## What it implements
 
@@ -105,6 +106,20 @@ av serve --config "${XDG_CONFIG_HOME:-$HOME/.config}/av/bootstrap.json"
 Treat the `owner-subject` as an irreversible bootstrap value for a fresh local
 database: changing it in JSON later does not replace an existing owner. Remove
 the database explicitly if you intend to discard that local control plane.
+
+### Managed profile policy
+
+Static mode preserves the simple model: every identity that passes the OIDC
+role check can use every configured profile and Tier 2 route. Managed mode is
+stricter: profiles and routes are unavailable until an owner grants the exact
+OIDC subject (or a `basic:<username>` subject) the named profile through the
+owner-only Connect control API. The same grant governs profile listing, Tier 3
+environment leases, and any Tier 2 route backed by that profile. Revoking the
+grant takes effect on the next request.
+
+Connector definitions and their credential-file references remain immutable
+bootstrap configuration; the control plane deliberately cannot add, edit, or
+retrieve provider credentials.
 
 ## Configuration
 
