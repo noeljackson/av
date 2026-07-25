@@ -67,6 +67,15 @@ status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
   --data '{}' "$base_url/av.v1.SessionService/ListProfiles")
 [[ "$status" == "401" ]]
 
+# Both generated Connect service namespaces must be routed ahead of the UI
+# fallback. This unauthenticated control request proves that it reaches AV's
+# auth boundary instead of the static-file handler.
+status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --header 'Content-Type: application/json' \
+  --header 'Connect-Protocol-Version: 1' \
+  --data '{}' "$base_url/av.v1.ControlService/ListBasicUsers")
+[[ "$status" == "401" ]]
+
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' "$base_url/v1/status")
 [[ "$status" == "401" ]]
 

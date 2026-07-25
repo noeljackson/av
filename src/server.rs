@@ -511,9 +511,9 @@ pub async fn run(config: Config) -> Result<()> {
         proxy_client,
         store,
     };
-    // Register every service before translating into Axum: each translated
-    // Connect router has a fallback, and Axum correctly refuses to merge two
-    // routers that would otherwise compete for unknown RPC paths.
+    // Register every service before translating into Axum. Mount the resulting
+    // service at each generated service namespace rather than merging its
+    // catch-all fallback: the UI fallback must not receive RPC POSTs.
     let connect_router = Arc::new(ConnectControlService {
         state: state.clone(),
     })
@@ -522,8 +522,7 @@ pub async fn run(config: Config) -> Result<()> {
         state: state.clone(),
     })
     .register(connect_router)
-    .into_axum_router()
-    .with_state::<AppState>(());
+    .into_axum_service();
     let ui_dir = PathBuf::from(&config.ui_dir);
     let app = Router::new()
         .route("/healthz", get(health))
@@ -534,7 +533,8 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/v1/profiles/{profile}/secrets", get(profile_secrets))
         .route("/v1/proxy/{route}/{*path}", any(proxy))
         .route("/v1/{*path}", any(api_not_found))
-        .merge(connect_router)
+        .route_service("/av.v1.SessionService/{*path}", connect_router.clone())
+        .route_service("/av.v1.ControlService/{*path}", connect_router)
         .fallback_service(
             ServeDir::new(&ui_dir).not_found_service(ServeFile::new(ui_dir.join("index.html"))),
         )
