@@ -223,12 +223,30 @@ async fn run_profile(api_url: &str, mut arguments: Vec<OsString>) -> Result<u8> 
         }
     }
     let executable = arguments.remove(0);
-    let status = ProcessCommand::new(executable)
-        .args(arguments)
-        .envs(secrets)
+    let status = profile_command(executable, arguments, secrets)
         .status()
         .context("start child process")?;
     Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
+}
+
+// Profile credentials are deliberately the only AV-specific material passed to
+// a child. `Command` otherwise inherits this process's environment, which
+// would expose the wrapper credential that authorizes access to other profiles.
+// Remove the reserved names after adding profile values too: a misconfigured
+// profile must not be able to reintroduce a wrapper credential.
+fn profile_command(
+    executable: OsString,
+    arguments: Vec<OsString>,
+    secrets: BTreeMap<String, String>,
+) -> ProcessCommand {
+    let mut command = ProcessCommand::new(executable);
+    command
+        .args(arguments)
+        .envs(secrets)
+        .env_remove("AV_TOKEN")
+        .env_remove("AV_BASIC_USER")
+        .env_remove("AV_BASIC_PASSWORD");
+    command
 }
 
 async fn authenticated_get(api_url: &str, path: &str) -> Result<reqwest::Response> {
@@ -320,5 +338,37 @@ mod tests {
         assert_eq!(arguments[1], OsString::from("--"));
         assert_eq!(arguments[2], OsString::from("cargo"));
         assert_eq!(arguments[3], OsString::from("test"));
+    }
+
+    #[test]
+    fn profile_child_does_not_inherit_wrapper_credentials() {
+        let command = profile_command(
+            OsString::from("example"),
+            vec![OsString::from("--flag")],
+            BTreeMap::from([
+                ("PROFILE_SECRET".to_owned(), "value".to_owned()),
+                ("AV_TOKEN".to_owned(), "must-not-reach-child".to_owned()),
+                (
+                    "AV_BASIC_USER".to_owned(),
+                    "must-not-reach-child".to_owned(),
+                ),
+                (
+                    "AV_BASIC_PASSWORD".to_owned(),
+                    "must-not-reach-child".to_owned(),
+                ),
+            ]),
+        );
+        let envs: BTreeMap<OsString, Option<OsString>> = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect();
+
+        assert_eq!(envs.get(&OsString::from("AV_TOKEN")), Some(&None));
+        assert_eq!(envs.get(&OsString::from("AV_BASIC_USER")), Some(&None));
+        assert_eq!(envs.get(&OsString::from("AV_BASIC_PASSWORD")), Some(&None));
+        assert_eq!(
+            envs.get(&OsString::from("PROFILE_SECRET")),
+            Some(&Some(OsString::from("value")))
+        );
     }
 }
