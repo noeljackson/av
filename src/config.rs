@@ -278,6 +278,9 @@ pub struct TransparentProxyConfig {
     /// Private TCP listener for CONNECT traffic. This must be exposed only by
     /// a private Service; public exposure is rejected by chart policy as well.
     pub listen: String,
+    /// Private HTTP forward-proxy URL used by local helpers. This is separate
+    /// from the public control API URL and must not include credentials.
+    pub proxy_url: String,
     /// PEM-encoded deployment CA certificate mounted from an existing Secret.
     pub ca_certificate_file: String,
     /// PEM-encoded deployment CA private key mounted from an existing Secret.
@@ -734,6 +737,20 @@ fn validate_transparent_proxy(config: &Config, proxy: &TransparentProxyConfig) -
     if listener.port() == 0 || listener == api_listener {
         bail!("transparent_proxy.listen must be a distinct non-zero listener");
     }
+    let proxy_url =
+        Url::parse(&proxy.proxy_url).context("transparent_proxy.proxy_url must be a URL")?;
+    if proxy_url.scheme() != "http"
+        || proxy_url.host_str().is_none()
+        || proxy_url.port().is_none()
+        || has_url_credentials(&proxy_url)
+        || proxy_url.query().is_some()
+        || proxy_url.fragment().is_some()
+        || !matches!(proxy_url.path(), "" | "/")
+    {
+        bail!(
+            "transparent_proxy.proxy_url must be a credential-free HTTP origin with an explicit port"
+        );
+    }
     let certificate = Path::new(&proxy.ca_certificate_file);
     let private_key = Path::new(&proxy.ca_private_key_file);
     if !certificate.is_absolute() || !private_key.is_absolute() || certificate == private_key {
@@ -1090,6 +1107,7 @@ mod tests {
         );
         config.transparent_proxy = Some(TransparentProxyConfig {
             listen: "127.0.0.1:14323".into(),
+            proxy_url: "http://av-proxy.example.test:14323".into(),
             ca_certificate_file: "/run/av/proxy/ca.crt".into(),
             ca_private_key_file: "/run/av/proxy/ca.key".into(),
             session_ttl_seconds: 900,
@@ -1114,6 +1132,17 @@ mod tests {
                 .contains("distinct")
         );
         config.transparent_proxy.as_mut().unwrap().listen = "127.0.0.1:14323".into();
+        config.transparent_proxy.as_mut().unwrap().proxy_url =
+            "https://av-proxy.example.test:14323".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("credential-free HTTP origin")
+        );
+        config.transparent_proxy.as_mut().unwrap().proxy_url =
+            "http://av-proxy.example.test:14323".into();
         config
             .transparent_proxy
             .as_mut()
