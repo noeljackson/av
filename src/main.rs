@@ -495,14 +495,21 @@ async fn run_transparent_proxy(
     }
     let session_id = lease.session_id;
     let token = Zeroizing::new(lease.token);
-    let ca = write_proxy_ca(&lease.ca_certificate_pem)?;
-    let (shutdown, listener_address, listener) =
-        start_loopback_proxy(&lease.proxy_url, token.clone()).await?;
-    let proxy_url = format!("http://{listener_address}");
-    let listener_task = tokio::spawn(listener);
-    let status = run_proxy_child(executable, arguments, &proxy_url, &ca.path).await;
-    let _ = shutdown.send(true);
-    let _ = listener_task.await;
+    // From this point forward revocation is mandatory, including failures while
+    // writing the public CA or binding loopback. TTL is a backstop, not normal
+    // cleanup for a partially initialized helper.
+    let status = async {
+        let ca = write_proxy_ca(&lease.ca_certificate_pem)?;
+        let (shutdown, listener_address, listener) =
+            start_loopback_proxy(&lease.proxy_url, token.clone()).await?;
+        let proxy_url = format!("http://{listener_address}");
+        let listener_task = tokio::spawn(listener);
+        let status = run_proxy_child(executable, arguments, &proxy_url, &ca.path).await;
+        let _ = shutdown.send(true);
+        let _ = listener_task.await;
+        status
+    }
+    .await;
     let revoke = connect_request::<_, ProxySessionLease>(
         api_url,
         "av.v1.SessionService/RevokeProxySession",
@@ -513,8 +520,14 @@ async fn run_transparent_proxy(
         true,
     )
     .await;
-    revoke.context("revoke transparent proxy session")?;
-    status
+    match (status, revoke) {
+        (Ok(status), Ok(_)) => Ok(status),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("revoke transparent proxy session"),
+        (Err(error), Err(revoke_error)) => Err(error).context(format!(
+            "proxied child failed and AV session revocation also failed: {revoke_error:#}"
+        )),
+    }
 }
 
 struct ProxyCaFile {
@@ -563,11 +576,12 @@ async fn start_loopback_proxy(
     {
         bail!("proxy session has an unsafe proxy URL");
     }
-    let remote_address = format!(
-        "{}:{}",
-        remote.host_str().expect("checked host"),
-        remote.port().expect("checked port")
-    );
+    let remote_host = remote.host_str().expect("checked host");
+    let remote_address = if remote_host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("[{remote_host}]:{}", remote.port().expect("checked port"))
+    } else {
+        format!("{remote_host}:{}", remote.port().expect("checked port"))
+    };
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .context("bind local proxy helper")?;
