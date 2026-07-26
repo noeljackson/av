@@ -11,9 +11,18 @@ const lockedScreen = page.locator("#locked-screen");
 const dashboard = page.locator("#dashboard");
 const browserErrors = [];
 const navigationEvents = [];
+let ignoredInitialUnauthorizedProbe = false;
 page.on("pageerror", (error) => browserErrors.push(error.message));
 page.on("console", (message) => {
-  if (message.type() === "error") browserErrors.push(message.text());
+  if (message.type() !== "error") return;
+  // The locked screen intentionally probes /ui/session without credentials
+  // before showing a login method. Chromium reports that expected 401 as a
+  // console error even though the application handles it.
+  if (!ignoredInitialUnauthorizedProbe && message.text().includes("401 (Unauthorized)")) {
+    ignoredInitialUnauthorizedProbe = true;
+    return;
+  }
+  browserErrors.push(message.text());
 });
 page.on("response", (response) => {
   if (response.url().startsWith(baseUrl)) {
@@ -58,11 +67,11 @@ try {
     await basicUserForm.locator('input[name="username"]').fill("browser-ui");
     await basicUserForm.locator('input[name="password"]').fill("browser-ui-password");
     await basicUserForm.getByRole("button", { name: "create or rotate" }).click();
-    await ownerPanel.getByText("browser-ui", { exact: true }).waitFor();
     const principal = ownerPanel.locator(".principal").filter({ hasText: "browser-ui" });
+    await principal.waitFor();
     await principal.locator(".inline-grant select[name=profile]").selectOption("ungranted-integration");
-    await principal.getByRole("button", { name: "grant" }).click();
-    await principal.getByText("ungranted-integration", { exact: true }).waitFor();
+    await principal.locator(".inline-grant button").click();
+    await principal.locator(".capability-list code").filter({ hasText: "ungranted-integration" }).waitFor();
     if (await ownerPanel.getByText("basic:browser-ui", { exact: true }).count()) {
       throw new Error("access UI exposed a raw Basic subject");
     }
