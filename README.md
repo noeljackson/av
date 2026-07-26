@@ -103,19 +103,17 @@ AV_IMAGE=av:ui-playwright tests/run-local-managed.sh
 
 Open `http://127.0.0.1:14322`. The disposable owner is `operator` / `password`.
 To test direct GitHub login, create a dedicated OAuth App with the exact
-callback `http://127.0.0.1:14322/auth/github/callback`. Store its client ID and
-secret in an existing Infisical project, materialize the secret into a
-mode-`0600` local file through the approved Infisical wrapper, then run the
-stack with the public client ID, the stable numeric GitHub account ID, and that
-file path. The client secret is mounted only into the disposable setup
-container and copied into the disposable Docker volume for AV; it is never a
-Git value, environment value, process argument, or browser value.
+callback `http://127.0.0.1:14322/auth/github/callback`. Store both fields in
+OpenBao KV v2 at `apps/av/local`: `GITHUB_CLIENT_ID` and
+`GITHUB_CLIENT_SECRET`. With an authenticated local `bao` CLI, the harness
+materializes the secret into a fresh mode-`0700` temporary directory, mounts it
+only into the disposable setup container, copies it into the disposable AV
+state volume, and removes the host file when setup completes. The secret is
+never a Git value, environment value, process argument, browser value, or AV
+log.
 
 ```bash
-AV_TEST_GITHUB_CLIENT_ID='<client id>' \
-AV_TEST_GITHUB_OWNER_ID="$(gh api user --jq .id)" \
-AV_TEST_GITHUB_CLIENT_SECRET_FILE="$HOME/.cache/av/github-client-secret" \
-AV_IMAGE=av:ui-playwright tests/run-local-managed.sh
+AV_TEST_GITHUB_OAUTH=1 AV_IMAGE=av:ui-playwright tests/run-local-managed.sh
 ```
 
 GitHub OAuth is a local managed-only mode. AV uses PKCE and server-side code
