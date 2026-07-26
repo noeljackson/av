@@ -8,13 +8,45 @@
 use std::{collections::BTreeMap, net::IpAddr};
 
 use anyhow::{Context, Result, bail};
+use argon2::password_hash::rand_core::{OsRng, RngCore};
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::config::ProxyRouteConfig;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransparentRouteCatalog {
     routes_by_host: BTreeMap<String, String>,
+}
+
+/// A one-time generated proxy capability. `token` is intentionally separate
+/// from `token_hash`: callers return the former to the local helper once and
+/// persist only the latter.
+#[derive(Debug)]
+pub struct ProxySessionCredential {
+    pub session_id: String,
+    pub token: Zeroizing<String>,
+    pub token_hash: [u8; 32],
+}
+
+pub fn mint_proxy_session_credential() -> ProxySessionCredential {
+    let mut session_id_bytes = [0_u8; 16];
+    let mut token_bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut session_id_bytes);
+    OsRng.fill_bytes(&mut token_bytes);
+    let token = Zeroizing::new(URL_SAFE_NO_PAD.encode(token_bytes));
+    let token_hash = proxy_session_token_hash(token.as_bytes());
+    ProxySessionCredential {
+        session_id: URL_SAFE_NO_PAD.encode(session_id_bytes),
+        token,
+        token_hash,
+    }
+}
+
+pub fn proxy_session_token_hash(token: &[u8]) -> [u8; 32] {
+    Sha256::digest(token).into()
 }
 
 impl TransparentRouteCatalog {
@@ -189,5 +221,25 @@ mod tests {
                 "{authority}"
             );
         }
+    }
+
+    #[test]
+    fn proxy_session_credentials_are_opaque_and_store_only_a_digest() {
+        let first = mint_proxy_session_credential();
+        let second = mint_proxy_session_credential();
+
+        assert_ne!(first.session_id, second.session_id);
+        assert_ne!(first.token, second.token);
+        assert_eq!(
+            first.token_hash,
+            proxy_session_token_hash(first.token.as_bytes())
+        );
+        assert_eq!(
+            second.token_hash,
+            proxy_session_token_hash(second.token.as_bytes())
+        );
+        assert_eq!(first.token_hash.len(), 32);
+        assert!(!first.session_id.contains('='));
+        assert!(!first.token.contains('='));
     }
 }
