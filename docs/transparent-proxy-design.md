@@ -2,10 +2,11 @@
 
 ## Status
 
-This document specifies AV's planned transparent proxy. **It is not available
-yet.** Current AV supports only the explicit named routes at
-`/v1/proxy/<route>/...`; setting `HTTP_PROXY` or `HTTPS_PROXY` to an AV address
-does not work and must not be used as a security control.
+AV implements this as an **opt-in, private deployment feature**. It is disabled
+by default: an operator must configure managed mode, a deployment CA, the
+private proxy listener, and workload egress enforcement before `av run` is
+usable. It is never a public forward proxy and must not be exposed through an
+Ingress, LoadBalancer, or tailnet funnel.
 
 The feature exists to make unmodified command-line tools, SDKs, MCP servers,
 Codex, and Claude Code usable without putting a provider credential in their
@@ -213,11 +214,7 @@ Before deployment, test all four paths from a disposable workload:
 | Direct allowed-provider call | Network failure |
 | UDP/443 to allowed-provider host | Network failure |
 
-## Operator workflow (when implemented)
-
-This is the intended ergonomic interface, shown here so the contract is
-reviewable. These commands must not be advertised as available until the
-feature ships.
+## Operator workflow
 
 ```bash
 # Grant the person the existing orchard-dev profile in AV's owner UI.
@@ -260,9 +257,9 @@ This comparison does not imply compatibility with Agent Vault's API, storage,
 or credential database. AV continues to use Infisical and OpenBao as connector
 backends and does not store application credentials itself.
 
-## Required security tests before release
+## Security verification
 
-The feature is not complete until automated tests cover at least:
+The implementation is kept available only with these test layers:
 
 - successful CONNECT interception and credential injection for one allowed host;
 - rejection before connection of unknown hosts, IP literals, internal ranges,
@@ -281,26 +278,9 @@ The feature is not complete until automated tests cover at least:
 - audit records that contain no provider secret, session credential, request
   body, or sensitive header value.
 
-Run these as Docker/Kubernetes integration tests, not only unit tests. AV's
-unit and integration tests for this feature are Rust tests: `cargo test` starts
+AV's unit and raw-TCP tests are Rust tests: `cargo test` starts
 controlled Rust upstreams and raw TCP proxy clients, rather than making Python
 or shell the authority for proxy behavior. Kubernetes deployment validation may
 use a Rust probe image launched by the test harness. The environment must use
 synthetic credentials and a controlled upstream that can prove whether a
 credential was injected or leaked.
-
-## Delivery sequence
-
-1. Add strict configuration types and reject unsafe or ambiguous connector host
-   mappings. Keep the feature disabled by default.
-2. Implement session issuance, revocation, audit metadata, and the private
-   listener with unknown-host denial. Do not enable TLS interception yet.
-3. Add CA lifecycle and CONNECT interception with the full hostile-request test
-   suite.
-4. Add the local `av run` helper and Codex/Claude smoke tests.
-5. Add Helm Service/NetworkPolicy templates and a Cilium-backed enforced-egress
-   integration test. Publish deployment guidance only after that test passes.
-
-At each stage, an incomplete feature must fail closed and remain unavailable to
-normal users. No deployment should acquire a public proxy port or a permissive
-fallback merely to make a demo work.

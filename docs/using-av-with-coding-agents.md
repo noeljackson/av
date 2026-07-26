@@ -92,17 +92,31 @@ Content-Type: application/json
 The bearer token authorizes AV; it is not the provider credential. The provider
 credential never crosses into the agent or application process.
 
-## Codex and Claude with Tier 2
+## Codex and Claude with the transparent proxy
 
-Current AV uses **explicit named reverse-proxy routes**. It is not yet a
-transparent forward proxy, so setting `HTTPS_PROXY` for Codex or Claude will
-not make their arbitrary outbound requests pass through AV.
+For a deployment that has enabled the private transparent listener and its
+egress policy, launch the agent through a profile-scoped helper:
+
+```bash
+av run orchard-dev -- codex
+av run orchard-dev -- claude
+```
+
+The child receives `HTTP_PROXY` and `HTTPS_PROXY` pointed only at a loopback
+helper plus the deployment CA certificate. It does not receive AV's remote
+session capability or a provider credential. The helper mints one short-lived,
+revocable session and removes it when the child exits.
+
+This still is not permission for arbitrary egress. AV accepts only configured
+HTTPS hosts, maps each to one immutable named route, and applies that route's
+method/path/query/header policy after TLS interception. If the workload lacks
+the accompanying NetworkPolicy/Cilium allowlist, this mode is cooperative and
+must not be treated as injection containment.
 
 Use Tier 2 from a narrow tool or application endpoint that knows the named AV
-route. Give Codex or Claude access to that tool, rather than giving either the
-provider token. For `orchard-api`, that tool exposes only operations such as
-`list_widgets` and `create_widget`; internally it calls the
-`orchard-provider` AV route.
+route when the action can be modeled explicitly. For `orchard-api`, that tool
+exposes only operations such as `list_widgets` and `create_widget`; internally
+it calls the `orchard-provider` AV route.
 
 ```text
 Codex / Claude
@@ -115,18 +129,6 @@ This is the preferred design for agent actions because prompt injection cannot
 turn a capability to create a development widget into arbitrary access to the
 provider account.
 
-## Transparent proxy is planned, not available
-
-Agent Vault takes a different approach: its clients set `HTTP_PROXY`,
-`HTTPS_PROXY`, and trust its local CA, then it MITMs normal HTTPS requests and
-substitutes credentials. That makes unmodified SDKs convenient, but a safe
-implementation requires a private proxy network, short-lived sessions, CA key
-management, strict host policy, and firewall rules that prevent direct egress
-bypass.
-
-Do not configure AV as `HTTPS_PROXY` today. AV's current security contract is
-the explicit named route shown above. The planned transparent design uses a
-local session helper rather than placing a reusable proxy token in the agent's
-environment, and it denies every destination not declared in AV policy. Read
-[the transparent proxy design](transparent-proxy-design.md) before evaluating
-or deploying that future feature.
+Read [the transparent proxy design](transparent-proxy-design.md) before
+enabling it. Certificate-pinned SDKs cannot use this mode; use an explicit
+named route or a deliberately scoped local-secret exception instead.

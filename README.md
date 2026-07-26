@@ -50,11 +50,11 @@ access token. `AV_TOKEN` is available for CI; optional Basic credentials use
 See [using AV with coding agents](docs/using-av-with-coding-agents.md) for a
 generic application example with Codex and Claude, and for the boundary between
 AV's explicit proxy routes and a transparent `HTTPS_PROXY` design.
-The complete planned transparent-proxy contract, including private deployment,
-CA handling, local session helpers, egress enforcement, and release tests, is
-in [transparent proxy design](docs/transparent-proxy-design.md). It is a
-security design document, not an indication that transparent proxying is
-available in the current release.
+The transparent proxy is opt-in and private: it requires managed sessions, a
+deployment CA, a private listener, and workload egress enforcement. Use
+`av run <profile> -- codex` or `av run <profile> -- claude`; never set a remote
+AV listener directly as a child's `HTTPS_PROXY`. The complete deployment and
+security contract is in [transparent proxy design](docs/transparent-proxy-design.md).
 
 For Tier 2, callers use a named route:
 

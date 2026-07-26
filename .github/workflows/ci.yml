@@ -45,6 +45,7 @@ jobs:
         run: |
           docker build --tag av:test .
           tests/container-smoke.sh av:test
+          tests/transparent-container-smoke.sh av:test
           AV_IMAGE=av:test tests/connector-integration.sh
       - name: Image SBOM and vulnerability policy
         uses: noeljackson/supplychain@dbf85be2f2efa1b265d96562d7c173b66ea08ec1
