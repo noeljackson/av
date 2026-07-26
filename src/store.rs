@@ -44,6 +44,17 @@ pub struct AuditEvent {
     pub executable_basename: Option<String>,
 }
 
+/// Metadata for an active transparent-proxy session. The random bearer
+/// capability is deliberately absent: the database stores only its SHA-256
+/// digest, so a database read cannot be replayed as proxy authentication.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProxySession {
+    pub session_id: String,
+    pub subject: String,
+    pub profile: String,
+    pub expires_unix_seconds: i64,
+}
+
 type AuditRow = (
     i64,
     String,
@@ -52,6 +63,8 @@ type AuditRow = (
     Option<String>,
     Option<String>,
 );
+
+type ProxySessionRow = (String, String, String, i64);
 
 impl Store {
     pub async fn connect(managed: &ManagedConfig) -> Result<Self> {
@@ -395,6 +408,122 @@ impl Store {
         Ok(())
     }
 
+    /// Persist one short-lived proxy session. `token_hash` must be the 32-byte
+    /// SHA-256 digest of a randomly generated bearer capability; raw session
+    /// capabilities are never accepted by this persistence layer.
+    pub async fn create_proxy_session(
+        &self,
+        session_id: &str,
+        token_hash: &[u8],
+        subject: &str,
+        profile: &str,
+        expires_unix_seconds: i64,
+    ) -> Result<()> {
+        validate_proxy_session(
+            session_id,
+            token_hash,
+            subject,
+            profile,
+            expires_unix_seconds,
+        )?;
+        match self {
+            Self::Postgres(pool) => {
+                sqlx::query(
+                    "INSERT INTO av_proxy_sessions \
+                     (session_id, token_hash, subject, profile, expires_unix_seconds, revoked) \
+                     VALUES ($1, $2, $3, $4, $5, FALSE)",
+                )
+                .bind(session_id)
+                .bind(token_hash)
+                .bind(subject)
+                .bind(profile)
+                .bind(expires_unix_seconds)
+                .execute(pool)
+                .await
+                .context("write proxy session")?;
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO av_proxy_sessions \
+                     (session_id, token_hash, subject, profile, expires_unix_seconds, revoked) \
+                     VALUES (?, ?, ?, ?, ?, FALSE)",
+                )
+                .bind(session_id)
+                .bind(token_hash)
+                .bind(subject)
+                .bind(profile)
+                .bind(expires_unix_seconds)
+                .execute(pool)
+                .await
+                .context("write proxy session")?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resolve a valid, unrevoked session by its digest. Expired sessions are
+    /// intentionally indistinguishable from unknown sessions to the caller.
+    pub async fn active_proxy_session(&self, token_hash: &[u8]) -> Result<Option<ProxySession>> {
+        if token_hash.len() != 32 {
+            return Ok(None);
+        }
+        let now = now_unix_seconds()?;
+        let row: Option<ProxySessionRow> = match self {
+            Self::Postgres(pool) => {
+                sqlx::query_as(
+                    "SELECT session_id, subject, profile, expires_unix_seconds \
+                 FROM av_proxy_sessions \
+                 WHERE token_hash = $1 AND revoked = FALSE AND expires_unix_seconds > $2",
+                )
+                .bind(token_hash)
+                .bind(now)
+                .fetch_optional(pool)
+                .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT session_id, subject, profile, expires_unix_seconds \
+                 FROM av_proxy_sessions \
+                 WHERE token_hash = ? AND revoked = FALSE AND expires_unix_seconds > ?",
+                )
+                .bind(token_hash)
+                .bind(now)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
+        Ok(row.map(
+            |(session_id, subject, profile, expires_unix_seconds)| ProxySession {
+                session_id,
+                subject,
+                profile,
+                expires_unix_seconds,
+            },
+        ))
+    }
+
+    /// Revocation is idempotent from an operator perspective: a missing or
+    /// already-revoked session has the same safe effect and returns `false`.
+    pub async fn revoke_proxy_session(&self, session_id: &str) -> Result<bool> {
+        let affected = match self {
+            Self::Postgres(pool) => sqlx::query(
+                "UPDATE av_proxy_sessions SET revoked = TRUE WHERE session_id = $1 AND revoked = FALSE",
+            )
+            .bind(session_id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+            Self::Sqlite(pool) => sqlx::query(
+                "UPDATE av_proxy_sessions SET revoked = TRUE WHERE session_id = ? AND revoked = FALSE",
+            )
+            .bind(session_id)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        };
+        Ok(affected == 1)
+    }
+
     async fn migrate(&self) -> Result<()> {
         const CREATE_OWNERS: &str = "CREATE TABLE IF NOT EXISTS av_owners (\
             subject TEXT PRIMARY KEY\
@@ -425,6 +554,16 @@ impl Store {
         )";
         const CREATE_AUDIT_INDEX: &str = "CREATE INDEX IF NOT EXISTS av_audit_events_created_idx \
             ON av_audit_events (created_unix_seconds)";
+        const CREATE_PROXY_SESSIONS: &str = "CREATE TABLE IF NOT EXISTS av_proxy_sessions (\
+            session_id TEXT PRIMARY KEY,\
+            token_hash BLOB NOT NULL UNIQUE,\
+            subject TEXT NOT NULL,\
+            profile TEXT NOT NULL,\
+            expires_unix_seconds BIGINT NOT NULL,\
+            revoked BOOLEAN NOT NULL\
+        )";
+        const CREATE_PROXY_SESSIONS_TOKEN_INDEX: &str = "CREATE INDEX IF NOT EXISTS av_proxy_sessions_token_idx \
+            ON av_proxy_sessions (token_hash)";
         match self {
             Self::Postgres(pool) => {
                 sqlx::query(CREATE_OWNERS).execute(pool).await?;
@@ -433,6 +572,10 @@ impl Store {
                 sqlx::query(CREATE_PROFILE_GRANTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_EVENTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_INDEX).execute(pool).await?;
+                sqlx::query(CREATE_PROXY_SESSIONS).execute(pool).await?;
+                sqlx::query(CREATE_PROXY_SESSIONS_TOKEN_INDEX)
+                    .execute(pool)
+                    .await?;
             }
             Self::Sqlite(pool) => {
                 sqlx::query(CREATE_OWNERS).execute(pool).await?;
@@ -441,6 +584,10 @@ impl Store {
                 sqlx::query(CREATE_PROFILE_GRANTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_EVENTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_INDEX).execute(pool).await?;
+                sqlx::query(CREATE_PROXY_SESSIONS).execute(pool).await?;
+                sqlx::query(CREATE_PROXY_SESSIONS_TOKEN_INDEX)
+                    .execute(pool)
+                    .await?;
             }
         }
         Ok(())
@@ -480,6 +627,34 @@ impl Store {
         }
         Ok(())
     }
+}
+
+fn validate_proxy_session(
+    session_id: &str,
+    token_hash: &[u8],
+    subject: &str,
+    profile: &str,
+    expires_unix_seconds: i64,
+) -> Result<()> {
+    if session_id.is_empty()
+        || subject.is_empty()
+        || profile.is_empty()
+        || session_id.len() > 256
+        || subject.len() > 1024
+        || profile.len() > 256
+        || session_id.chars().any(char::is_control)
+        || subject.chars().any(char::is_control)
+        || profile.chars().any(char::is_control)
+    {
+        bail!("proxy session fields must be non-empty bounded text without control characters");
+    }
+    if token_hash.len() != 32 {
+        bail!("proxy session token hash must be exactly 32 bytes");
+    }
+    if expires_unix_seconds <= now_unix_seconds()? {
+        bail!("proxy session expiry must be in the future");
+    }
+    Ok(())
 }
 
 fn read_database_url(path: &str) -> Result<String> {
@@ -633,5 +808,67 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[tokio::test]
+    async fn proxy_sessions_store_only_hashes_and_fail_closed_on_expiry_or_revocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = sqlite_store(&directory, "").await;
+        let token_hash = [7_u8; 32];
+        let expiry = now_unix_seconds().unwrap() + 60;
+        store
+            .create_proxy_session(
+                "session-1",
+                &token_hash,
+                "oidc:developer",
+                "example-dev",
+                expiry,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.active_proxy_session(&token_hash).await.unwrap(),
+            Some(ProxySession {
+                session_id: "session-1".into(),
+                subject: "oidc:developer".into(),
+                profile: "example-dev".into(),
+                expires_unix_seconds: expiry,
+            })
+        );
+        assert!(store.revoke_proxy_session("session-1").await.unwrap());
+        assert!(!store.revoke_proxy_session("session-1").await.unwrap());
+        assert!(
+            store
+                .active_proxy_session(&token_hash)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let expired_hash = [8_u8; 32];
+        let error = store
+            .create_proxy_session(
+                "expired-session",
+                &expired_hash,
+                "oidc:developer",
+                "example-dev",
+                now_unix_seconds().unwrap(),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("expiry must be in the future"));
+
+        let invalid_hash = [9_u8; 31];
+        let error = store
+            .create_proxy_session(
+                "invalid-hash",
+                &invalid_hash,
+                "oidc:developer",
+                "example-dev",
+                now_unix_seconds().unwrap() + 60,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("exactly 32 bytes"));
     }
 }
