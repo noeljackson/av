@@ -200,7 +200,8 @@ def write_config(project_id, environment):
             "github": {
                 "client_id": github_client_id,
                 "client_secret_file": "/state/github-client-secret",
-                "allowed_logins": ["noeljackson"],
+                "allowed_user_ids": [int(github_owner_id)],
+                "allowed_organizations": [],
             },
         }
         initial_owner_subject = f"github:{github_owner_id}"

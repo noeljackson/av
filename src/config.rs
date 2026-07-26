@@ -96,7 +96,12 @@ pub struct AuthConfig {
 pub struct GithubAuthConfig {
     pub client_id: String,
     pub client_secret_file: String,
-    pub allowed_logins: Vec<String>,
+    /// Immutable GitHub numeric account IDs permitted to use the local UI.
+    #[serde(default)]
+    pub allowed_user_ids: Vec<u64>,
+    /// GitHub organization slugs whose active members may use the local UI.
+    #[serde(default)]
+    pub allowed_organizations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -347,16 +352,19 @@ impl Config {
                     bail!("github_or_basic is only allowed for a loopback managed instance");
                 }
                 if github.client_id.trim().is_empty()
-                    || github.allowed_logins.is_empty()
+                    || (github.allowed_user_ids.is_empty()
+                        && github.allowed_organizations.is_empty())
                     || !Path::new(&github.client_secret_file).is_absolute()
                 {
                     bail!(
-                        "github_or_basic requires a client_id, allowed_logins, and an absolute client_secret_file"
+                        "github_or_basic requires a client_id, at least one allowed_user_id or allowed_organization, and an absolute client_secret_file"
                     );
                 }
-                for login in &github.allowed_logins {
-                    if !valid_github_login(login) {
-                        bail!("github allowed_logins must contain valid GitHub logins");
+                for organization in &github.allowed_organizations {
+                    if !valid_github_organization(organization) {
+                        bail!(
+                            "github allowed_organizations must contain valid GitHub organization slugs"
+                        );
                     }
                 }
             }
@@ -563,16 +571,6 @@ impl Config {
             && std::env::var("AV_ALLOW_INSECURE_CONNECTORS")
                 .is_ok_and(|value| value == "integration-tests-only")
     }
-}
-
-fn valid_github_login(login: &str) -> bool {
-    let bytes = login.as_bytes();
-    (1..=39).contains(&bytes.len())
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 fn validate_connector_auth(name: &str, connector: &ConnectorConfig) -> Result<()> {
@@ -887,7 +885,8 @@ mod tests {
         config.auth.github = Some(GithubAuthConfig {
             client_id: "github-client-id".into(),
             client_secret_file: "/run/av/github-client-secret".into(),
-            allowed_logins: vec!["noeljackson".into()],
+            allowed_user_ids: vec![12345],
+            allowed_organizations: vec![],
         });
         assert!(config.validate().is_ok());
         config.public_url = "https://av.example.test".into();
@@ -895,6 +894,29 @@ mod tests {
         config.public_url = "http://127.0.0.1:14322".into();
         config.mode = ConfigMode::Static;
         config.managed = None;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn github_browser_auth_requires_an_immutable_user_or_valid_organization_policy() {
+        let mut config = base_config();
+        config.mode = ConfigMode::Managed;
+        config.managed = Some(ManagedConfig {
+            database_url_file: "/run/av/database-url".into(),
+            initial_owner_oidc_subject: "github:12345".into(),
+        });
+        config.auth.mode = AuthMode::GithubOrBasic;
+        config.auth.github = Some(GithubAuthConfig {
+            client_id: "github-client-id".into(),
+            client_secret_file: "/run/av/github-client-secret".into(),
+            allowed_user_ids: vec![],
+            allowed_organizations: vec!["example-org".into()],
+        });
+        assert!(config.validate().is_ok());
+
+        config.auth.github.as_mut().unwrap().allowed_organizations = vec!["invalid_org".into()];
+        assert!(config.validate().is_err());
+        config.auth.github.as_mut().unwrap().allowed_organizations = vec![];
         assert!(config.validate().is_err());
     }
 
@@ -987,4 +1009,13 @@ mod tests {
         .unwrap();
         assert!(matches!(openbao, ConnectorConfig::OpenBao(_)));
     }
+}
+fn valid_github_organization(organization: &str) -> bool {
+    let bytes = organization.as_bytes();
+    (1..=39).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }

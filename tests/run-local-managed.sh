@@ -17,6 +17,10 @@ if [[ ${AV_TEST_GITHUB_OAUTH:-0} == 1 ]]; then
     printf '%s\n' 'AV_TEST_GITHUB_OAUTH=1 requires an authenticated OpenBao CLI.' >&2
     exit 1
   }
+  command -v jq >/dev/null || {
+    printf '%s\n' 'AV_TEST_GITHUB_OAUTH=1 requires jq to select the two OpenBao fields.' >&2
+    exit 1
+  }
   command -v gh >/dev/null || {
     printf '%s\n' 'AV_TEST_GITHUB_OAUTH=1 requires an authenticated GitHub CLI.' >&2
     exit 1
@@ -25,14 +29,14 @@ if [[ ${AV_TEST_GITHUB_OAUTH:-0} == 1 ]]; then
   chmod 700 "$temporary_secret_directory"
   openbao_mount=${AV_TEST_GITHUB_OPENBAO_MOUNT:-apps}
   openbao_path=${AV_TEST_GITHUB_OPENBAO_PATH:-av/local}
-  openbao_secret_path="${openbao_mount%/}/${openbao_path#/}"
-  # Supplying the mount prevents `bao kv get` from enumerating mounts, which
-  # the bounded human policy deliberately cannot do. It also unwraps KV v2
-  # response data before selecting the requested field.
-  bao kv get -mount="${openbao_mount%/}" -field=GITHUB_CLIENT_ID "${openbao_path#/}" \
-    > "$temporary_secret_directory/client-id"
-  bao kv get -mount="${openbao_mount%/}" -field=GITHUB_CLIENT_SECRET "${openbao_path#/}" \
-    > "$temporary_secret_directory/client-secret"
+  openbao_secret_path="${openbao_mount%/}/data/${openbao_path#/}"
+  # `bao kv get` first discovers the mount through sys/internal/ui/mounts,
+  # which the bounded human policy deliberately cannot read. Address the known
+  # KV v2 data endpoint directly and extract only the two test fields.
+  bao read -format=json "${openbao_secret_path%/}" | \
+    jq -er '.data.data.GITHUB_CLIENT_ID' > "$temporary_secret_directory/client-id"
+  bao read -format=json "${openbao_secret_path%/}" | \
+    jq -er '.data.data.GITHUB_CLIENT_SECRET' > "$temporary_secret_directory/client-secret"
   [[ -s $temporary_secret_directory/client-id && -s $temporary_secret_directory/client-secret ]] || {
     printf '%s\n' 'OpenBao returned an empty GitHub OAuth credential field.' >&2
     exit 1

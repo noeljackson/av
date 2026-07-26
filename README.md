@@ -117,11 +117,15 @@ AV_TEST_GITHUB_OAUTH=1 AV_IMAGE=av:ui-playwright tests/run-local-managed.sh
 ```
 
 GitHub OAuth is a local managed-only mode. AV uses PKCE and server-side code
-exchange, requests only `read:user`, allowlists GitHub logins, turns the stable
-numeric GitHub account ID into the AV policy subject, then discards the GitHub
-access token. The browser receives only an AV-issued, HttpOnly, SameSite cookie
-that is accepted solely by UI routes; it cannot authenticate AV's API,
-connector, or proxy routes.
+exchange, requests only `read:user`, and allowlists immutable numeric GitHub
+account IDs. The local harness obtains the configured account ID from `gh api
+user`, so this setup admits only the authenticated `noeljackson` account rather
+than trusting a changeable login name. Deployments may instead or additionally
+set `auth.github.allowed_organizations` to GitHub organization slugs; AV then
+requires active membership in any configured organization and requests
+`read:org` only for that mode. AV discards the GitHub access token. The browser
+receives only an AV-issued, HttpOnly, SameSite cookie that is accepted solely by
+UI routes; it cannot authenticate AV's API, connector, or proxy routes.
 
 ```bash
 av local init \

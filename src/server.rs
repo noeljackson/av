@@ -7,7 +7,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use argon2::{
     Algorithm, Argon2, Params, Version,
-    password_hash::{PasswordHasher, SaltString, rand_core::OsRng},
+    password_hash::{
+        PasswordHasher, SaltString,
+        rand_core::{OsRng, RngCore},
+    },
 };
 use askama::Template;
 use axum::{
@@ -64,6 +67,8 @@ struct AppState {
 const GITHUB_AUTHORIZATION_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
 const GITHUB_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_USER_ENDPOINT: &str = "https://api.github.com/user";
+const GITHUB_ORGANIZATION_MEMBERSHIP_ENDPOINT: &str =
+    "https://api.github.com/user/memberships/orgs";
 const GITHUB_STATE_COOKIE: &str = "av_github_state";
 const GITHUB_SESSION_COOKIE: &str = "av_github_session";
 const GITHUB_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
@@ -73,7 +78,8 @@ const GITHUB_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
 struct GithubBrowserAuth {
     client_id: String,
     client_secret: Arc<Zeroizing<String>>,
-    allowed_logins: BTreeSet<String>,
+    allowed_user_ids: BTreeSet<u64>,
+    allowed_organizations: BTreeSet<String>,
     client: reqwest::Client,
     pending: Arc<Mutex<BTreeMap<String, GithubPendingLogin>>>,
     sessions: Arc<Mutex<BTreeMap<String, GithubBrowserSession>>>,
@@ -104,7 +110,11 @@ struct GithubTokenResponse {
 #[derive(Deserialize)]
 struct GithubUser {
     id: u64,
-    login: String,
+}
+
+#[derive(Deserialize)]
+struct GithubOrganizationMembership {
+    state: String,
 }
 
 impl GithubBrowserAuth {
@@ -125,10 +135,11 @@ impl GithubBrowserAuth {
         Ok(Self {
             client_id: config.client_id.clone(),
             client_secret: Arc::new(Zeroizing::new(client_secret)),
-            allowed_logins: config
-                .allowed_logins
+            allowed_user_ids: config.allowed_user_ids.iter().copied().collect(),
+            allowed_organizations: config
+                .allowed_organizations
                 .iter()
-                .map(|login| login.to_ascii_lowercase())
+                .map(|organization| organization.to_ascii_lowercase())
                 .collect(),
             client,
             pending: Arc::new(Mutex::new(BTreeMap::new())),
@@ -154,10 +165,17 @@ impl GithubBrowserAuth {
         );
         let mut url = url::Url::parse(GITHUB_AUTHORIZATION_ENDPOINT)
             .expect("constant GitHub authorization URL is valid");
+        let scope = if self.allowed_organizations.is_empty() {
+            "read:user"
+        } else {
+            // Private organization membership is not available from the public
+            // profile endpoint. Request it only when organization policy is used.
+            "read:user read:org"
+        };
         url.query_pairs_mut()
             .append_pair("client_id", &self.client_id)
             .append_pair("redirect_uri", redirect_uri)
-            .append_pair("scope", "read:user")
+            .append_pair("scope", scope)
             .append_pair("state", &state)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256");
@@ -209,10 +227,7 @@ impl GithubBrowserAuth {
             .json()
             .await
             .context("decode GitHub OAuth identity")?;
-        if !self
-            .allowed_logins
-            .contains(&user.login.to_ascii_lowercase())
-        {
+        if !self.is_allowed_user(&user, &token.access_token).await? {
             bail!("GitHub user is not allowed");
         }
         Ok(crate::auth::Identity {
@@ -220,6 +235,47 @@ impl GithubBrowserAuth {
             // or recycled login from inheriting policy grants.
             subject: format!("github:{}", user.id),
         })
+    }
+
+    async fn is_allowed_user(&self, user: &GithubUser, access_token: &str) -> Result<bool> {
+        if self.allowed_user_ids.contains(&user.id) {
+            return Ok(true);
+        }
+        for organization in &self.allowed_organizations {
+            if self
+                .has_active_organization_membership(access_token, organization)
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    async fn has_active_organization_membership(
+        &self,
+        access_token: &str,
+        organization: &str,
+    ) -> Result<bool> {
+        let endpoint = github_organization_membership_endpoint(organization);
+        let response = self
+            .client
+            .get(endpoint)
+            .bearer_auth(access_token)
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await
+            .context("check GitHub organization membership")?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        let membership: GithubOrganizationMembership = response
+            .error_for_status()
+            .context("GitHub organization membership request failed")?
+            .json()
+            .await
+            .context("decode GitHub organization membership")?;
+        Ok(membership.state == "active")
     }
 
     async fn create_session(&self, identity: crate::auth::Identity) -> String {
@@ -249,8 +305,19 @@ impl GithubBrowserAuth {
     }
 }
 
+fn github_organization_membership_endpoint(organization: &str) -> String {
+    format!("{GITHUB_ORGANIZATION_MEMBERSHIP_ENDPOINT}/{organization}")
+}
+
 fn random_browser_token() -> String {
-    SaltString::generate(&mut OsRng).as_str().to_owned()
+    // Browser OAuth state and session values cross both a URL query and a
+    // strict cookie parser. SaltString uses a password-salt alphabet, which
+    // may include characters that are valid in a URL only after escaping but
+    // intentionally rejected by cookie_value().
+    let mut bytes = [0_u8; 32];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut bytes);
+    URL_SAFE_NO_PAD.encode(bytes)
 }
 
 #[derive(Clone)]
@@ -2239,7 +2306,8 @@ mod tests {
         let github = GithubBrowserAuth::new(&GithubAuthConfig {
             client_id: "synthetic-client-id".into(),
             client_secret_file: secret_file.display().to_string(),
-            allowed_logins: vec!["noeljackson".into()],
+            allowed_user_ids: vec![12345],
+            allowed_organizations: vec![],
         })
         .unwrap();
         let (redirect, state) = github
@@ -2263,6 +2331,78 @@ mod tests {
         assert!(!redirect.as_str().contains("synthetic-client-secret"));
         assert!(github_state_cookie(&state).contains("HttpOnly; SameSite=Lax"));
         assert!(github_session_cookie("session").contains("HttpOnly; SameSite=Lax"));
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::COOKIE,
+            HeaderValue::from_str(&format!("{GITHUB_STATE_COOKIE}={state}")).unwrap(),
+        );
+        assert_eq!(
+            cookie_value(&headers, GITHUB_STATE_COOKIE),
+            Some(state.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn github_organization_policy_requests_membership_scope() {
+        let github = GithubBrowserAuth {
+            client_id: "synthetic-client-id".into(),
+            client_secret: Arc::new(Zeroizing::new("synthetic-client-secret".into())),
+            allowed_user_ids: BTreeSet::new(),
+            allowed_organizations: ["example-org".to_owned()].into_iter().collect(),
+            client: reqwest::Client::new(),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        let (redirect, _) = github
+            .start("http://127.0.0.1:14322/auth/github/callback")
+            .await
+            .unwrap();
+        let redirect = url::Url::parse(&redirect).unwrap();
+        let query: BTreeMap<_, _> = redirect.query_pairs().into_owned().collect();
+        assert_eq!(query.get("scope"), Some(&"read:user read:org".into()));
+        assert_eq!(
+            github_organization_membership_endpoint("example-org"),
+            "https://api.github.com/user/memberships/orgs/example-org"
+        );
+    }
+
+    #[test]
+    fn browser_tokens_are_safe_for_urls_and_strict_cookie_parsing() {
+        for _ in 0..16 {
+            let token = random_browser_token();
+            assert_eq!(token.len(), 43);
+            assert!(
+                token
+                    .bytes()
+                    .all(|byte| { byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' })
+            );
+
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                header::COOKIE,
+                HeaderValue::from_str(&format!("{GITHUB_SESSION_COOKIE}={token}")).unwrap(),
+            );
+            assert_eq!(
+                cookie_value(&headers, GITHUB_SESSION_COOKIE),
+                Some(token.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn github_browser_auth_allows_only_configured_immutable_account_ids() {
+        let github = GithubBrowserAuth {
+            client_id: "synthetic-client-id".into(),
+            client_secret: Arc::new(Zeroizing::new("synthetic-client-secret".into())),
+            allowed_user_ids: [12345].into_iter().collect(),
+            allowed_organizations: BTreeSet::new(),
+            client: reqwest::Client::new(),
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+        };
+        assert!(github.allowed_user_ids.contains(&12345));
+        assert!(!github.allowed_user_ids.contains(&67890));
     }
 
     #[test]
