@@ -2,6 +2,8 @@ import { chromium } from "playwright";
 
 const baseUrl = process.env.AV_UI_URL;
 if (!baseUrl) throw new Error("AV_UI_URL is required");
+const expectManaged = process.env.AV_UI_EXPECT_MANAGED === "1";
+const expectedProfile = process.env.AV_UI_EXPECT_PROFILE || "container-smoke";
 
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage();
@@ -29,7 +31,7 @@ try {
     throw new Error(`${error.message}; ${navigationEvents.join("; ")}`);
   }
   await page.getByRole("heading", { name: "authentication required" }).waitFor();
-  if (await page.getByRole("heading", { name: "container-smoke" }).count()) {
+  if (await page.getByRole("heading", { name: expectedProfile }).count()) {
     throw new Error("locked UI leaked a configured profile");
   }
 
@@ -38,8 +40,22 @@ try {
   await page.getByRole("button", { name: "sign in" }).click();
   await page.locator("#dashboard:not([hidden])").waitFor();
   await page.getByText("runtime matrix").waitFor();
-  await page.getByRole("heading", { name: "container-smoke" }).waitFor();
-  if (await page.getByText("managed control plane").count()) {
+  await page.getByRole("heading", { name: expectedProfile }).waitFor();
+  const ownerPanel = page.getByRole("region", { name: "Managed control plane" });
+  if (expectManaged) {
+    await ownerPanel.waitFor();
+    await ownerPanel.getByRole("heading", { name: "basic users" }).waitFor();
+    const basicUserForm = ownerPanel.locator("form.owner-form").first();
+    await basicUserForm.locator('input[name="username"]').fill("browser-ui");
+    await basicUserForm.locator('input[name="password"]').fill("browser-ui-password");
+    await basicUserForm.getByRole("button", { name: "add or rotate" }).click();
+    await ownerPanel.getByText("browser-ui", { exact: true }).waitFor();
+    const grantForm = ownerPanel.locator("form.owner-form").nth(1);
+    await grantForm.locator('input[name="subject"]').fill("basic:browser-ui");
+    await grantForm.locator('select[name="profile"]').selectOption("ungranted-integration");
+    await grantForm.getByRole("button", { name: "grant profile" }).click();
+    await ownerPanel.getByText("basic:browser-ui", { exact: true }).waitFor();
+  } else if (await ownerPanel.count()) {
     throw new Error("static UI exposed a managed owner panel");
   }
   if (await page.locator("#password").inputValue()) {
@@ -48,7 +64,7 @@ try {
 
   await page.getByRole("button", { name: "disconnect" }).click();
   await page.locator("#locked-screen:not([hidden])").waitFor();
-  if (await page.getByRole("heading", { name: "container-smoke" }).isVisible()) {
+  if (await page.getByRole("heading", { name: expectedProfile }).isVisible()) {
     throw new Error("logout left an authorized profile visible");
   }
   if (browserErrors.length) throw new Error(browserErrors.join("; "));

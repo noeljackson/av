@@ -23,13 +23,15 @@ fi
 managed_seed=$("${compose[@]}" ps --all --quiet managed-seed)
 [[ -n "$managed_seed" ]]
 [[ $(docker wait "$managed_seed") == 0 ]]
+av_container=$("${compose[@]}" ps --quiet av)
+AV_UI_CONTAINER="$av_container" AV_UI_EXPECT_MANAGED=1 AV_UI_EXPECT_PROFILE=infisical-integration AV_UI_URL=http://127.0.0.1:14322 \
+  "$root/tests/ui-smoke.sh"
 "${compose[@]}" run --no-deps --rm verify
 
 # Exercise the release CLI, not just AV's HTTP API. The CLI runs in a
 # disposable, capability-free container sharing AV's network namespace. That
 # makes the test endpoint loopback without publishing a host port or adding a
 # production insecure-transport exception.
-av_container=$("${compose[@]}" ps --quiet av)
 docker cp "$av_container:/usr/local/bin/av" "$workdir/av"
 chmod 0755 "$workdir/av"
 run_cli() {

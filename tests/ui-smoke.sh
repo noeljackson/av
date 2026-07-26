@@ -19,6 +19,8 @@ docker run --rm --pull never \
   --cap-drop ALL \
   --security-opt no-new-privileges:true \
   --env AV_UI_URL="$ui_url" \
+  --env AV_UI_EXPECT_MANAGED="${AV_UI_EXPECT_MANAGED:-}" \
+  --env AV_UI_EXPECT_PROFILE="${AV_UI_EXPECT_PROFILE:-}" \
   --mount "type=bind,src=$root/tests/ui-smoke.mjs,dst=/test/ui-smoke.mjs,readonly" \
   "$image" \
   node /test/ui-smoke.mjs
