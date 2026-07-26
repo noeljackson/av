@@ -28,6 +28,7 @@ serde_json = "=1.0.149"
 sha2 = "=0.10.9"
 sqlx = { version = "=0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls", "sqlite"] }
 time = "=0.3.47"
+tempfile = "=3.26.0"
 tokio = { version = "=1.50.0", features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "time"] }
 tokio-rustls = "=0.26.4"
 tower-http = { version = "=0.6.8", features = ["limit", "request-id", "set-header", "trace"] }
@@ -36,9 +37,6 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt", "js
 rustls = "=0.23.42"
 url = "=2.5.8"
 zeroize = "=1.9.0"
-
-[dev-dependencies]
-tempfile = "=3.26.0"
 
 [build-dependencies]
 connectrpc-build = "=0.8.0"

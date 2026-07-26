@@ -3,6 +3,7 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    net::SocketAddr,
     path::Path,
     path::PathBuf,
     process::{Command as ProcessCommand, ExitCode},
@@ -12,8 +13,9 @@ use std::{
 use anyhow::{Context, Result, bail};
 use av::{
     av::v1::{
-        AuthConfig as RpcAuthConfig, GetAuthConfigRequest, GetProfileEnvironmentRequest,
-        ListProfilesRequest, ListProfilesResponse, ProfileEnvironment,
+        AuthConfig as RpcAuthConfig, CreateProxySessionRequest, GetAuthConfigRequest,
+        GetProfileEnvironmentRequest, ListProfilesRequest, ListProfilesResponse,
+        ProfileEnvironment, ProxySessionLease, RevokeProxySessionRequest,
     },
     config::{AuthConfig, AuthMode, Config, ConfigMode, ManagedConfig, OidcSigningAlgorithm},
     keyring, server,
@@ -22,8 +24,14 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{CommandFactory, Parser, Subcommand};
 use reqwest::{Client, StatusCode, header};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use tokio::{
+    io::{AsyncReadExt, AsyncWriteExt},
+    net::{TcpListener, TcpStream},
+    sync::watch,
+};
 use tracing_subscriber::EnvFilter;
 use url::Url;
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "av", version, about)]
@@ -47,6 +55,12 @@ enum Command {
     Logout,
     /// List profiles available to the current identity.
     Profiles,
+    /// Run a child through a profile-scoped transparent proxy session.
+    Run {
+        profile: String,
+        #[arg(required = true, last = true)]
+        command: Vec<OsString>,
+    },
     /// Initialize a local managed AV instance under XDG directories.
     Local {
         #[command(subcommand)]
@@ -129,6 +143,9 @@ async fn run() -> Result<u8> {
         Some(Command::Profiles) => {
             list_profiles(&cli.api_url).await?;
             Ok(0)
+        }
+        Some(Command::Run { profile, command }) => {
+            run_transparent_proxy(&cli.api_url, profile, command).await
         }
         Some(Command::Local { command }) => match command {
             LocalCommand::Init {
@@ -446,6 +463,317 @@ async fn run_profile(api_url: &str, mut arguments: Vec<OsString>) -> Result<u8> 
     Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
 }
 
+async fn run_transparent_proxy(
+    api_url: &str,
+    profile: String,
+    mut command: Vec<OsString>,
+) -> Result<u8> {
+    if command.first().is_some_and(|argument| argument == "--") {
+        command.remove(0);
+    }
+    let executable = command
+        .first()
+        .cloned()
+        .context("usage: av run <profile> -- <command> [args...]")?;
+    let arguments = command.into_iter().skip(1).collect();
+    let lease: ProxySessionLease = connect_request(
+        api_url,
+        "av.v1.SessionService/CreateProxySession",
+        &CreateProxySessionRequest {
+            profile,
+            ..Default::default()
+        },
+        true,
+    )
+    .await?;
+    if lease.session_id.is_empty()
+        || lease.token.is_empty()
+        || lease.proxy_url.is_empty()
+        || lease.ca_certificate_pem.is_empty()
+    {
+        bail!("AV returned an incomplete proxy session");
+    }
+    let session_id = lease.session_id;
+    let token = Zeroizing::new(lease.token);
+    let ca = write_proxy_ca(&lease.ca_certificate_pem)?;
+    let (shutdown, listener_address, listener) =
+        start_loopback_proxy(&lease.proxy_url, token.clone()).await?;
+    let proxy_url = format!("http://{listener_address}");
+    let listener_task = tokio::spawn(listener);
+    let status = run_proxy_child(executable, arguments, &proxy_url, &ca.path).await;
+    let _ = shutdown.send(true);
+    let _ = listener_task.await;
+    let revoke = connect_request::<_, ProxySessionLease>(
+        api_url,
+        "av.v1.SessionService/RevokeProxySession",
+        &RevokeProxySessionRequest {
+            session_id,
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    revoke.context("revoke transparent proxy session")?;
+    status
+}
+
+struct ProxyCaFile {
+    // Dropping TempDir removes the temporary certificate after the child exits.
+    // The CA private key is never present here.
+    _directory: tempfile::TempDir,
+    path: PathBuf,
+}
+
+fn write_proxy_ca(certificate_pem: &str) -> Result<ProxyCaFile> {
+    if !certificate_pem.contains("-----BEGIN CERTIFICATE-----")
+        || certificate_pem.len() > 256 * 1024
+    {
+        bail!("AV returned an invalid proxy CA certificate");
+    }
+    let directory = tempfile::Builder::new()
+        .prefix("av-proxy-")
+        .tempdir()
+        .context("create private proxy CA directory")?;
+    restrict_directory(directory.path())?;
+    let path = directory.path().join("proxy-ca.pem");
+    write_private_file(&path, certificate_pem.as_bytes())?;
+    Ok(ProxyCaFile {
+        _directory: directory,
+        path,
+    })
+}
+
+async fn start_loopback_proxy(
+    remote_proxy_url: &str,
+    token: Zeroizing<String>,
+) -> Result<(
+    watch::Sender<bool>,
+    SocketAddr,
+    impl std::future::Future<Output = Result<()>> + use<>,
+)> {
+    let remote = Url::parse(remote_proxy_url).context("proxy session has an invalid proxy URL")?;
+    if remote.scheme() != "http"
+        || remote.host_str().is_none()
+        || remote.port().is_none()
+        || remote.username() != ""
+        || remote.password().is_some()
+        || remote.query().is_some()
+        || remote.fragment().is_some()
+        || !matches!(remote.path(), "" | "/")
+    {
+        bail!("proxy session has an unsafe proxy URL");
+    }
+    let remote_address = format!(
+        "{}:{}",
+        remote.host_str().expect("checked host"),
+        remote.port().expect("checked port")
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind local proxy helper")?;
+    let listener_address = listener
+        .local_addr()
+        .context("inspect local proxy helper")?;
+    let (shutdown, mut stopped) = watch::channel(false);
+    let token = std::sync::Arc::new(token);
+    let future = async move {
+        loop {
+            tokio::select! {
+                changed = stopped.changed() => {
+                    if changed.is_err() || *stopped.borrow() { return Ok(()); }
+                }
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.context("accept local proxy client")?;
+                    let remote_address = remote_address.clone();
+                    let token = token.clone();
+                    let stopped = stopped.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) = proxy_local_connection(stream, &remote_address, token, stopped).await {
+                            tracing::debug!(%error, "local proxy helper connection ended");
+                        }
+                    });
+                }
+            }
+        }
+    };
+    Ok((shutdown, listener_address, future))
+}
+
+async fn proxy_local_connection(
+    mut client: TcpStream,
+    remote_address: &str,
+    token: std::sync::Arc<Zeroizing<String>>,
+    mut stopped: watch::Receiver<bool>,
+) -> Result<()> {
+    let (header, remaining) = read_proxy_header(&mut client).await?;
+    let rewritten = inject_proxy_authorization(&header, token.as_str())?;
+    let mut remote = TcpStream::connect(remote_address)
+        .await
+        .context("connect private AV proxy")?;
+    remote.write_all(&rewritten).await?;
+    let (response, remote_remaining) = read_proxy_header(&mut remote).await?;
+    client.write_all(&response).await?;
+    if !response.starts_with(b"HTTP/1.1 200") && !response.starts_with(b"HTTP/1.0 200") {
+        return Ok(());
+    }
+    if !remaining.is_empty() {
+        remote.write_all(&remaining).await?;
+    }
+    if !remote_remaining.is_empty() {
+        client.write_all(&remote_remaining).await?;
+    }
+    tokio::select! {
+        result = tokio::io::copy_bidirectional(&mut client, &mut remote) => {
+            result.context("relay local proxy connection")?;
+        }
+        changed = stopped.changed() => {
+            let _ = changed;
+        }
+    }
+    Ok(())
+}
+
+async fn read_proxy_header(stream: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>)> {
+    const MAX_PROXY_HEADER: usize = 16 * 1024;
+    let mut bytes = Vec::new();
+    let mut chunk = [0_u8; 2048];
+    loop {
+        if let Some(index) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+            let end = index + 4;
+            return Ok((bytes[..end].to_vec(), bytes[end..].to_vec()));
+        }
+        if bytes.len() >= MAX_PROXY_HEADER {
+            bail!("proxy request headers are too large");
+        }
+        let read = stream
+            .read(&mut chunk)
+            .await
+            .context("read proxy headers")?;
+        if read == 0 {
+            bail!("proxy connection closed before request headers");
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+    }
+}
+
+fn inject_proxy_authorization(header: &[u8], token: &str) -> Result<Vec<u8>> {
+    if token.is_empty()
+        || token
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        bail!("proxy session token is invalid");
+    }
+    let header = std::str::from_utf8(header).context("proxy request headers are not UTF-8")?;
+    let mut lines = header.split("\r\n");
+    let request_line = lines
+        .next()
+        .context("proxy request is missing a request line")?;
+    let mut request_parts = request_line.split_ascii_whitespace();
+    if request_parts.next() != Some("CONNECT")
+        || request_parts.next().is_none()
+        || request_parts.next() != Some("HTTP/1.1")
+        || request_parts.next().is_some()
+    {
+        bail!("local proxy helper accepts CONNECT HTTP/1.1 only");
+    }
+    let mut output = String::with_capacity(header.len() + token.len() + 40);
+    output.push_str(request_line);
+    output.push_str("\r\n");
+    let mut host_count = 0;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        if line.starts_with([' ', '\t']) {
+            bail!("proxy request contains folded headers");
+        }
+        let (name, value) = line
+            .split_once(':')
+            .context("proxy request has an invalid header")?;
+        if name.eq_ignore_ascii_case("proxy-authorization") {
+            continue;
+        }
+        if name.eq_ignore_ascii_case("host") {
+            host_count += 1;
+        }
+        if name.is_empty() || value.contains(['\r', '\n']) {
+            bail!("proxy request has an invalid header");
+        }
+        output.push_str(line);
+        output.push_str("\r\n");
+    }
+    if host_count != 1 {
+        bail!("proxy CONNECT request requires exactly one Host header");
+    }
+    output.push_str("Proxy-Authorization: Bearer ");
+    output.push_str(token);
+    output.push_str("\r\n\r\n");
+    Ok(output.into_bytes())
+}
+
+async fn run_proxy_child(
+    executable: OsString,
+    arguments: Vec<OsString>,
+    proxy_url: &str,
+    ca_path: &Path,
+) -> Result<u8> {
+    let mut child = tokio::process::Command::from(proxy_child_command(
+        executable, arguments, proxy_url, ca_path,
+    )?)
+    .spawn()
+    .context("start proxied child process")?;
+    let status = tokio::select! {
+        status = child.wait() => status.context("wait for proxied child process")?,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("wait for interrupt")?;
+            let _ = child.kill().await;
+            child.wait().await.context("wait for interrupted child process")?
+        }
+    };
+    Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
+}
+
+fn proxy_child_command(
+    executable: OsString,
+    arguments: Vec<OsString>,
+    proxy_url: &str,
+    ca_path: &Path,
+) -> Result<ProcessCommand> {
+    let proxy_url = Url::parse(proxy_url).context("local proxy URL is invalid")?;
+    if proxy_url.scheme() != "http"
+        || proxy_url.host_str().is_none_or(|host| !is_loopback(host))
+        || proxy_url.port().is_none()
+        || proxy_url.username() != ""
+        || proxy_url.password().is_some()
+        || proxy_url.query().is_some()
+        || proxy_url.fragment().is_some()
+        || !matches!(proxy_url.path(), "" | "/")
+    {
+        bail!("local proxy URL must be a credential-free loopback HTTP origin");
+    }
+    let mut command = ProcessCommand::new(executable);
+    command
+        .args(arguments)
+        .env("HTTP_PROXY", proxy_url.as_str())
+        .env("HTTPS_PROXY", proxy_url.as_str())
+        .env("http_proxy", proxy_url.as_str())
+        .env("https_proxy", proxy_url.as_str())
+        .env("SSL_CERT_FILE", ca_path)
+        .env("NODE_EXTRA_CA_CERTS", ca_path)
+        .env("CURL_CA_BUNDLE", ca_path)
+        .env("REQUESTS_CA_BUNDLE", ca_path)
+        .env("GIT_SSL_CAINFO", ca_path)
+        .env_remove("AV_TOKEN")
+        .env_remove("AV_BASIC_USER")
+        .env_remove("AV_BASIC_PASSWORD")
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        .env_remove("ALL_PROXY")
+        .env_remove("all_proxy");
+    Ok(command)
+}
+
 // Profile credentials are deliberately the only AV-specific material passed to
 // a child. `Command` otherwise inherits this process's environment, which
 // would expose the wrapper credential that authorizes access to other profiles.
@@ -607,5 +935,149 @@ mod tests {
             envs.get(&OsString::from("PROFILE_SECRET")),
             Some(&Some(OsString::from("value")))
         );
+    }
+
+    #[test]
+    fn local_helper_replaces_caller_proxy_authorization() {
+        let rewritten = inject_proxy_authorization(
+            b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\nProxy-Authorization: Basic caller-controlled\r\nProxy-Authorization: Bearer also-caller-controlled\r\n\r\n",
+            "opaque-test-session",
+        )
+        .unwrap();
+        let rewritten = std::str::from_utf8(&rewritten).unwrap();
+
+        assert!(rewritten.starts_with("CONNECT api.example.test:443 HTTP/1.1\r\n"));
+        assert!(!rewritten.contains("caller-controlled"));
+        assert_eq!(rewritten.matches("Proxy-Authorization:").count(), 1);
+        assert!(rewritten.contains("Proxy-Authorization: Bearer opaque-test-session\r\n"));
+    }
+
+    #[test]
+    fn local_helper_rejects_ambiguous_or_non_connect_requests() {
+        assert!(
+            inject_proxy_authorization(
+                b"GET https://api.example.test/ HTTP/1.1\r\nHost: api.example.test\r\n\r\n",
+                "opaque-test-session"
+            )
+            .is_err()
+        );
+        assert!(inject_proxy_authorization(
+            b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\nHost: api.example.test:443\r\n\r\n",
+            "opaque-test-session"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn proxied_child_gets_only_loopback_proxy_settings() {
+        let command = proxy_child_command(
+            OsString::from("example"),
+            Vec::new(),
+            "http://127.0.0.1:42173",
+            Path::new("/private/proxy-ca.pem"),
+        )
+        .unwrap();
+        let envs: BTreeMap<OsString, Option<OsString>> = command
+            .get_envs()
+            .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
+            .collect();
+
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert_eq!(
+                envs.get(&OsString::from(name)),
+                Some(&Some(OsString::from("http://127.0.0.1:42173/")))
+            );
+        }
+        for name in [
+            "AV_TOKEN",
+            "AV_BASIC_USER",
+            "AV_BASIC_PASSWORD",
+            "NO_PROXY",
+            "no_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+        ] {
+            assert_eq!(envs.get(&OsString::from(name)), Some(&None));
+        }
+        for name in [
+            "SSL_CERT_FILE",
+            "NODE_EXTRA_CA_CERTS",
+            "CURL_CA_BUNDLE",
+            "REQUESTS_CA_BUNDLE",
+            "GIT_SSL_CAINFO",
+        ] {
+            assert_eq!(
+                envs.get(&OsString::from(name)),
+                Some(&Some(OsString::from("/private/proxy-ca.pem")))
+            );
+        }
+        assert!(
+            proxy_child_command(
+                OsString::from("example"),
+                Vec::new(),
+                "http://token@proxy.example.test:14323",
+                Path::new("/private/proxy-ca.pem"),
+            )
+            .is_err()
+        );
+        assert!(
+            proxy_child_command(
+                OsString::from("example"),
+                Vec::new(),
+                "http://proxy.example.test:14323",
+                Path::new("/private/proxy-ca.pem"),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_helper_forwards_only_its_opaque_session_credential() {
+        let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let remote_address = remote_listener.local_addr().unwrap();
+        let (header_sent, header_received) = tokio::sync::oneshot::channel();
+        let remote_task = tokio::spawn(async move {
+            let (mut remote, _) = remote_listener.accept().await.unwrap();
+            let (header, _) = read_proxy_header(&mut remote).await.unwrap();
+            header_sent.send(header).unwrap();
+            remote
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let (shutdown, local_address, local_helper) = start_loopback_proxy(
+            &format!("http://{remote_address}"),
+            Zeroizing::new("opaque-test-session".to_owned()),
+        )
+        .await
+        .unwrap();
+        let helper_task = tokio::spawn(local_helper);
+        let mut client = TcpStream::connect(local_address).await.unwrap();
+        client
+            .write_all(b"CONNECT api.example.test:443 HTTP/1.1\r\nHost: api.example.test:443\r\nProxy-Authorization: Basic caller-controlled\r\n\r\n")
+            .await
+            .unwrap();
+        let (response, _) = read_proxy_header(&mut client).await.unwrap();
+        assert!(response.starts_with(b"HTTP/1.1 407"));
+        drop(client);
+
+        let header = tokio::time::timeout(Duration::from_secs(1), header_received)
+            .await
+            .unwrap()
+            .unwrap();
+        let header = std::str::from_utf8(&header).unwrap();
+        assert!(!header.contains("caller-controlled"));
+        assert_eq!(header.matches("Proxy-Authorization:").count(), 1);
+        assert!(header.contains("Proxy-Authorization: Bearer opaque-test-session\r\n"));
+
+        shutdown.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), helper_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        remote_task.await.unwrap();
     }
 }
