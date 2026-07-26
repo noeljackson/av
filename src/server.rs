@@ -1187,17 +1187,24 @@ async fn github_callback(
         }
     };
     let session = github.create_session(identity).await;
-    no_store(
-        (
-            StatusCode::FOUND,
-            [
-                (header::LOCATION, "/".to_owned()),
-                (header::SET_COOKIE, github_session_cookie(&session)),
-                (header::SET_COOKIE, clear_github_state_cookie()),
-            ],
-        )
-            .into_response(),
-    )
+    github_callback_success(&session)
+}
+
+fn github_callback_success(session: &str) -> Response {
+    let mut response = no_store((StatusCode::FOUND, [(header::LOCATION, "/")]).into_response());
+    // HeaderMap::insert would retain only one Set-Cookie value. Both are
+    // necessary: establish the browser session and invalidate OAuth state.
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&github_session_cookie(session))
+            .expect("URL-safe browser session is a valid cookie value"),
+    );
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&clear_github_state_cookie())
+            .expect("cleared state cookie is a valid header value"),
+    );
+    response
 }
 
 async fn github_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -2388,6 +2395,29 @@ mod tests {
                 Some(token.as_str())
             );
         }
+    }
+
+    #[test]
+    fn successful_github_callback_sets_session_and_clears_oauth_state() {
+        let response = github_callback_success("session-token");
+        assert_eq!(response.status(), StatusCode::FOUND);
+        let cookies: Vec<_> = response
+            .headers()
+            .get_all(header::SET_COOKIE)
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(cookies.len(), 2);
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("av_github_session=session-token;"))
+        );
+        assert!(
+            cookies
+                .iter()
+                .any(|cookie| cookie.starts_with("av_github_state=;"))
+        );
     }
 
     #[test]
