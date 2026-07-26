@@ -33,6 +33,14 @@ jobs:
         run: |
           helm lint chart/av
           helm template av chart/av >/dev/null
+          helm lint chart/av -f tests/helm/transparent-values.yaml
+          helm template av chart/av -f tests/helm/transparent-values.yaml >/tmp/av-transparent.yaml
+          grep --quiet 'kind: CiliumNetworkPolicy' /tmp/av-transparent.yaml
+          grep --quiet 'name: av-av-proxy' /tmp/av-transparent.yaml
+          if helm template av chart/av --set transparentProxy.enabled=true >/dev/null 2>&1; then
+            echo 'transparent proxy rendered without managed session configuration' >&2
+            exit 1
+          fi
       - name: Docker build
         run: |
           docker build --tag av:test .

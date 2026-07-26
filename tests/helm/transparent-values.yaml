@@ -1,0 +1,31 @@
+# Synthetic, non-deployable values used only to exercise the transparent
+# listener's Helm rendering and fail-closed policy checks in CI.
+controlPlane:
+  mode: managed
+  existingDatabaseSecret:
+    name: test-av-database
+    key: database-url
+  initialOwnerOidcSubject: oidc:test-owner
+
+transparentProxy:
+  enabled: true
+  proxyUrl: http://av-proxy.test.internal:14323
+  caSecret:
+    name: test-av-proxy-ca
+  networkPolicy:
+    enabled: true
+    workloadSelector:
+      matchLabels:
+        app.kubernetes.io/part-of: transparent-test
+    proxyClientPodSelector:
+      matchLabels:
+        app.kubernetes.io/part-of: transparent-test
+    controlPlaneIngress:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: ingress-controller
+  cilium:
+    enabled: true
+    workloadSelector:
+      matchLabels:
+        k8s:app.kubernetes.io/part-of: transparent-test
