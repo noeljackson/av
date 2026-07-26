@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    net::IpAddr,
+    net::{IpAddr, SocketAddr},
     path::Path,
 };
 
@@ -26,6 +26,10 @@ pub struct Config {
     pub profiles: BTreeMap<String, ProfileConfig>,
     #[serde(default)]
     pub proxy_routes: BTreeMap<String, ProxyRouteConfig>,
+    /// The planned private CONNECT/MITM listener. It is intentionally absent
+    /// from ordinary deployments and must never share the public API listener.
+    #[serde(default)]
+    pub transparent_proxy: Option<TransparentProxyConfig>,
     #[serde(default = "default_max_connector_concurrency")]
     pub max_connector_concurrency: usize,
     #[serde(default = "default_api_rate_limit_per_second")]
@@ -266,6 +270,20 @@ pub struct ProxyRouteConfig {
     pub allowed_content_types: Vec<String>,
     #[serde(default = "default_proxy_max_body_bytes")]
     pub max_body_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TransparentProxyConfig {
+    /// Private TCP listener for CONNECT traffic. This must be exposed only by
+    /// a private Service; public exposure is rejected by chart policy as well.
+    pub listen: String,
+    /// PEM-encoded deployment CA certificate mounted from an existing Secret.
+    pub ca_certificate_file: String,
+    /// PEM-encoded deployment CA private key mounted from an existing Secret.
+    pub ca_private_key_file: String,
+    #[serde(default = "default_proxy_session_ttl_seconds")]
+    pub session_ttl_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -559,6 +577,9 @@ impl Config {
             }
         }
 
+        if let Some(transparent_proxy) = &self.transparent_proxy {
+            validate_transparent_proxy(self, transparent_proxy)?;
+        }
         Ok(())
     }
 
@@ -698,6 +719,36 @@ fn validate_string_allowlist(
     Ok(())
 }
 
+fn validate_transparent_proxy(config: &Config, proxy: &TransparentProxyConfig) -> Result<()> {
+    if config.mode != ConfigMode::Managed {
+        bail!("transparent_proxy requires managed mode for session revocation");
+    }
+    let listener = proxy
+        .listen
+        .parse::<SocketAddr>()
+        .context("transparent_proxy.listen must be an IP socket address")?;
+    let api_listener = config
+        .listen
+        .parse::<SocketAddr>()
+        .context("listen must be an IP socket address when transparent_proxy is configured")?;
+    if listener.port() == 0 || listener == api_listener {
+        bail!("transparent_proxy.listen must be a distinct non-zero listener");
+    }
+    let certificate = Path::new(&proxy.ca_certificate_file);
+    let private_key = Path::new(&proxy.ca_private_key_file);
+    if !certificate.is_absolute() || !private_key.is_absolute() || certificate == private_key {
+        bail!("transparent proxy CA certificate and key must be distinct absolute file paths");
+    }
+    if !(60..=3600).contains(&proxy.session_ttl_seconds) {
+        bail!("transparent proxy session_ttl_seconds must be between 60 and 3600");
+    }
+    if config.proxy_routes.is_empty() {
+        bail!("transparent_proxy requires at least one immutable proxy route");
+    }
+    crate::transparent_proxy::TransparentRouteCatalog::from_proxy_routes(&config.proxy_routes)?;
+    Ok(())
+}
+
 fn validate_openbao_mount_path(name: &str, mount_path: &str) -> Result<()> {
     let normalized = mount_path.trim_matches('/');
     if normalized.is_empty()
@@ -814,6 +865,10 @@ fn default_proxy_max_body_bytes() -> usize {
     1024 * 1024
 }
 
+fn default_proxy_session_ttl_seconds() -> u64 {
+    15 * 60
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -842,6 +897,7 @@ mod tests {
             connectors: BTreeMap::new(),
             profiles: BTreeMap::new(),
             proxy_routes: BTreeMap::new(),
+            transparent_proxy: None,
             max_connector_concurrency: 16,
             api_rate_limit_per_second: 50,
             api_rate_limit_burst: 100,
@@ -981,6 +1037,95 @@ mod tests {
             route.allowed_response_headers = vec!["location".into()];
         }
         assert!(config.validate().is_err());
+        unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
+    }
+
+    #[test]
+    fn transparent_proxy_is_managed_private_and_unambiguous() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AV_ALLOW_INSECURE_AUTH", "1") };
+        let mut config = base_config();
+        config.mode = ConfigMode::Managed;
+        config.managed = Some(ManagedConfig {
+            database_url_file: "/run/av/database-url".into(),
+            initial_owner_oidc_subject: "oidc:owner".into(),
+        });
+        config.connectors.insert(
+            "main".into(),
+            ConnectorConfig::Infisical(InfisicalConfig {
+                _kind: InfisicalKind::Infisical,
+                base_url: "https://infisical.example.test".into(),
+                auth: InfisicalAuth::Kubernetes {
+                    identity_id: "identity".into(),
+                    token_file: "/run/token".into(),
+                },
+            }),
+        );
+        config.profiles.insert(
+            "example".into(),
+            ProfileConfig {
+                connector: "main".into(),
+                project_id: "project".into(),
+                environment: "dev".into(),
+                secret_path: "/".into(),
+                allowed_keys: vec![],
+            },
+        );
+        config.proxy_routes.insert(
+            "provider".into(),
+            ProxyRouteConfig {
+                profile: "example".into(),
+                base_url: "https://api.example.test/v1".into(),
+                secret_key: "TOKEN".into(),
+                header: "Authorization".into(),
+                header_prefix: "Bearer ".into(),
+                allowed_methods: vec!["GET".into()],
+                allowed_path_prefixes: vec!["/v1/".into()],
+                allowed_request_headers: vec![],
+                allowed_response_headers: vec![],
+                allowed_query_parameters: vec![],
+                allowed_content_types: vec![],
+                max_body_bytes: default_proxy_max_body_bytes(),
+            },
+        );
+        config.transparent_proxy = Some(TransparentProxyConfig {
+            listen: "127.0.0.1:14323".into(),
+            ca_certificate_file: "/run/av/proxy/ca.crt".into(),
+            ca_private_key_file: "/run/av/proxy/ca.key".into(),
+            session_ttl_seconds: 900,
+        });
+        assert!(config.validate().is_ok());
+
+        config.mode = ConfigMode::Static;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("only valid when mode is managed")
+        );
+        config.mode = ConfigMode::Managed;
+        config.transparent_proxy.as_mut().unwrap().listen = config.listen.clone();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("distinct")
+        );
+        config.transparent_proxy.as_mut().unwrap().listen = "127.0.0.1:14323".into();
+        config
+            .transparent_proxy
+            .as_mut()
+            .unwrap()
+            .session_ttl_seconds = 30;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("between 60 and 3600")
+        );
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
     }
 

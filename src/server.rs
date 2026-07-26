@@ -958,6 +958,13 @@ struct ExternalProfileGrantForm {
 }
 
 pub async fn run(config: Config) -> Result<()> {
+    if config.transparent_proxy.is_some() {
+        // Do not accept a configuration that looks enabled while the complete
+        // private listener, CA, session, and egress enforcement stack is not
+        // running. This guard is removed only in the same change that starts
+        // the fully tested listener.
+        bail!("transparent proxy listener is not enabled in this build");
+    }
     let store = match config.mode {
         ConfigMode::Static => None,
         ConfigMode::Managed => Some(
