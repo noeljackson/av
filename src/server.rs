@@ -2118,6 +2118,10 @@ async fn transparent_tunnel_response(
         }
     }
     let (parts, body) = request.into_parts();
+    if let Err(error) = enforce_transparent_tunnel_target(route, &parts.uri, &parts.headers) {
+        tracing::warn!(%error, route = route_name, "transparent proxy request target denied");
+        return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+    }
     let normalized_path = match enforce_proxy_policy(route, parts.uri.path(), &parts.method) {
         Ok(path) => path,
         Err(error) => {
@@ -2473,6 +2477,48 @@ fn enforce_proxy_policy(route: &ProxyRouteConfig, path: &str, method: &Method) -
     Ok(normalized_path)
 }
 
+/// The TLS tunnel is already bound to a catalog host by CONNECT. Repeat that
+/// check on the decrypted HTTP request so a client cannot smuggle a different
+/// target through an absolute-form URI, Host header, or nested proxy auth.
+/// Any allowed caller headers are later copied by `proxy_request`; everything
+/// else is dropped rather than forwarded to the provider.
+fn enforce_transparent_tunnel_target(
+    route: &ProxyRouteConfig,
+    uri: &Uri,
+    headers: &HeaderMap,
+) -> Result<()> {
+    if uri.scheme().is_some() || uri.authority().is_some() || !uri.path().starts_with('/') {
+        bail!("transparent tunnel requires an origin-form request target");
+    }
+    if headers.get_all(header::HOST).iter().count() != 1 {
+        bail!("transparent tunnel requires exactly one Host header");
+    }
+    if headers
+        .get_all(header::PROXY_AUTHORIZATION)
+        .iter()
+        .next()
+        .is_some()
+    {
+        bail!("transparent tunnel must not contain proxy authorization");
+    }
+    let configured =
+        url::Url::parse(&route.base_url).context("transparent route base URL disappeared")?;
+    let supplied_host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .context("transparent tunnel Host header is invalid")?;
+    let supplied = url::Url::parse(&format!("https://{supplied_host}"))
+        .context("transparent tunnel Host header is malformed")?;
+    if supplied.username() != ""
+        || supplied.password().is_some()
+        || supplied.port_or_known_default() != Some(443)
+        || supplied.host_str() != configured.host_str()
+    {
+        bail!("transparent tunnel Host does not match its configured route");
+    }
+    Ok(())
+}
+
 fn path_matches_prefix(path: &str, configured_prefix: &str) -> bool {
     let normalized_prefix = format!("/{}", configured_prefix.trim_matches('/'));
     if normalized_prefix == "/" {
@@ -2704,17 +2750,20 @@ async fn shutdown() {
 mod tests {
     use super::*;
     use crate::{
-        config::{AuthConfig, BasicUserConfig, ManagedConfig, TransparentProxyConfig},
+        config::{
+            AuthConfig, BasicUserConfig, ConnectorConfig, ManagedConfig, TransparentProxyConfig,
+        },
+        connector::Connector,
         transparent_proxy::{mint_proxy_session_credential, proxy_session_token_hash},
     };
-    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
     use rustls::{
-        ClientConfig, RootCertStore,
-        pki_types::{CertificateDer, ServerName},
+        ClientConfig, RootCertStore, ServerConfig,
+        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName},
     };
     use std::{collections::BTreeMap, sync::Arc};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio_rustls::TlsConnector;
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     fn proxy_route(methods: &[&str], prefixes: &[&str]) -> ProxyRouteConfig {
         ProxyRouteConfig {
@@ -2896,6 +2945,184 @@ mod tests {
         }
     }
 
+    async fn read_test_http_header<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; 2048];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "connection closed before HTTP headers");
+            bytes.extend_from_slice(&chunk[..read]);
+            assert!(bytes.len() <= 32 * 1024, "HTTP test headers exceeded bound");
+            if bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                return bytes;
+            }
+        }
+    }
+
+    fn test_upstream_tls_config() -> (ServerConfig, Vec<u8>) {
+        crate::proxy_ca::install_rustls_provider().unwrap();
+        let mut ca_params = CertificateParams::new(vec!["upstream-test-ca".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_certificate = ca_params.self_signed(&ca_key).unwrap();
+        let issuer = Issuer::new(ca_params, ca_key);
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = CertificateParams::new(vec!["api.example.com".into()])
+            .unwrap()
+            .signed_by(&leaf_key, &issuer)
+            .unwrap();
+        let config = ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![CertificateDer::from(leaf.der().to_vec())],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der())),
+            )
+            .unwrap();
+        (config, ca_certificate.der().to_vec())
+    }
+
+    #[tokio::test]
+    async fn transparent_tls_enforces_policy_injects_only_provider_auth_and_redacts_response() {
+        let (mut state, runtime, _store, token, proxy_ca_der) = transparent_test_context().await;
+        let secrets_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secrets_address = secrets_listener.local_addr().unwrap();
+        let secret_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret_file.path(), "connector-test-token\n").unwrap();
+        let connector_config: ConnectorConfig = serde_json::from_value(serde_json::json!({
+            "base_url": format!("http://{secrets_address}"),
+            "auth": {"type": "token", "token_file": secret_file.path()},
+        }))
+        .unwrap();
+        let connector = Connector::new(connector_config, true).unwrap();
+        state.connectors = Arc::new(BTreeMap::from([("unused".to_owned(), connector)]));
+        let secrets_task = tokio::spawn(async move {
+            let (mut stream, _) = secrets_listener.accept().await.unwrap();
+            let request = read_test_http_header(&mut stream).await;
+            assert!(request.starts_with(b"GET /api/v3/secrets/raw?"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 76\r\nConnection: close\r\n\r\n{\"secrets\":[{\"secretKey\":\"API_TOKEN\",\"secretValue\":\"upstream-test-secret\"}]}" )
+                .await
+                .unwrap();
+        });
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let (upstream_config, upstream_ca_der) = test_upstream_tls_config();
+        state.proxy_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(reqwest::Certificate::from_der(&upstream_ca_der).unwrap())
+            .resolve("api.example.com", upstream_address)
+            .build()
+            .unwrap();
+        let (upstream_request_sent, upstream_request_received) = tokio::sync::oneshot::channel();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut stream = TlsAcceptor::from(Arc::new(upstream_config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let request = read_test_http_header(&mut stream).await;
+            upstream_request_sent.send(request).unwrap();
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"echo\":\"upstream-test-secret\"}")
+                .await
+                .unwrap();
+        });
+
+        let (mut proxy, proxy_task) =
+            serve_one_transparent_connection(state.clone(), runtime.clone()).await;
+        assert!(
+            raw_connect(&mut proxy, "api.example.com:443", &token)
+                .await
+                .starts_with(b"HTTP/1.1 200")
+        );
+        let mut proxy_roots = RootCertStore::empty();
+        proxy_roots
+            .add(CertificateDer::from(proxy_ca_der.clone()))
+            .unwrap();
+        let tls = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(proxy_roots)
+                .with_no_client_auth(),
+        ));
+        let mut tunnel = tls
+            .connect(ServerName::try_from("api.example.com").unwrap(), proxy)
+            .await
+            .unwrap();
+        tunnel
+            .write_all(b"GET /v1/allowed?source=transparent-test HTTP/1.1\r\nHost: api.example.com\r\nAccept: application/json\r\nAuthorization: Bearer caller-controlled\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tunnel.read_to_end(&mut response).await.unwrap();
+        assert!(
+            response.starts_with(b"HTTP/1.1 200"),
+            "unexpected transparent response status: {}",
+            String::from_utf8_lossy(&response)
+                .lines()
+                .next()
+                .unwrap_or("<no response>")
+        );
+        assert!(
+            !response
+                .windows(b"upstream-test-secret".len())
+                .any(|window| window == b"upstream-test-secret")
+        );
+        assert!(
+            response
+                .windows(b"[REDACTED]".len())
+                .any(|window| window == b"[REDACTED]")
+        );
+
+        let upstream_request = upstream_request_received.await.unwrap();
+        let upstream_request = std::str::from_utf8(&upstream_request).unwrap();
+        let canonical_upstream_request = upstream_request.to_ascii_lowercase();
+        assert!(
+            upstream_request.starts_with("GET /v1/allowed?source=transparent-test HTTP/1.1\r\n")
+        );
+        assert!(
+            canonical_upstream_request.contains("authorization: bearer upstream-test-secret\r\n")
+        );
+        assert!(!upstream_request.contains("caller-controlled"));
+
+        proxy_task.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+        secrets_task.await.unwrap();
+
+        let (mut denied_proxy, denied_task) =
+            serve_one_transparent_connection(state, runtime).await;
+        assert!(
+            raw_connect(&mut denied_proxy, "api.example.com:443", &token)
+                .await
+                .starts_with(b"HTTP/1.1 200")
+        );
+        let mut denied_roots = RootCertStore::empty();
+        denied_roots
+            .add(CertificateDer::from(proxy_ca_der))
+            .unwrap();
+        let denied_tls = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(denied_roots)
+                .with_no_client_auth(),
+        ));
+        let mut denied_tunnel = denied_tls
+            .connect(
+                ServerName::try_from("api.example.com").unwrap(),
+                denied_proxy,
+            )
+            .await
+            .unwrap();
+        denied_tunnel
+            .write_all(b"GET /v1/allowed HTTP/1.1\r\nHost: api.example.com\r\nProxy-Authorization: Bearer caller-controlled\r\n\r\n")
+            .await
+            .unwrap();
+        let denied_response = read_test_http_header(&mut denied_tunnel).await;
+        assert!(denied_response.starts_with(b"HTTP/1.1 403"));
+        drop(denied_tunnel);
+        denied_task.await.unwrap().unwrap();
+    }
+
     #[tokio::test]
     async fn raw_tcp_connect_denies_unknown_destinations_and_honors_live_revocation() {
         let (state, runtime, store, token, ca_der) = transparent_test_context().await;
@@ -2995,6 +3222,31 @@ mod tests {
         assert!(enforce_proxy_policy(&read_only, "zones/123", &Method::GET).is_ok());
         assert!(enforce_proxy_policy(&read_only, "zones/123", &Method::POST).is_err());
         assert!(enforce_proxy_policy(&read_only, "zones/123", &Method::DELETE).is_err());
+    }
+
+    #[test]
+    fn transparent_tunnel_binds_decrypted_request_to_connect_host() {
+        let route = proxy_route(&["GET"], &["/v1/"]);
+        let uri = "/v1/allowed".parse::<Uri>().unwrap();
+        let mut valid_headers = HeaderMap::new();
+        valid_headers.insert(header::HOST, HeaderValue::from_static("api.example.com"));
+        assert!(enforce_transparent_tunnel_target(&route, &uri, &valid_headers).is_ok());
+
+        let mut wrong_host = valid_headers.clone();
+        wrong_host.insert(header::HOST, HeaderValue::from_static("other.example.com"));
+        assert!(enforce_transparent_tunnel_target(&route, &uri, &wrong_host).is_err());
+
+        let mut nested_proxy_auth = valid_headers;
+        nested_proxy_auth.insert(
+            header::PROXY_AUTHORIZATION,
+            HeaderValue::from_static("Bearer caller-controlled"),
+        );
+        assert!(enforce_transparent_tunnel_target(&route, &uri, &nested_proxy_auth).is_err());
+
+        let absolute = "https://api.example.com/v1/allowed".parse::<Uri>().unwrap();
+        let mut absolute_headers = HeaderMap::new();
+        absolute_headers.insert(header::HOST, HeaderValue::from_static("api.example.com"));
+        assert!(enforce_transparent_tunnel_target(&route, &absolute, &absolute_headers).is_err());
     }
 
     #[test]
