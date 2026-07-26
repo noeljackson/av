@@ -24,6 +24,48 @@ service:
   port: 80
   targetPort: 14322
 
+# The transparent listener is deliberately opt-in. It is a private CONNECT/TLS
+# interception service, never an Ingress backend. proxyUrl is the private
+# origin local `av run` helpers reach; it must resolve only inside the chosen
+# trusted network boundary.
+transparentProxy:
+  enabled: false
+  port: 14323
+  proxyUrl: ""
+  caSecret:
+    name: ""
+    certificateKey: ca.crt
+    privateKeyKey: ca.key
+  networkPolicy:
+    enabled: false
+    # Select only workloads that must use `av run`. An empty selector is never
+    # accepted because it would default-deny every workload in the namespace.
+    workloadSelector: {}
+    # Selectors are evaluated in this release namespace unless a namespace
+    # selector is supplied. Configure the control-plane source explicitly when
+    # an Ingress/controller needs access to AV's normal HTTP port.
+    proxyClientNamespaceSelector: {}
+    proxyClientPodSelector: {}
+    controlPlaneIngress: []
+    # Kubernetes DNS defaults shown here work on common clusters; override for
+    # a different resolver label/namespace.
+    dnsNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: kube-system
+    dnsPodSelector:
+      matchLabels:
+        k8s-app: kube-dns
+  cilium:
+    enabled: false
+    # Cilium enforcement mirrors the workload NetworkPolicy so direct TCP and
+    # UDP/443 have no allowed path. It is kept separate because Cilium CRDs are
+    # not installed on every Kubernetes distribution.
+    workloadSelector: {}
+    dnsEndpointSelector:
+      matchLabels:
+        k8s:io.kubernetes.pod.namespace: kube-system
+        k8s:k8s-app: kube-dns
+
 ingress:
   enabled: false
   className: ""

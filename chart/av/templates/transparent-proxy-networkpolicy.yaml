@@ -1,0 +1,85 @@
+{{- if and .Values.transparentProxy.enabled .Values.transparentProxy.networkPolicy.enabled }}
+{{- $policy := .Values.transparentProxy.networkPolicy }}
+{{- if empty $policy.workloadSelector }}
+{{- fail "transparentProxy.networkPolicy.workloadSelector must select only proxy-enforced workloads" }}
+{{- end }}
+{{- if and (empty $policy.proxyClientNamespaceSelector) (empty $policy.proxyClientPodSelector) }}
+{{- fail "transparentProxy.networkPolicy requires a proxyClient namespace or pod selector" }}
+{{- end }}
+# The AV pod accepts CONNECT only on the private proxy port from the explicit
+# workload selector below. HTTP control-plane access is independently listed;
+# enabling this policy without controlPlaneIngress intentionally denies it.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "av.fullname" . }}-transparent-proxy
+  labels:
+    {{- include "av.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "av.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    - ports:
+        - protocol: TCP
+          port: proxy
+      from:
+        - {{- with $policy.proxyClientNamespaceSelector }}
+          namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $policy.proxyClientPodSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+    {{- range $source := $policy.controlPlaneIngress }}
+    - ports:
+        - protocol: TCP
+          port: http
+      from:
+        - {{- with $source.namespaceSelector }}
+          namespaceSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with $source.podSelector }}
+          podSelector:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+    {{- end }}
+---
+# This egress allowlist is the bypass control. It permits only the AV proxy
+# and DNS; because no UDP/443 rule exists, QUIC cannot escape inspection.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "av.fullname" . }}-transparent-workloads
+  labels:
+    {{- include "av.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    {{- toYaml $policy.workloadSelector | nindent 4 }}
+  policyTypes: [Egress]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "av.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: proxy
+    {{- if and (not (empty $policy.dnsNamespaceSelector)) (not (empty $policy.dnsPodSelector)) }}
+    - to:
+        - namespaceSelector:
+            {{- toYaml $policy.dnsNamespaceSelector | nindent 12 }}
+          podSelector:
+            {{- toYaml $policy.dnsPodSelector | nindent 12 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    {{- end }}
+{{- end }}

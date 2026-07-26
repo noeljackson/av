@@ -1948,6 +1948,13 @@ async fn transparent_connect_response(
     state: AppState,
     runtime: Arc<TransparentProxyRuntime>,
 ) -> HyperResponse<Empty<Bytes>> {
+    // The private listener is not an Internet service, but a compromised
+    // in-cluster workload must still not be able to exhaust AV's session or
+    // TLS work. Share the bounded application token bucket with the control
+    // plane rather than leaving CONNECT unmetered.
+    if !state.api_rate_limiter.try_acquire().await {
+        return transparent_response(StatusCode::TOO_MANY_REQUESTS, "proxy rate limit exceeded\n");
+    }
     if request
         .headers()
         .get(header::CONTENT_LENGTH)
@@ -2076,6 +2083,12 @@ async fn transparent_tunnel_response(
     token_hash: [u8; 32],
     session_id: String,
 ) -> HyperResponse<Full<Bytes>> {
+    if !state.api_rate_limiter.try_acquire().await {
+        return transparent_full_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "proxy rate limit exceeded\n",
+        );
+    }
     let Some(store) = &state.store else {
         return transparent_full_response(
             StatusCode::PROXY_AUTHENTICATION_REQUIRED,

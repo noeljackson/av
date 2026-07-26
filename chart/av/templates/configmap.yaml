@@ -10,6 +10,17 @@
 {{- else -}}
 {{- fail "controlPlane.mode must be static or managed" -}}
 {{- end -}}
+{{- if .Values.transparentProxy.enabled -}}
+{{- if ne .Values.controlPlane.mode "managed" -}}
+{{- fail "transparentProxy.enabled requires controlPlane.mode=managed for revocable sessions" -}}
+{{- end -}}
+{{- $proxyURL := required "transparentProxy.proxyUrl is required when transparentProxy.enabled" .Values.transparentProxy.proxyUrl -}}
+{{- $caSecretName := required "transparentProxy.caSecret.name is required when transparentProxy.enabled" .Values.transparentProxy.caSecret.name -}}
+{{- $_ := $caSecretName -}}
+{{- $_ := set $config "transparent_proxy" (dict "listen" (printf "0.0.0.0:%v" .Values.transparentProxy.port) "proxy_url" $proxyURL "ca_certificate_file" "/var/run/av/transparent-proxy/ca.crt" "ca_private_key_file" "/var/run/av/transparent-proxy/ca.key") -}}
+{{- else -}}
+{{- $_ := unset $config "transparent_proxy" -}}
+{{- end -}}
 apiVersion: v1
 kind: ConfigMap
 metadata:

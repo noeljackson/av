@@ -1,0 +1,21 @@
+{{- if .Values.transparentProxy.enabled }}
+# This is intentionally a distinct ClusterIP Service. The public Ingress only
+# ever targets the normal HTTP Service in service.yaml.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "av.fullname" . }}-proxy
+  labels:
+    {{- include "av.labels" . | nindent 4 }}
+    app.kubernetes.io/component: transparent-proxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: {{ include "av.name" . }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: proxy
+      port: {{ .Values.transparentProxy.port }}
+      targetPort: proxy
+      protocol: TCP
+{{- end }}

@@ -19,7 +19,7 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
       annotations:
-        checksum/config: {{ printf "%s:%s:%s" (.Values.config | toJson) .Values.controlPlane.mode .Values.controlPlane.initialOwnerOidcSubject | sha256sum }}
+        checksum/config: {{ printf "%s:%s:%s:%s" (.Values.config | toJson) .Values.controlPlane.mode .Values.controlPlane.initialOwnerOidcSubject (.Values.transparentProxy | toJson) | sha256sum }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -41,6 +41,11 @@ spec:
             - name: http
               containerPort: {{ .Values.service.targetPort }}
               protocol: TCP
+            {{- if .Values.transparentProxy.enabled }}
+            - name: proxy
+              containerPort: {{ .Values.transparentProxy.port }}
+              protocol: TCP
+            {{- end }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
           readinessProbe:
@@ -74,6 +79,11 @@ spec:
               mountPath: {{ .mountPath }}
               readOnly: true
             {{- end }}
+            {{- if .Values.transparentProxy.enabled }}
+            - name: transparent-proxy-ca
+              mountPath: /var/run/av/transparent-proxy
+              readOnly: true
+            {{- end }}
       volumes:
         - name: config
           configMap:
@@ -92,6 +102,16 @@ spec:
         - name: {{ .name }}
           secret:
             secretName: {{ .secretName }}
+        {{- end }}
+        {{- if .Values.transparentProxy.enabled }}
+        - name: transparent-proxy-ca
+          secret:
+            secretName: {{ required "transparentProxy.caSecret.name is required when transparentProxy.enabled" .Values.transparentProxy.caSecret.name }}
+            items:
+              - key: {{ .Values.transparentProxy.caSecret.certificateKey }}
+                path: ca.crt
+              - key: {{ .Values.transparentProxy.caSecret.privateKeyKey }}
+                path: ca.key
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

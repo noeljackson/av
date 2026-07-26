@@ -1,0 +1,42 @@
+{{- if and .Values.transparentProxy.enabled .Values.transparentProxy.cilium.enabled }}
+{{- $policy := .Values.transparentProxy.networkPolicy }}
+{{- $cilium := .Values.transparentProxy.cilium }}
+{{- if not $policy.enabled }}
+{{- fail "transparentProxy.cilium.enabled requires transparentProxy.networkPolicy.enabled" }}
+{{- end }}
+{{- if empty $cilium.workloadSelector }}
+{{- fail "transparentProxy.cilium.workloadSelector must be an explicit Cilium endpoint selector" }}
+{{- end }}
+{{- if empty $cilium.dnsEndpointSelector }}
+{{- fail "transparentProxy.cilium.dnsEndpointSelector must select the cluster DNS endpoint" }}
+{{- end }}
+# Cilium supplies an independent L3/L4 allowlist. In particular it has no
+# broad `toEntities: world` rule, so direct TCP and UDP/443 are denied.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: {{ include "av.fullname" . }}-transparent-workloads
+  labels:
+    {{- include "av.labels" . | nindent 4 }}
+spec:
+  endpointSelector:
+    {{- toYaml $cilium.workloadSelector | nindent 4 }}
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ .Release.Namespace | quote }}
+            k8s:app.kubernetes.io/name: {{ include "av.name" . | quote }}
+            k8s:app.kubernetes.io/instance: {{ .Release.Name | quote }}
+      toPorts:
+        - ports:
+            - port: {{ .Values.transparentProxy.port | quote }}
+              protocol: TCP
+    - toEndpoints:
+        - {{- toYaml $cilium.dnsEndpointSelector | nindent 10 }}
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: UDP
+            - port: "53"
+              protocol: TCP
+{{- end }}
