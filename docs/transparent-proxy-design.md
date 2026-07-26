@@ -281,9 +281,13 @@ The feature is not complete until automated tests cover at least:
 - audit records that contain no provider secret, session credential, request
   body, or sensitive header value.
 
-Run these as Docker/Kubernetes integration tests, not only unit tests. The
-test environment must use synthetic credentials and a controlled upstream that
-can prove whether a credential was injected or leaked.
+Run these as Docker/Kubernetes integration tests, not only unit tests. AV's
+unit and integration tests for this feature are Rust tests: `cargo test` starts
+controlled Rust upstreams and raw TCP proxy clients, rather than making Python
+or shell the authority for proxy behavior. Kubernetes deployment validation may
+use a Rust probe image launched by the test harness. The environment must use
+synthetic credentials and a controlled upstream that can prove whether a
+credential was injected or leaked.
 
 ## Delivery sequence
 
