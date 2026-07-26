@@ -2703,6 +2703,18 @@ async fn shutdown() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        config::{AuthConfig, BasicUserConfig, ManagedConfig, TransparentProxyConfig},
+        transparent_proxy::{mint_proxy_session_credential, proxy_session_token_hash},
+    };
+    use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, KeyUsagePurpose};
+    use rustls::{
+        ClientConfig, RootCertStore,
+        pki_types::{CertificateDer, ServerName},
+    };
+    use std::{collections::BTreeMap, sync::Arc};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_rustls::TlsConnector;
 
     fn proxy_route(methods: &[&str], prefixes: &[&str]) -> ProxyRouteConfig {
         ProxyRouteConfig {
@@ -2719,6 +2731,248 @@ mod tests {
             allowed_content_types: vec!["application/json".into()],
             max_body_bytes: 1024,
         }
+    }
+
+    async fn transparent_test_context() -> (
+        AppState,
+        Arc<TransparentProxyRuntime>,
+        Store,
+        String,
+        Vec<u8>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        // Keep the fixture directory alive for the test process. The database
+        // pool has opened it before this intentional leak; its contents are
+        // synthetic and the operating system removes it at process exit.
+        let directory = Box::leak(Box::new(directory));
+        let database = directory.path().join("av.sqlite");
+        let database_url_file = directory.path().join("database-url");
+        std::fs::write(&database_url_file, format!("sqlite:{}", database.display())).unwrap();
+        let store = Store::connect(&ManagedConfig {
+            database_url_file: database_url_file.display().to_string(),
+            initial_owner_oidc_subject: "basic:operator".into(),
+        })
+        .await
+        .unwrap();
+        store
+            .grant_profile("basic:operator", "infra")
+            .await
+            .unwrap();
+        let credential = mint_proxy_session_credential();
+        let token = credential.token.to_string();
+        store
+            .create_proxy_session(
+                &credential.session_id,
+                &credential.token_hash,
+                "basic:operator",
+                "infra",
+                (SystemTime::now() + Duration::from_secs(60))
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+                    .try_into()
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let mut ca_params = CertificateParams::new(vec!["av-test-ca".into()]).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_certificate_file = directory.path().join("ca.crt");
+        let ca_private_key_file = directory.path().join("ca.key");
+        std::fs::write(&ca_certificate_file, ca_cert.pem()).unwrap();
+        std::fs::write(&ca_private_key_file, ca_key.serialize_pem()).unwrap();
+
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            "infra".into(),
+            ProfileConfig {
+                connector: "unused".into(),
+                project_id: "project".into(),
+                environment: "dev".into(),
+                secret_path: "/".into(),
+                allowed_keys: vec![],
+            },
+        );
+        let route = proxy_route(&["GET"], &["/v1/"]);
+        let mut routes = BTreeMap::new();
+        routes.insert("provider".into(), route);
+        let config = Config {
+            listen: "127.0.0.1:0".into(),
+            public_url: "http://127.0.0.1:14322".into(),
+            mode: ConfigMode::Managed,
+            managed: Some(ManagedConfig {
+                database_url_file: database_url_file.display().to_string(),
+                initial_owner_oidc_subject: "basic:operator".into(),
+            }),
+            auth: AuthConfig {
+                mode: AuthMode::Basic,
+                issuer: String::new(),
+                client_id: String::new(),
+                audiences: vec![],
+                scopes: vec![],
+                signing_algorithms: vec![],
+                allowed_groups: vec![],
+                group_claim: "groups".into(),
+                basic_users: Vec::<BasicUserConfig>::new(),
+                github: None,
+            },
+            connectors: BTreeMap::new(),
+            profiles,
+            proxy_routes: routes.clone(),
+            transparent_proxy: Some(TransparentProxyConfig {
+                listen: "127.0.0.1:0".into(),
+                proxy_url: "http://127.0.0.1:1".into(),
+                ca_certificate_file: ca_certificate_file.display().to_string(),
+                ca_private_key_file: ca_private_key_file.display().to_string(),
+                session_ttl_seconds: 60,
+            }),
+            max_connector_concurrency: 1,
+            api_rate_limit_per_second: 10,
+            api_rate_limit_burst: 10,
+        };
+        let state = AppState {
+            config: Arc::new(config.clone()),
+            auth: Authenticator::new(config.auth.clone(), Some(store.clone()))
+                .await
+                .unwrap(),
+            connectors: Arc::new(BTreeMap::new()),
+            connector_slots: Arc::new(Semaphore::new(1)),
+            api_rate_limiter: ApiRateLimiter::new(10, 10),
+            proxy_client: reqwest::Client::builder().build().unwrap(),
+            store: Some(store.clone()),
+            github_browser_auth: None,
+            transparent_proxy: None,
+        };
+        let runtime = Arc::new(TransparentProxyRuntime {
+            listen: "127.0.0.1:0".into(),
+            proxy_url: "http://127.0.0.1:1".into(),
+            session_ttl: Duration::from_secs(60),
+            catalog: TransparentRouteCatalog::from_proxy_routes(&routes).unwrap(),
+            certificate_authority: ProxyCertificateAuthority::load(
+                &ca_certificate_file,
+                &ca_private_key_file,
+            )
+            .unwrap(),
+        });
+        (state, runtime, store, token, ca_cert.der().to_vec())
+    }
+
+    async fn serve_one_transparent_connection(
+        state: AppState,
+        runtime: Arc<TransparentProxyRuntime>,
+    ) -> (TcpStream, tokio::task::JoinHandle<Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_transparent_proxy_connection(stream, state, runtime).await
+        });
+        (TcpStream::connect(address).await.unwrap(), task)
+    }
+
+    async fn raw_connect(stream: &mut TcpStream, authority: &str, token: &str) -> Vec<u8> {
+        stream
+            .write_all(
+                format!(
+                    "CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\nProxy-Authorization: Bearer {token}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        let mut chunk = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut chunk).await.unwrap();
+            assert!(read > 0, "proxy closed before an HTTP response");
+            response.extend_from_slice(&chunk[..read]);
+            if response.windows(4).any(|window| window == b"\r\n\r\n") {
+                return response;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_tcp_connect_denies_unknown_destinations_and_honors_live_revocation() {
+        let (state, runtime, store, token, ca_der) = transparent_test_context().await;
+
+        let (mut unknown, task) =
+            serve_one_transparent_connection(state.clone(), runtime.clone()).await;
+        assert!(
+            raw_connect(&mut unknown, "unknown.example.test:443", &token)
+                .await
+                .starts_with(b"HTTP/1.1 403")
+        );
+        drop(unknown);
+        task.await.unwrap().unwrap();
+
+        let (mut invalid, task) =
+            serve_one_transparent_connection(state.clone(), runtime.clone()).await;
+        assert!(
+            raw_connect(&mut invalid, "api.example.com:443", "wrong-token")
+                .await
+                .starts_with(b"HTTP/1.1 407")
+        );
+        drop(invalid);
+        task.await.unwrap().unwrap();
+
+        let (mut allowed, task) =
+            serve_one_transparent_connection(state.clone(), runtime.clone()).await;
+        assert!(
+            raw_connect(&mut allowed, "api.example.com:443", &token)
+                .await
+                .starts_with(b"HTTP/1.1 200")
+        );
+        let mut roots = RootCertStore::empty();
+        roots.add(CertificateDer::from(ca_der)).unwrap();
+        let tls = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let tls_stream = tls
+            .connect(ServerName::try_from("api.example.com").unwrap(), allowed)
+            .await
+            .unwrap();
+        drop(tls_stream);
+        task.await.unwrap().unwrap();
+
+        store
+            .revoke_profile("basic:operator", "infra")
+            .await
+            .unwrap();
+        let (mut revoked_grant, task) =
+            serve_one_transparent_connection(state.clone(), runtime.clone()).await;
+        assert!(
+            raw_connect(&mut revoked_grant, "api.example.com:443", &token)
+                .await
+                .starts_with(b"HTTP/1.1 403")
+        );
+        drop(revoked_grant);
+        task.await.unwrap().unwrap();
+
+        let active = store
+            .active_proxy_session(&proxy_session_token_hash(token.as_bytes()))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.subject, "basic:operator");
+        store
+            .revoke_proxy_session(&active.session_id)
+            .await
+            .unwrap();
+        let (mut revoked_session, task) = serve_one_transparent_connection(state, runtime).await;
+        assert!(
+            raw_connect(&mut revoked_session, "api.example.com:443", &token)
+                .await
+                .starts_with(b"HTTP/1.1 407")
+        );
+        drop(revoked_session);
+        task.await.unwrap().unwrap();
     }
 
     #[test]
