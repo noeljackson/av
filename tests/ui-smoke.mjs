@@ -7,6 +7,8 @@ const expectedProfile = process.env.AV_UI_EXPECT_PROFILE || "container-smoke";
 
 const browser = await chromium.launch({ headless: true });
 const page = await browser.newPage();
+const lockedScreen = page.locator("#locked-screen");
+const dashboard = page.locator("#dashboard");
 const browserErrors = [];
 const navigationEvents = [];
 page.on("pageerror", (error) => browserErrors.push(error.message));
@@ -31,6 +33,9 @@ try {
     throw new Error(`${error.message}; ${navigationEvents.join("; ")}`);
   }
   await page.getByRole("heading", { name: "authentication required" }).waitFor();
+  if (!(await lockedScreen.isVisible()) || (await dashboard.isVisible())) {
+    throw new Error("locked UI did not render as the only visible screen");
+  }
   if (await page.getByRole("heading", { name: expectedProfile }).count()) {
     throw new Error("locked UI leaked a configured profile");
   }
@@ -38,7 +43,10 @@ try {
   await page.locator("#username").fill("operator");
   await page.locator("#password").fill("password");
   await page.getByRole("button", { name: "sign in" }).click();
-  await page.locator("#dashboard:not([hidden])").waitFor();
+  await dashboard.waitFor();
+  if (!(await dashboard.isVisible()) || (await lockedScreen.isVisible())) {
+    throw new Error("authenticated UI did not hide the locked screen");
+  }
   await page.getByText("runtime matrix").waitFor();
   await page.getByRole("heading", { name: expectedProfile }).waitFor();
   const ownerPanel = page.getByRole("region", { name: "Managed control plane" });
@@ -63,7 +71,10 @@ try {
   }
 
   await page.getByRole("button", { name: "disconnect" }).click();
-  await page.locator("#locked-screen:not([hidden])").waitFor();
+  await lockedScreen.waitFor();
+  if (!(await lockedScreen.isVisible()) || (await dashboard.isVisible())) {
+    throw new Error("logout did not restore the locked screen exclusively");
+  }
   if (await page.getByRole("heading", { name: expectedProfile }).isVisible()) {
     throw new Error("logout left an authorized profile visible");
   }

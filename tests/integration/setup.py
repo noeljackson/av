@@ -164,6 +164,38 @@ def write_config(project_id, environment):
         "av-control-plane-url",
         "postgres://infisical:integration-only@postgres:5432/infisical",
     )
+    oidc_issuer = os.environ.get("AV_TEST_OIDC_ISSUER", "").rstrip("/")
+    oidc_client_id = os.environ.get("AV_TEST_OIDC_CLIENT_ID", "")
+    oidc_project_id = os.environ.get("AV_TEST_OIDC_PROJECT_ID", "")
+    if bool(oidc_issuer) != bool(oidc_client_id) or bool(oidc_issuer) != bool(oidc_project_id):
+        raise RuntimeError("local OIDC test configuration requires issuer, client ID, and project ID")
+    auth = {
+        "mode": "basic",
+        "issuer": "",
+        "client_id": "",
+        "audiences": [],
+        "scopes": [],
+        "signing_algorithms": ["RS256"],
+        "allowed_groups": [],
+        "group_claim": "groups",
+        "basic_users": [],
+    }
+    if oidc_issuer:
+        auth = {
+            "mode": "oidc_or_basic",
+            "issuer": oidc_issuer,
+            "client_id": oidc_client_id,
+            "audiences": [oidc_project_id],
+            "scopes": [
+                "openid",
+                f"urn:zitadel:iam:org:project:id:{oidc_project_id}:aud",
+                "urn:zitadel:iam:org:projects:roles",
+            ],
+            "signing_algorithms": ["RS256"],
+            "allowed_groups": ["av-users"],
+            "group_claim": f"urn:zitadel:iam:org:project:{oidc_project_id}:roles",
+            "basic_users": [],
+        }
     config = {
         "listen": "0.0.0.0:14322",
         "public_url": "http://127.0.0.1:14322",
@@ -172,17 +204,7 @@ def write_config(project_id, environment):
             "database_url_file": "/state/av-control-plane-url",
             "initial_owner_oidc_subject": "oidc:integration-owner",
         },
-        "auth": {
-            "mode": "basic",
-            "issuer": "",
-            "client_id": "",
-            "audiences": [],
-            "scopes": [],
-            "signing_algorithms": ["RS256"],
-            "allowed_groups": [],
-            "group_claim": "groups",
-            "basic_users": [],
-        },
+        "auth": auth,
         "connectors": {
             "infisical": {
                 "kind": "infisical",

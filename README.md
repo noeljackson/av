@@ -94,6 +94,19 @@ mode-`0600` JSON file and database URL file under XDG directories and a SQLite
 database under XDG state. It does not start a service, register users, or store
 any connector credential.
 
+For the full Docker-only browser test stack (managed RBAC, synthetic
+Infisical/OpenBao connectors, Basic owner login, and the existing public
+Zitadel PKCE client), run:
+
+```bash
+AV_IMAGE=av:ui-playwright tests/run-local-managed.sh
+```
+
+Open `http://127.0.0.1:14322`. The disposable owner is `operator` / `password`.
+Use **continue with identity provider** to test the Zitadel path; select GitHub
+at Zitadel when that provider is offered. The app only receives Zitadel OIDC
+tokens—GitHub is never configured as an AV credential source.
+
 ```bash
 av local init \
   --issuer https://zitadel.example.com \

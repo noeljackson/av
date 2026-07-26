@@ -1,0 +1,19 @@
+services:
+  setup:
+    environment:
+      # Public Zitadel metadata for the existing AV native PKCE client. GitHub,
+      # if selected on the Zitadel login screen, remains an upstream identity
+      # provider; AV receives only the resulting OIDC token.
+      AV_TEST_OIDC_ISSUER: https://zitadel.noel.sh
+      AV_TEST_OIDC_CLIENT_ID: "382477898071737285"
+      AV_TEST_OIDC_PROJECT_ID: "362034625293321604"
+
+  av:
+    ports:
+      - 127.0.0.1:14322:14322
+    networks:
+      - connectors
+      - oidc-egress
+
+networks:
+  oidc-egress: {}

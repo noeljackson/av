@@ -1,5 +1,6 @@
 :root { font-family: "JetBrains Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace; color: #d7e0d9; background: #030504; font-synthesis: none; --green: #78f59a; --green-dim: #3e9b58; --line: #183220; --muted: #6d7d71; --panel: rgba(5, 10, 7, .94); }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 html { min-width: 320px; min-height: 100%; background: #030504; }
 body { margin: 0; min-width: 320px; min-height: 100vh; background: linear-gradient(rgba(120,245,154,.018) 1px,transparent 1px), linear-gradient(90deg,rgba(120,245,154,.018) 1px,transparent 1px), radial-gradient(circle at 73% 22%,rgba(44,118,65,.12),transparent 32rem), #030504; background-size: 42px 42px,42px 42px,auto,auto; }
 body::after { position: fixed; inset: 0; z-index: 20; pointer-events: none; content: ""; opacity: .18; background: repeating-linear-gradient(0deg,transparent 0 3px,rgba(0,0,0,.22) 3px 4px); }
