@@ -886,6 +886,16 @@ fn default_proxy_session_ttl_seconds() -> u64 {
     15 * 60
 }
 
+fn valid_github_organization(organization: &str) -> bool {
+    let bytes = organization.as_bytes();
+    (1..=39).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1183,13 +1193,4 @@ mod tests {
         .unwrap();
         assert!(matches!(openbao, ConnectorConfig::OpenBao(_)));
     }
-}
-fn valid_github_organization(organization: &str) -> bool {
-    let bytes = organization.as_bytes();
-    (1..=39).contains(&bytes.len())
-        && bytes[0].is_ascii_alphanumeric()
-        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
-        && bytes
-            .iter()
-            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }

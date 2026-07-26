@@ -7,6 +7,8 @@ service SessionService {
   rpc GetStatus(GetStatusRequest) returns (Status);
   rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
   rpc GetProfileEnvironment(GetProfileEnvironmentRequest) returns (ProfileEnvironment);
+  rpc CreateProxySession(CreateProxySessionRequest) returns (ProxySessionLease);
+  rpc RevokeProxySession(RevokeProxySessionRequest) returns (ProxySessionLease);
 }
 
 service ControlService {
@@ -74,6 +76,26 @@ message EnvironmentValue {
 
 message ProfileEnvironment {
   repeated EnvironmentValue values = 1;
+}
+
+message CreateProxySessionRequest {
+  string profile = 1;
+}
+
+message RevokeProxySessionRequest {
+  string session_id = 1;
+}
+
+// The token is returned once over the authenticated control-plane TLS
+// connection. AV persists only its SHA-256 digest. The local helper, never its
+// child process, keeps the raw token in memory.
+message ProxySessionLease {
+  string session_id = 1;
+  string token = 2;
+  string proxy_url = 3;
+  string ca_certificate_pem = 4;
+  int64 expires_unix_seconds = 5;
+  bool revoked = 6;
 }
 
 message ListBasicUsersRequest {}

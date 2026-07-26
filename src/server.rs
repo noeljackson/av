@@ -1,7 +1,8 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    convert::Infallible,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -26,9 +27,16 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
+use http_body_util::{BodyExt, Empty, Full};
+use hyper::{
+    Request as HyperRequest, Response as HyperResponse, body::Incoming, server::conn::http1,
+    service::service_fn,
+};
+use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::{
+    net::{TcpListener, TcpStream},
     sync::{Mutex, Semaphore},
     time::Instant,
 };
@@ -39,17 +47,22 @@ use crate::{
     auth::Authenticator,
     av::v1::{
         AuditEvent as RpcAuditEvent, AuthConfig as RpcAuthConfig, BasicUser as RpcBasicUser,
-        Connector as RpcConnector, ControlService, ControlServiceExt, EnvironmentValue,
-        GetAuthConfigRequest, GetProfileEnvironmentRequest, GetStatusRequest, GrantProfileRequest,
-        ListAuditEventsRequest, ListAuditEventsResponse, ListBasicUsersRequest,
-        ListBasicUsersResponse, ListProfileGrantsRequest, ListProfileGrantsResponse,
-        ListProfilesRequest, ListProfilesResponse, Profile as RpcProfile, ProfileEnvironment,
-        ProfileGrant as RpcProfileGrant, RevokeProfileRequest, SessionService, SessionServiceExt,
-        SetBasicUserEnabledRequest, Status as RpcStatus, UpsertBasicUserRequest,
+        Connector as RpcConnector, ControlService, ControlServiceExt, CreateProxySessionRequest,
+        EnvironmentValue, GetAuthConfigRequest, GetProfileEnvironmentRequest, GetStatusRequest,
+        GrantProfileRequest, ListAuditEventsRequest, ListAuditEventsResponse,
+        ListBasicUsersRequest, ListBasicUsersResponse, ListProfileGrantsRequest,
+        ListProfileGrantsResponse, ListProfilesRequest, ListProfilesResponse,
+        Profile as RpcProfile, ProfileEnvironment, ProfileGrant as RpcProfileGrant,
+        ProxySessionLease, RevokeProfileRequest, RevokeProxySessionRequest, SessionService,
+        SessionServiceExt, SetBasicUserEnabledRequest, Status as RpcStatus, UpsertBasicUserRequest,
     },
     config::{AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyRouteConfig},
     connector::Connector,
+    proxy_ca::ProxyCertificateAuthority,
     store::Store,
+    transparent_proxy::{
+        TransparentRouteCatalog, authorize_connect_request, mint_proxy_session_credential,
+    },
 };
 
 #[derive(Clone)]
@@ -62,6 +75,15 @@ struct AppState {
     proxy_client: reqwest::Client,
     store: Option<Store>,
     github_browser_auth: Option<GithubBrowserAuth>,
+    transparent_proxy: Option<Arc<TransparentProxyRuntime>>,
+}
+
+struct TransparentProxyRuntime {
+    listen: String,
+    proxy_url: String,
+    session_ttl: Duration,
+    catalog: TransparentRouteCatalog,
+    certificate_authority: ProxyCertificateAuthority,
 }
 
 const GITHUB_AUTHORIZATION_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
@@ -795,6 +817,136 @@ impl SessionService for ConnectSessionService {
             ..Default::default()
         })
     }
+
+    async fn create_proxy_session(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, CreateProxySessionRequest>,
+    ) -> connectrpc::ServiceResult<ProxySessionLease> {
+        let identity = authorize_connect(&self.state, ctx.headers()).await?;
+        let runtime = self
+            .state
+            .transparent_proxy
+            .as_ref()
+            .context("transparent proxy is not configured")
+            .map_err(|_| {
+                connectrpc::ConnectError::failed_precondition("transparent proxy is not configured")
+            })?;
+        let store = self
+            .state
+            .store
+            .as_ref()
+            .context("managed store is unavailable")
+            .map_err(|_| {
+                connectrpc::ConnectError::failed_precondition("managed proxy sessions are required")
+            })?;
+        let profile = request.profile;
+        if !self.state.config.profiles.contains_key(profile) {
+            return Err(connectrpc::ConnectError::not_found("profile not found"));
+        }
+        if !profile_permitted(&self.state, &identity.subject, profile)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        {
+            return Err(connectrpc::ConnectError::permission_denied(
+                "profile access is not granted",
+            ));
+        }
+        let credential = mint_proxy_session_credential();
+        let expires_unix_seconds = SystemTime::now()
+            .checked_add(runtime.session_ttl)
+            .context("proxy session expiry overflow")
+            .and_then(|time| {
+                time.duration_since(UNIX_EPOCH)
+                    .context("system clock is before Unix epoch")
+            })
+            .and_then(|duration| {
+                i64::try_from(duration.as_secs())
+                    .context("proxy session expiry is outside supported range")
+            })
+            .map_err(|_| {
+                connectrpc::ConnectError::internal("proxy session clock is unavailable")
+            })?;
+        store
+            .create_proxy_session(
+                &credential.session_id,
+                &credential.token_hash,
+                &identity.subject,
+                profile,
+                expires_unix_seconds,
+            )
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "create transparent proxy session");
+                connectrpc::ConnectError::internal("proxy session is unavailable")
+            })?;
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "transparent_proxy_session_created",
+            Some(profile),
+            Some(&credential.session_id),
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(ProxySessionLease {
+            session_id: credential.session_id,
+            token: credential.token.to_string(),
+            proxy_url: runtime.proxy_url.clone(),
+            ca_certificate_pem: runtime.certificate_authority.certificate_pem().to_owned(),
+            expires_unix_seconds,
+            revoked: false,
+            ..Default::default()
+        })
+    }
+
+    async fn revoke_proxy_session(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, RevokeProxySessionRequest>,
+    ) -> connectrpc::ServiceResult<ProxySessionLease> {
+        let identity = authorize_connect(&self.state, ctx.headers()).await?;
+        let session_id = request.session_id;
+        if session_id.is_empty()
+            || session_id.len() > 256
+            || session_id.chars().any(char::is_control)
+        {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "session_id is invalid",
+            ));
+        }
+        let store = self
+            .state
+            .store
+            .as_ref()
+            .context("managed store is unavailable")
+            .map_err(|_| {
+                connectrpc::ConnectError::failed_precondition("managed proxy sessions are required")
+            })?;
+        let revoked = store
+            .revoke_proxy_session_for_subject(session_id, &identity.subject)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "revoke transparent proxy session");
+                connectrpc::ConnectError::internal("proxy session is unavailable")
+            })?;
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "transparent_proxy_session_revoked",
+            None,
+            Some(session_id),
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(ProxySessionLease {
+            session_id: session_id.to_owned(),
+            revoked,
+            ..Default::default()
+        })
+    }
 }
 
 async fn authorize_connect(
@@ -958,13 +1110,22 @@ struct ExternalProfileGrantForm {
 }
 
 pub async fn run(config: Config) -> Result<()> {
-    if config.transparent_proxy.is_some() {
-        // Do not accept a configuration that looks enabled while the complete
-        // private listener, CA, session, and egress enforcement stack is not
-        // running. This guard is removed only in the same change that starts
-        // the fully tested listener.
-        bail!("transparent proxy listener is not enabled in this build");
-    }
+    let transparent_proxy = config
+        .transparent_proxy
+        .as_ref()
+        .map(|proxy| {
+            Ok::<_, anyhow::Error>(Arc::new(TransparentProxyRuntime {
+                listen: proxy.listen.clone(),
+                proxy_url: proxy.proxy_url.clone(),
+                session_ttl: Duration::from_secs(proxy.session_ttl_seconds),
+                catalog: TransparentRouteCatalog::from_proxy_routes(&config.proxy_routes)?,
+                certificate_authority: ProxyCertificateAuthority::load(
+                    std::path::Path::new(&proxy.ca_certificate_file),
+                    std::path::Path::new(&proxy.ca_private_key_file),
+                )?,
+            }))
+        })
+        .transpose()?;
     let store = match config.mode {
         ConfigMode::Static => None,
         ConfigMode::Managed => Some(
@@ -1010,7 +1171,26 @@ pub async fn run(config: Config) -> Result<()> {
         proxy_client,
         store,
         github_browser_auth,
+        transparent_proxy: transparent_proxy.clone(),
     };
+    if let Some(transparent_proxy) = transparent_proxy {
+        let listener = TcpListener::bind(&transparent_proxy.listen)
+            .await
+            .with_context(|| {
+                format!(
+                    "bind transparent proxy listener {}",
+                    transparent_proxy.listen
+                )
+            })?;
+        let listener_state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) =
+                run_transparent_proxy_listener(listener, listener_state, transparent_proxy).await
+            {
+                tracing::error!(%error, "transparent proxy listener stopped");
+            }
+        });
+    }
     // Register every service before translating into Axum. Mount the resulting
     // service at each generated service namespace rather than merging its
     // catch-all fallback: the UI fallback must not receive RPC POSTs.
@@ -1724,6 +1904,330 @@ async fn profiles(State(state): State<AppState>, headers: HeaderMap) -> Response
         })
         .collect();
     no_store(axum::Json(profiles).into_response())
+}
+
+async fn run_transparent_proxy_listener(
+    listener: TcpListener,
+    state: AppState,
+    runtime: Arc<TransparentProxyRuntime>,
+) -> Result<()> {
+    loop {
+        let (stream, peer) = listener
+            .accept()
+            .await
+            .context("accept transparent proxy connection")?;
+        let state = state.clone();
+        let runtime = runtime.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_transparent_proxy_connection(stream, state, runtime).await {
+                tracing::debug!(%peer, %error, "transparent proxy connection ended");
+            }
+        });
+    }
+}
+
+async fn serve_transparent_proxy_connection(
+    stream: TcpStream,
+    state: AppState,
+    runtime: Arc<TransparentProxyRuntime>,
+) -> Result<()> {
+    let service = service_fn(move |request| {
+        let state = state.clone();
+        let runtime = runtime.clone();
+        async move { Ok::<_, Infallible>(transparent_connect_response(request, state, runtime).await) }
+    });
+    http1::Builder::new()
+        .serve_connection(TokioIo::new(stream), service)
+        .with_upgrades()
+        .await
+        .context("serve transparent proxy HTTP connection")
+}
+
+async fn transparent_connect_response(
+    mut request: HyperRequest<Incoming>,
+    state: AppState,
+    runtime: Arc<TransparentProxyRuntime>,
+) -> HyperResponse<Empty<Bytes>> {
+    if request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .is_some_and(|value| value != "0")
+    {
+        return transparent_response(StatusCode::BAD_REQUEST, "CONNECT must not include a body\n");
+    }
+    let authorized = match authorize_connect_request(
+        request.method(),
+        request.uri(),
+        request.headers(),
+        &runtime.catalog,
+    ) {
+        Ok(authorized) => authorized,
+        Err(error) => {
+            tracing::warn!(%error, "transparent proxy CONNECT denied");
+            return transparent_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+        }
+    };
+    let Some(store) = &state.store else {
+        return transparent_proxy_auth_required();
+    };
+    let session = match store.active_proxy_session(&authorized.token_hash).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return transparent_proxy_auth_required(),
+        Err(error) => {
+            tracing::error!(%error, "read transparent proxy session");
+            return transparent_response(StatusCode::SERVICE_UNAVAILABLE, "proxy unavailable\n");
+        }
+    };
+    let Some(route) = state.config.proxy_routes.get(&authorized.route_name) else {
+        return transparent_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+    };
+    if session.profile != route.profile {
+        return transparent_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+    }
+    match profile_permitted(&state, &session.subject, &session.profile).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return transparent_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+        }
+        Err(error) => {
+            tracing::error!(%error, "check transparent proxy grant");
+            return transparent_response(StatusCode::SERVICE_UNAVAILABLE, "proxy unavailable\n");
+        }
+    }
+    let host = authorized.host.clone();
+    let upgraded = hyper::upgrade::on(&mut request);
+    let state_for_tunnel = state.clone();
+    let runtime_for_tunnel = runtime.clone();
+    let route_name = authorized.route_name.clone();
+    let token_hash = authorized.token_hash;
+    let session_id = session.session_id.clone();
+    tokio::spawn(async move {
+        match upgraded.await {
+            Ok(upgraded) => {
+                if let Err(error) = serve_transparent_tls_tunnel(
+                    upgraded,
+                    state_for_tunnel,
+                    runtime_for_tunnel,
+                    route_name,
+                    host,
+                    token_hash,
+                    session_id,
+                )
+                .await
+                {
+                    tracing::debug!(%error, "transparent proxy TLS tunnel ended");
+                }
+            }
+            Err(error) => tracing::debug!(%error, "transparent proxy CONNECT upgrade failed"),
+        }
+    });
+    if let Err(error) = audit_event(
+        &state,
+        &session.subject,
+        "transparent_proxy_connect",
+        Some(&session.profile),
+        Some(&authorized.route_name),
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, "record transparent proxy CONNECT audit event");
+        return transparent_response(StatusCode::SERVICE_UNAVAILABLE, "proxy unavailable\n");
+    }
+    transparent_response(StatusCode::OK, "")
+}
+
+async fn serve_transparent_tls_tunnel(
+    upgraded: hyper::upgrade::Upgraded,
+    state: AppState,
+    runtime: Arc<TransparentProxyRuntime>,
+    route_name: String,
+    host: String,
+    token_hash: [u8; 32],
+    session_id: String,
+) -> Result<()> {
+    let leaf = runtime.certificate_authority.issue_leaf(&host)?;
+    let tls = tokio_rustls::TlsAcceptor::from(Arc::new(leaf.server_config()?))
+        .accept(TokioIo::new(upgraded))
+        .await
+        .context("accept transparent proxy TLS")?;
+    let service = service_fn(move |request| {
+        let state = state.clone();
+        let route_name = route_name.clone();
+        let token_hash = token_hash;
+        let session_id = session_id.clone();
+        async move {
+            Ok::<_, Infallible>(
+                transparent_tunnel_response(request, state, route_name, token_hash, session_id)
+                    .await,
+            )
+        }
+    });
+    http1::Builder::new()
+        .serve_connection(TokioIo::new(tls), service)
+        .await
+        .context("serve transparent proxy TLS request")
+}
+
+async fn transparent_tunnel_response(
+    request: HyperRequest<Incoming>,
+    state: AppState,
+    route_name: String,
+    token_hash: [u8; 32],
+    session_id: String,
+) -> HyperResponse<Full<Bytes>> {
+    let Some(store) = &state.store else {
+        return transparent_full_response(
+            StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+            "proxy authentication required\n",
+        );
+    };
+    let session = match store.active_proxy_session(&token_hash).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return transparent_full_response(
+                StatusCode::PROXY_AUTHENTICATION_REQUIRED,
+                "proxy authentication required\n",
+            );
+        }
+        Err(error) => {
+            tracing::error!(%error, "read transparent proxy tunnel session");
+            return transparent_full_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "proxy unavailable\n",
+            );
+        }
+    };
+    let Some(route) = state.config.proxy_routes.get(&route_name) else {
+        return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+    };
+    if session.session_id != session_id || session.profile != route.profile {
+        return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+    }
+    match profile_permitted(&state, &session.subject, &session.profile).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+        }
+        Err(error) => {
+            tracing::error!(%error, "check transparent proxy tunnel grant");
+            return transparent_full_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "proxy unavailable\n",
+            );
+        }
+    }
+    let (parts, body) = request.into_parts();
+    let normalized_path = match enforce_proxy_policy(route, parts.uri.path(), &parts.method) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!(%error, route = route_name, "transparent proxy request denied by route policy");
+            return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+        }
+    };
+    let body = match collect_transparent_body(body, route.max_body_bytes).await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::warn!(%error, route = route_name, "transparent proxy request body rejected");
+            return transparent_full_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "proxy request is too large\n",
+            );
+        }
+    };
+    if let Err(error) = enforce_proxy_content_type(route, &parts.headers, body.len()) {
+        tracing::warn!(%error, route = route_name, "transparent proxy content type rejected");
+        return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+    }
+    let query = match validate_proxy_query(route, parts.uri.query()) {
+        Ok(query) => query,
+        Err(error) => {
+            tracing::warn!(%error, route = route_name, "transparent proxy query rejected");
+            return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+        }
+    };
+    let response = match proxy_request(
+        &state,
+        route,
+        &normalized_path,
+        &query,
+        parts.method,
+        parts.headers,
+        body,
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::warn!(%error, route = route_name, "transparent proxy upstream request failed");
+            return transparent_full_response(StatusCode::BAD_GATEWAY, "proxy request failed\n");
+        }
+    };
+    if let Err(error) = audit_event(
+        &state,
+        &session.subject,
+        "transparent_proxy_request",
+        Some(&session.profile),
+        Some(&route_name),
+        None,
+    )
+    .await
+    {
+        tracing::error!(%error, "record transparent proxy request audit event");
+        return transparent_full_response(StatusCode::SERVICE_UNAVAILABLE, "proxy unavailable\n");
+    }
+    let (parts, body) = response.into_parts();
+    let body = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
+        Ok(body) => body,
+        Err(error) => {
+            tracing::error!(%error, "read bounded transparent proxy response");
+            return transparent_full_response(StatusCode::BAD_GATEWAY, "proxy request failed\n");
+        }
+    };
+    let mut response = HyperResponse::builder().status(parts.status);
+    for (name, value) in &parts.headers {
+        response = response.header(name, value);
+    }
+    response.body(Full::new(body)).unwrap_or_else(|_| {
+        transparent_full_response(StatusCode::BAD_GATEWAY, "proxy request failed\n")
+    })
+}
+
+async fn collect_transparent_body(mut body: Incoming, maximum: usize) -> Result<Bytes> {
+    let mut bytes = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.context("read transparent proxy request body")?;
+        if let Ok(data) = frame.into_data() {
+            if bytes.len().saturating_add(data.len()) > maximum {
+                bail!("transparent proxy request body is too large");
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(bytes))
+}
+
+fn transparent_proxy_auth_required() -> HyperResponse<Empty<Bytes>> {
+    HyperResponse::builder()
+        .status(StatusCode::PROXY_AUTHENTICATION_REQUIRED)
+        .header(header::PROXY_AUTHENTICATE, "Bearer")
+        .body(Empty::new())
+        .expect("constant transparent proxy authentication response")
+}
+
+fn transparent_response(status: StatusCode, message: &str) -> HyperResponse<Empty<Bytes>> {
+    let _ = message;
+    HyperResponse::builder()
+        .status(status)
+        .body(Empty::new())
+        .expect("constant transparent proxy response")
+}
+
+fn transparent_full_response(status: StatusCode, message: &str) -> HyperResponse<Full<Bytes>> {
+    HyperResponse::builder()
+        .status(status)
+        .body(Full::new(Bytes::copy_from_slice(message.as_bytes())))
+        .expect("constant transparent proxy response")
 }
 
 async fn profile_secrets(

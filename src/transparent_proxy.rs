@@ -35,6 +35,7 @@ pub struct ProxySessionCredential {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedConnect {
     pub route_name: String,
+    pub host: String,
     pub token_hash: [u8; 32],
 }
 
@@ -126,8 +127,10 @@ pub fn authorize_connect_request(
     {
         bail!("CONNECT Host header must exactly identify the requested authority");
     }
+    let canonical_authority = canonical_connect_authority(authority)?;
     let route_name = catalog
-        .route_for_connect_authority(authority)
+        .routes_by_host
+        .get(&canonical_authority)
         .context("CONNECT destination is not configured")?;
     let values: Vec<_> = headers.get_all("proxy-authorization").iter().collect();
     if values.len() != 1 {
@@ -148,6 +151,7 @@ pub fn authorize_connect_request(
     }
     Ok(AuthorizedConnect {
         route_name: route_name.to_owned(),
+        host: canonical_authority,
         token_hash: proxy_session_token_hash(token.as_bytes()),
     })
 }
@@ -321,6 +325,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(authorized.route_name, "provider");
+        assert_eq!(authorized.host, "api.example.test");
         assert_eq!(authorized.token_hash, credential.token_hash);
 
         let wrong_host = "other.example.test:443".parse().unwrap();

@@ -524,6 +524,38 @@ impl Store {
         Ok(affected == 1)
     }
 
+    /// A session holder may revoke only its own proxy capability. Owner-level
+    /// administrative revocation is intentionally a separate control
+    /// operation, rather than allowing arbitrary session IDs to be killed by
+    /// an authenticated peer.
+    pub async fn revoke_proxy_session_for_subject(
+        &self,
+        session_id: &str,
+        subject: &str,
+    ) -> Result<bool> {
+        let affected = match self {
+            Self::Postgres(pool) => sqlx::query(
+                "UPDATE av_proxy_sessions SET revoked = TRUE \
+                 WHERE session_id = $1 AND subject = $2 AND revoked = FALSE",
+            )
+            .bind(session_id)
+            .bind(subject)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+            Self::Sqlite(pool) => sqlx::query(
+                "UPDATE av_proxy_sessions SET revoked = TRUE \
+                 WHERE session_id = ? AND subject = ? AND revoked = FALSE",
+            )
+            .bind(session_id)
+            .bind(subject)
+            .execute(pool)
+            .await?
+            .rows_affected(),
+        };
+        Ok(affected == 1)
+    }
+
     async fn migrate(&self) -> Result<()> {
         const CREATE_OWNERS: &str = "CREATE TABLE IF NOT EXISTS av_owners (\
             subject TEXT PRIMARY KEY\
@@ -843,6 +875,30 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+
+        let owned_hash = [6_u8; 32];
+        store
+            .create_proxy_session(
+                "owned-session",
+                &owned_hash,
+                "oidc:developer",
+                "example-dev",
+                now_unix_seconds().unwrap() + 60,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .revoke_proxy_session_for_subject("owned-session", "oidc:other")
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .revoke_proxy_session_for_subject("owned-session", "oidc:developer")
+                .await
+                .unwrap()
         );
 
         let expired_hash = [8_u8; 32];
