@@ -611,6 +611,31 @@ fn valid_policy_subject(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
 }
 
+fn external_identity_subject(kind: &str, identity: &str) -> Result<String> {
+    let identity = identity.trim();
+    match kind {
+        "github" => {
+            let account_id = identity
+                .parse::<u64>()
+                .context("GitHub account ID must be numeric")?;
+            if account_id == 0 {
+                bail!("GitHub account ID must be numeric");
+            }
+            Ok(format!("github:{account_id}"))
+        }
+        "oidc" => {
+            if !valid_policy_subject(identity)
+                || identity.starts_with("basic:")
+                || identity.starts_with("github:")
+            {
+                bail!("OIDC subject is invalid");
+            }
+            Ok(identity.to_owned())
+        }
+        _ => bail!("identity kind is invalid"),
+    }
+}
+
 fn require_known_profile(
     state: &AppState,
     profile: &str,
@@ -892,7 +917,7 @@ struct SessionTemplate<'a> {
 struct OwnerTemplate {
     basic_users: Vec<OwnerBasicUser>,
     profiles: Vec<String>,
-    grants: Vec<OwnerProfileGrant>,
+    principals: Vec<OwnerPrincipal>,
 }
 
 struct OwnerBasicUser {
@@ -900,9 +925,11 @@ struct OwnerBasicUser {
     enabled: bool,
 }
 
-struct OwnerProfileGrant {
-    profile: String,
+struct OwnerPrincipal {
+    label: String,
+    kind: String,
     subject: String,
+    profiles: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -921,6 +948,13 @@ struct BasicUserEnabledForm {
 struct ProfileGrantForm {
     profile: String,
     subject: String,
+}
+
+#[derive(Deserialize)]
+struct ExternalProfileGrantForm {
+    profile: String,
+    identity_kind: String,
+    identity: String,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -1005,6 +1039,7 @@ pub async fn run(config: Config) -> Result<()> {
             post(ui_set_basic_user_enabled),
         )
         .route("/ui/owner/grants", post(ui_grant_profile))
+        .route("/ui/owner/external-grants", post(ui_grant_external_profile))
         .route("/ui/owner/grants/revoke", post(ui_revoke_profile))
         .route("/v1/{*path}", any(api_not_found))
         .route_service("/av.v1.SessionService/{*path}", connect_router.clone())
@@ -1363,14 +1398,42 @@ async fn ui_grant_profile(
     headers: HeaderMap,
     Form(form): Form<ProfileGrantForm>,
 ) -> Response {
-    if !is_trusted_browser_origin(&headers, &state.config.public_url) {
+    ui_grant_profile_subject(&state, &headers, form).await
+}
+
+async fn ui_grant_external_profile(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<ExternalProfileGrantForm>,
+) -> Response {
+    let subject = match external_identity_subject(&form.identity_kind, &form.identity) {
+        Ok(subject) => subject,
+        Err(error) => return ui_bad_request(error.to_string()),
+    };
+    ui_grant_profile_subject(
+        &state,
+        &headers,
+        ProfileGrantForm {
+            profile: form.profile,
+            subject,
+        },
+    )
+    .await
+}
+
+async fn ui_grant_profile_subject(
+    state: &AppState,
+    headers: &HeaderMap,
+    form: ProfileGrantForm,
+) -> Response {
+    if !is_trusted_browser_origin(headers, &state.config.public_url) {
         return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
     }
-    let identity = match ui_require_owner(&state, &headers).await {
+    let identity = match ui_require_owner(state, headers).await {
         Ok(identity) => identity,
         Err(response) => return response,
     };
-    if let Err(error) = require_known_profile(&state, &form.profile) {
+    if let Err(error) = require_known_profile(state, &form.profile) {
         return ui_bad_request(error.to_string());
     }
     if !valid_policy_subject(&form.subject) {
@@ -1384,7 +1447,7 @@ async fn ui_grant_profile(
         return internal_error(error);
     }
     if let Err(error) = audit_event(
-        &state,
+        state,
         &identity.subject,
         "profile_grant",
         Some(&form.profile),
@@ -1395,7 +1458,7 @@ async fn ui_grant_profile(
     {
         return internal_error(error);
     }
-    render_owner_panel(&state).await
+    render_owner_panel(state).await
 }
 
 async fn ui_revoke_profile(
@@ -1527,32 +1590,55 @@ async fn render_owner_panel(state: &AppState) -> Response {
     let Some(store) = state.store.as_ref() else {
         return ui_not_found().await;
     };
-    let basic_users = match store.list_basic_users().await {
-        Ok(users) => users
-            .into_iter()
-            .map(|user| OwnerBasicUser {
-                username: user.username,
-                enabled: user.enabled,
-            })
-            .collect(),
+    let stored_basic_users = match store.list_basic_users().await {
+        Ok(users) => users,
         Err(error) => return internal_error(error),
     };
     let profiles: Vec<_> = state.config.profiles.keys().cloned().collect();
-    let mut grants = Vec::new();
+    let mut grants_by_subject: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for profile in &profiles {
         let profile_grants = match store.list_profile_grants(profile).await {
             Ok(grants) => grants,
             Err(error) => return internal_error(error),
         };
-        grants.extend(profile_grants.into_iter().map(|grant| OwnerProfileGrant {
-            profile: grant.profile,
-            subject: grant.subject,
-        }));
+        for grant in profile_grants {
+            grants_by_subject
+                .entry(grant.subject)
+                .or_default()
+                .push(grant.profile);
+        }
     }
+    let basic_users = stored_basic_users
+        .iter()
+        .map(|user| OwnerBasicUser {
+            username: user.username.clone(),
+            enabled: user.enabled,
+        })
+        .collect();
+    let mut principals = Vec::new();
+    for user in stored_basic_users {
+        let subject = format!("basic:{}", user.username);
+        let profiles = grants_by_subject.remove(&subject).unwrap_or_default();
+        principals.push(OwnerPrincipal {
+            label: user.username,
+            kind: "Basic account".into(),
+            subject,
+            profiles,
+        });
+    }
+    principals.extend(grants_by_subject.into_iter().map(|(subject, profiles)| {
+        let (label, kind) = display_principal(&subject);
+        OwnerPrincipal {
+            label,
+            kind,
+            subject,
+            profiles,
+        }
+    }));
     match (OwnerTemplate {
         basic_users,
         profiles,
-        grants,
+        principals,
     })
     .render()
     {
@@ -1562,6 +1648,16 @@ async fn render_owner_panel(state: &AppState) -> Response {
             no_store((StatusCode::INTERNAL_SERVER_ERROR, "UI unavailable\n").into_response())
         }
     }
+}
+
+fn display_principal(subject: &str) -> (String, String) {
+    if let Some(username) = subject.strip_prefix("basic:") {
+        return (username.to_owned(), "Basic account".into());
+    }
+    if let Some(account_id) = subject.strip_prefix("github:") {
+        return (format!("GitHub account #{account_id}"), "GitHub".into());
+    }
+    ("OIDC identity".into(), "OIDC".into())
 }
 
 fn ui_bad_request(message: impl AsRef<str>) -> Response {
@@ -2278,23 +2374,44 @@ mod tests {
     }
 
     #[test]
-    fn owner_ui_escapes_policy_subjects_and_usernames() {
+    fn owner_ui_escapes_principal_labels_and_usernames() {
         let page = OwnerTemplate {
             basic_users: vec![OwnerBasicUser {
                 username: "<script>user</script>".into(),
                 enabled: true,
             }],
             profiles: vec!["<script>profile</script>".into()],
-            grants: vec![OwnerProfileGrant {
-                profile: "<script>profile</script>".into(),
+            principals: vec![OwnerPrincipal {
+                label: "<script>identity</script>".into(),
+                kind: "OIDC".into(),
                 subject: "<script>subject</script>".into(),
+                profiles: vec!["<script>profile</script>".into()],
             }],
         }
         .render()
         .unwrap();
         assert!(page.contains("&#60;script&#62;user&#60;/script&#62;"));
+        assert!(page.contains("&#60;script&#62;identity&#60;/script&#62;"));
         assert!(page.contains("&#60;script&#62;subject&#60;/script&#62;"));
         assert!(!page.contains("<script>subject</script>"));
+    }
+
+    #[test]
+    fn external_identity_grants_use_canonical_subjects_and_friendly_labels() {
+        assert_eq!(
+            external_identity_subject("github", " 12345 ").unwrap(),
+            "github:12345"
+        );
+        assert!(external_identity_subject("github", "not-a-number").is_err());
+        assert_eq!(
+            external_identity_subject("oidc", "zitadel-subject").unwrap(),
+            "zitadel-subject"
+        );
+        assert!(external_identity_subject("oidc", "basic:operator").is_err());
+        assert_eq!(
+            display_principal("github:12345"),
+            ("GitHub account #12345".into(), "GitHub".into())
+        );
     }
 
     #[tokio::test]

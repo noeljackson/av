@@ -66,7 +66,7 @@ def main():
 
     request("/ui/owner", auth=False, accepted=(401,))
     _, owner, _ = request("/ui/owner")
-    assert b"managed control plane" in owner
+    assert b"access management" in owner
     assert b"operator" in owner
     assert b"integration-only" not in owner
     form_headers = {"Content-Type": "application/x-www-form-urlencoded"}

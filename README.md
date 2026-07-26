@@ -47,6 +47,10 @@ disk or to the kernel keyring. The keyring contains only the short-lived OIDC
 access token. `AV_TOKEN` is available for CI; optional Basic credentials use
 `AV_BASIC_USER` and `AV_BASIC_PASSWORD`.
 
+See [using AV with coding agents](docs/using-av-with-coding-agents.md) for a
+generic application example with Codex and Claude, and for the boundary between
+AV's explicit proxy routes and a transparent `HTTPS_PROXY` design.
+
 For Tier 2, callers use a named route:
 
 ```text

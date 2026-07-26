@@ -49,20 +49,23 @@ try {
   }
   await page.getByText("runtime matrix").waitFor();
   await page.getByRole("heading", { name: expectedProfile }).waitFor();
-  const ownerPanel = page.getByRole("region", { name: "Managed control plane" });
+  const ownerPanel = page.getByRole("region", { name: "Access management" });
   if (expectManaged) {
     await ownerPanel.waitFor();
-    await ownerPanel.getByRole("heading", { name: "basic users" }).waitFor();
+    await ownerPanel.getByRole("heading", { name: "basic accounts" }).waitFor();
+    await ownerPanel.getByRole("heading", { name: "people and agent access" }).waitFor();
     const basicUserForm = ownerPanel.locator("form.owner-form").first();
     await basicUserForm.locator('input[name="username"]').fill("browser-ui");
     await basicUserForm.locator('input[name="password"]').fill("browser-ui-password");
-    await basicUserForm.getByRole("button", { name: "add or rotate" }).click();
+    await basicUserForm.getByRole("button", { name: "create or rotate" }).click();
     await ownerPanel.getByText("browser-ui", { exact: true }).waitFor();
-    const grantForm = ownerPanel.locator("form.owner-form").nth(1);
-    await grantForm.locator('input[name="subject"]').fill("basic:browser-ui");
-    await grantForm.locator('select[name="profile"]').selectOption("ungranted-integration");
-    await grantForm.getByRole("button", { name: "grant profile" }).click();
-    await ownerPanel.getByText("basic:browser-ui", { exact: true }).waitFor();
+    const principal = ownerPanel.locator(".principal").filter({ hasText: "browser-ui" });
+    await principal.locator(".inline-grant select[name=profile]").selectOption("ungranted-integration");
+    await principal.getByRole("button", { name: "grant" }).click();
+    await principal.getByText("ungranted-integration", { exact: true }).waitFor();
+    if (await ownerPanel.getByText("basic:browser-ui", { exact: true }).count()) {
+      throw new Error("access UI exposed a raw Basic subject");
+    }
   } else if (await ownerPanel.count()) {
     throw new Error("static UI exposed a managed owner panel");
   }
