@@ -29,4 +29,4 @@
     {% else %}<p class="empty">no profiles available_</p>{% endfor %}
   </div>
 </div>
-<div id="owner-panel" class="owner-slot"></div>
+<div id="owner-panel" class="owner-slot"{% if status.persistence_enabled %} data-managed="true"{% endif %}></div>

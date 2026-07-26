@@ -129,7 +129,9 @@ async function loadSession(candidate) {
   dashboard.hidden = false;
   linkState.classList.add("linked");
   linkLabel.textContent = "identity linked";
-  window.htmx.ajax("GET", "/ui/owner", { target: "#owner-panel", swap: "innerHTML" });
+  if (sessionPanel.querySelector("#owner-panel[data-managed]")) {
+    window.htmx.ajax("GET", "/ui/owner", { target: "#owner-panel", swap: "innerHTML" });
+  }
 }
 
 document.body.addEventListener("htmx:configRequest", (event) => {

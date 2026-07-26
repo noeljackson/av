@@ -155,6 +155,7 @@ cargo clippy --locked --all-targets -- -D warnings
 helm lint chart/av
 tests/connector-integration.sh
 tests/security-scan.sh
+AV_UI_CONTAINER=av-ui-local AV_UI_URL=http://127.0.0.1:14322 tests/ui-smoke.sh
 ```
 
 The integration runner starts separate pinned containers for AV, Infisical,

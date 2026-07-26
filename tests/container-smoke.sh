@@ -49,6 +49,8 @@ curl --fail --silent --dump-header "$workdir/ui-asset-headers" \
 grep --ignore-case --quiet '^content-type: text/javascript' "$workdir/ui-asset-headers"
 grep --quiet 'code_challenge_method: "S256"' "$workdir/ui-asset"
 
+AV_UI_CONTAINER="$container" AV_UI_URL=http://127.0.0.1:14322 tests/ui-smoke.sh
+
 status=$(curl --silent --output /dev/null --write-out '%{http_code}' \
   --user 'operator:password' "$base_url/ui/owner") # gitleaks:allow -- synthetic smoke-test credential
 [[ "$status" == "404" ]]

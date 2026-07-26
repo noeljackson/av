@@ -1,0 +1,9 @@
+FROM mcr.microsoft.com/playwright@sha256:2f29369043d81d6d69a815ceb80760f55e85f5020371ad06a4d996f18503ad1c
+
+WORKDIR /test
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+COPY tests/ui/package.json tests/ui/pnpm-lock.yaml ./
+RUN corepack pnpm install --frozen-lockfile --ignore-scripts
+COPY tests/ui-smoke.mjs ./
+USER pwuser
+ENTRYPOINT ["node", "/test/ui-smoke.mjs"]
