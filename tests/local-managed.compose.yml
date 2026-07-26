@@ -1,19 +1,21 @@
 services:
   setup:
     environment:
-      # Public Zitadel metadata for the existing AV native PKCE client. GitHub,
-      # if selected on the Zitadel login screen, remains an upstream identity
-      # provider; AV receives only the resulting OIDC token.
-      AV_TEST_OIDC_ISSUER: https://zitadel.noel.sh
-      AV_TEST_OIDC_CLIENT_ID: "382477898071737285"
-      AV_TEST_OIDC_PROJECT_ID: "362034625293321604"
+      # Set all three values only for the direct GitHub OAuth browser test.
+      # The host secret file is mounted only into setup; setup copies it into
+      # the disposable named volume for AV to read at startup.
+      AV_TEST_GITHUB_CLIENT_ID: ${AV_TEST_GITHUB_CLIENT_ID:-}
+      AV_TEST_GITHUB_OWNER_ID: ${AV_TEST_GITHUB_OWNER_ID:-}
+      AV_TEST_GITHUB_CLIENT_SECRET_FILE: /run/local-secrets/github-client-secret
+    volumes:
+      - ${AV_TEST_GITHUB_CLIENT_SECRET_FILE:-/dev/null}:/run/local-secrets/github-client-secret:ro
 
   av:
     ports:
       - 127.0.0.1:14322:14322
     networks:
       - connectors
-      - oidc-egress
+      - github-egress
 
 networks:
-  oidc-egress: {}
+  github-egress: {}

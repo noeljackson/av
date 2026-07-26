@@ -60,6 +60,7 @@ pub enum AuthMode {
     Oidc,
     Basic,
     OidcOrBasic,
+    GithubOrBasic,
     Disabled,
 }
 
@@ -83,6 +84,19 @@ pub struct AuthConfig {
     pub group_claim: String,
     #[serde(default)]
     pub basic_users: Vec<BasicUserConfig>,
+    #[serde(default)]
+    pub github: Option<GithubAuthConfig>,
+}
+
+/// GitHub OAuth is deliberately limited to a loopback managed instance. It
+/// authenticates the local browser UI only; GitHub access tokens never become
+/// AV API credentials.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GithubAuthConfig {
+    pub client_id: String,
+    pub client_secret_file: String,
+    pub allowed_logins: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -321,6 +335,31 @@ impl Config {
                     bail!("auth.issuer must be a trusted HTTPS URL");
                 }
             }
+            AuthMode::GithubOrBasic => {
+                let github = self
+                    .auth
+                    .github
+                    .as_ref()
+                    .context("github_or_basic requires auth.github")?;
+                if self.mode != ConfigMode::Managed
+                    || !public_url.host_str().is_some_and(is_loopback_host)
+                {
+                    bail!("github_or_basic is only allowed for a loopback managed instance");
+                }
+                if github.client_id.trim().is_empty()
+                    || github.allowed_logins.is_empty()
+                    || !Path::new(&github.client_secret_file).is_absolute()
+                {
+                    bail!(
+                        "github_or_basic requires a client_id, allowed_logins, and an absolute client_secret_file"
+                    );
+                }
+                for login in &github.allowed_logins {
+                    if !valid_github_login(login) {
+                        bail!("github allowed_logins must contain valid GitHub logins");
+                    }
+                }
+            }
             AuthMode::Basic => {}
             AuthMode::Disabled => {
                 let host = self
@@ -335,9 +374,14 @@ impl Config {
                 }
             }
         }
+        if self.auth.mode != AuthMode::GithubOrBasic && self.auth.github.is_some() {
+            bail!("auth.github is only valid with github_or_basic");
+        }
 
-        if matches!(self.auth.mode, AuthMode::Basic | AuthMode::OidcOrBasic)
-            && self.auth.basic_users.is_empty()
+        if matches!(
+            self.auth.mode,
+            AuthMode::Basic | AuthMode::OidcOrBasic | AuthMode::GithubOrBasic
+        ) && self.auth.basic_users.is_empty()
             && self.mode == ConfigMode::Static
         {
             bail!("basic auth mode requires basic_users");
@@ -519,6 +563,16 @@ impl Config {
             && std::env::var("AV_ALLOW_INSECURE_CONNECTORS")
                 .is_ok_and(|value| value == "integration-tests-only")
     }
+}
+
+fn valid_github_login(login: &str) -> bool {
+    let bytes = login.as_bytes();
+    (1..=39).contains(&bytes.len())
+        && bytes[0].is_ascii_alphanumeric()
+        && bytes[bytes.len() - 1].is_ascii_alphanumeric()
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
 fn validate_connector_auth(name: &str, connector: &ConnectorConfig) -> Result<()> {
@@ -785,6 +839,7 @@ mod tests {
                 allowed_groups: vec![],
                 group_claim: "groups".into(),
                 basic_users: vec![],
+                github: None,
             },
             connectors: BTreeMap::new(),
             profiles: BTreeMap::new(),
@@ -818,6 +873,29 @@ mod tests {
         config.managed.as_mut().unwrap().initial_owner_oidc_subject = "oidc:owner".into();
         assert!(config.validate().is_ok());
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
+    }
+
+    #[test]
+    fn github_browser_auth_is_limited_to_loopback_managed_instances() {
+        let mut config = base_config();
+        config.mode = ConfigMode::Managed;
+        config.managed = Some(ManagedConfig {
+            database_url_file: "/run/av/database-url".into(),
+            initial_owner_oidc_subject: "github:12345".into(),
+        });
+        config.auth.mode = AuthMode::GithubOrBasic;
+        config.auth.github = Some(GithubAuthConfig {
+            client_id: "github-client-id".into(),
+            client_secret_file: "/run/av/github-client-secret".into(),
+            allowed_logins: vec!["noeljackson".into()],
+        });
+        assert!(config.validate().is_ok());
+        config.public_url = "https://av.example.test".into();
+        assert!(config.validate().is_err());
+        config.public_url = "http://127.0.0.1:14322".into();
+        config.mode = ConfigMode::Static;
+        config.managed = None;
+        assert!(config.validate().is_err());
     }
 
     #[test]

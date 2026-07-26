@@ -125,6 +125,7 @@ impl Authenticator {
                 AuthMode::Oidc => "oidc",
                 AuthMode::Basic => "basic",
                 AuthMode::OidcOrBasic => "oidc_or_basic",
+                AuthMode::GithubOrBasic => "github_or_basic",
                 AuthMode::Disabled => "disabled",
             }
             .into(),
@@ -159,7 +160,10 @@ impl Authenticator {
             return self.authorize_oidc(token).await;
         }
         if let Some(encoded) = authorization.strip_prefix("Basic ")
-            && matches!(self.config.mode, AuthMode::Basic | AuthMode::OidcOrBasic)
+            && matches!(
+                self.config.mode,
+                AuthMode::Basic | AuthMode::OidcOrBasic | AuthMode::GithubOrBasic
+            )
         {
             return self.authorize_basic(encoded).await;
         }
@@ -401,6 +405,7 @@ mod tests {
                 allowed_groups: vec!["av-users".into()],
                 group_claim: "roles".into(),
                 basic_users: vec![],
+                github: None,
             },
             client: reqwest::Client::new(),
             discovery: None,
@@ -439,6 +444,7 @@ mod tests {
                     username: "operator".into(),
                     password_hash_file: password_hash_file.display().to_string(),
                 }],
+                github: None,
             },
             None,
         )
@@ -493,6 +499,7 @@ mod tests {
                     username: "operator".into(),
                     password_hash_file: password_hash_file.display().to_string(),
                 }],
+                github: None,
             },
             None,
         )

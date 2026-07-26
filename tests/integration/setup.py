@@ -164,11 +164,12 @@ def write_config(project_id, environment):
         "av-control-plane-url",
         "postgres://infisical:integration-only@postgres:5432/infisical",
     )
-    oidc_issuer = os.environ.get("AV_TEST_OIDC_ISSUER", "").rstrip("/")
-    oidc_client_id = os.environ.get("AV_TEST_OIDC_CLIENT_ID", "")
-    oidc_project_id = os.environ.get("AV_TEST_OIDC_PROJECT_ID", "")
-    if bool(oidc_issuer) != bool(oidc_client_id) or bool(oidc_issuer) != bool(oidc_project_id):
-        raise RuntimeError("local OIDC test configuration requires issuer, client ID, and project ID")
+    github_client_id = os.environ.get("AV_TEST_GITHUB_CLIENT_ID", "")
+    github_owner_id = os.environ.get("AV_TEST_GITHUB_OWNER_ID", "")
+    github_secret_path = os.environ.get("AV_TEST_GITHUB_CLIENT_SECRET_FILE", "")
+    github_enabled = bool(github_client_id) or bool(github_owner_id)
+    if github_enabled and not all((github_client_id, github_owner_id, github_secret_path)):
+        raise RuntimeError("local GitHub test configuration requires client ID, owner ID, and client secret file")
     auth = {
         "mode": "basic",
         "issuer": "",
@@ -180,29 +181,36 @@ def write_config(project_id, environment):
         "group_claim": "groups",
         "basic_users": [],
     }
-    if oidc_issuer:
+    initial_owner_subject = "oidc:integration-owner"
+    if github_enabled:
+        secret = pathlib.Path(github_secret_path).read_text(encoding="utf-8").strip()
+        if not secret:
+            raise RuntimeError("local GitHub client secret file is empty")
+        write_secret("github-client-secret", secret)
         auth = {
-            "mode": "oidc_or_basic",
-            "issuer": oidc_issuer,
-            "client_id": oidc_client_id,
-            "audiences": [oidc_project_id],
-            "scopes": [
-                "openid",
-                f"urn:zitadel:iam:org:project:id:{oidc_project_id}:aud",
-                "urn:zitadel:iam:org:projects:roles",
-            ],
+            "mode": "github_or_basic",
+            "issuer": "",
+            "client_id": "",
+            "audiences": [],
+            "scopes": [],
             "signing_algorithms": ["RS256"],
-            "allowed_groups": ["av-users"],
-            "group_claim": f"urn:zitadel:iam:org:project:{oidc_project_id}:roles",
+            "allowed_groups": [],
+            "group_claim": "groups",
             "basic_users": [],
+            "github": {
+                "client_id": github_client_id,
+                "client_secret_file": "/state/github-client-secret",
+                "allowed_logins": ["noeljackson"],
+            },
         }
+        initial_owner_subject = f"github:{github_owner_id}"
     config = {
         "listen": "0.0.0.0:14322",
         "public_url": "http://127.0.0.1:14322",
         "mode": "managed",
         "managed": {
             "database_url_file": "/state/av-control-plane-url",
-            "initial_owner_oidc_subject": "oidc:integration-owner",
+            "initial_owner_oidc_subject": initial_owner_subject,
         },
         "auth": auth,
         "connectors": {

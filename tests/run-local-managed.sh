@@ -26,5 +26,9 @@ managed_seed=$("${compose[@]}" ps --all --quiet managed-seed)
 
 printf '%s\n' 'AV local managed test UI: http://127.0.0.1:14322'
 printf '%s\n' 'Basic owner test login: operator / password'
-printf '%s\n' 'OIDC uses Zitadel; choose GitHub there if it is enabled for your account.'
+if [[ -n ${AV_TEST_GITHUB_CLIENT_ID:-} ]]; then
+  printf '%s\n' 'GitHub OAuth is enabled for the configured local test account.'
+else
+  printf '%s\n' 'GitHub OAuth is disabled. Set AV_TEST_GITHUB_CLIENT_ID, AV_TEST_GITHUB_OWNER_ID, and AV_TEST_GITHUB_CLIENT_SECRET_FILE to test it.'
+fi
 printf '%s\n' 'Stop it with: docker compose --project-name av-local-managed --file tests/integration/compose.yml --file tests/local-managed.compose.yml down --volumes'

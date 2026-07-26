@@ -95,17 +95,35 @@ database under XDG state. It does not start a service, register users, or store
 any connector credential.
 
 For the full Docker-only browser test stack (managed RBAC, synthetic
-Infisical/OpenBao connectors, Basic owner login, and the existing public
-Zitadel PKCE client), run:
+Infisical/OpenBao connectors, and a Basic owner login), run:
 
 ```bash
 AV_IMAGE=av:ui-playwright tests/run-local-managed.sh
 ```
 
 Open `http://127.0.0.1:14322`. The disposable owner is `operator` / `password`.
-Use **continue with identity provider** to test the Zitadel path; select GitHub
-at Zitadel when that provider is offered. The app only receives Zitadel OIDC
-tokens—GitHub is never configured as an AV credential source.
+To test direct GitHub login, create a dedicated OAuth App with the exact
+callback `http://127.0.0.1:14322/auth/github/callback`. Store its client ID and
+secret in an existing Infisical project, materialize the secret into a
+mode-`0600` local file through the approved Infisical wrapper, then run the
+stack with the public client ID, the stable numeric GitHub account ID, and that
+file path. The client secret is mounted only into the disposable setup
+container and copied into the disposable Docker volume for AV; it is never a
+Git value, environment value, process argument, or browser value.
+
+```bash
+AV_TEST_GITHUB_CLIENT_ID='<client id>' \
+AV_TEST_GITHUB_OWNER_ID="$(gh api user --jq .id)" \
+AV_TEST_GITHUB_CLIENT_SECRET_FILE="$HOME/.cache/av/github-client-secret" \
+AV_IMAGE=av:ui-playwright tests/run-local-managed.sh
+```
+
+GitHub OAuth is a local managed-only mode. AV uses PKCE and server-side code
+exchange, requests only `read:user`, allowlists GitHub logins, turns the stable
+numeric GitHub account ID into the AV policy subject, then discards the GitHub
+access token. The browser receives only an AV-issued, HttpOnly, SameSite cookie
+that is accepted solely by UI routes; it cannot authenticate AV's API,
+connector, or proxy routes.
 
 ```bash
 av local init \

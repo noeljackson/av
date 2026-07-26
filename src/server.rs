@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +13,7 @@ use askama::Template;
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Form, Path, Request, State},
+    extract::{DefaultBodyLimit, Form, Path, Query, Request, State},
     http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri, header},
     middleware::{self, Next},
     response::{Html, IntoResponse, Response},
@@ -24,6 +24,7 @@ use base64::{
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
 use serde::{Deserialize, Serialize};
+use sha2::Digest;
 use tokio::{
     sync::{Mutex, Semaphore},
     time::Instant,
@@ -43,7 +44,7 @@ use crate::{
         ProfileGrant as RpcProfileGrant, RevokeProfileRequest, SessionService, SessionServiceExt,
         SetBasicUserEnabledRequest, Status as RpcStatus, UpsertBasicUserRequest,
     },
-    config::{AuthMode, Config, ConfigMode, ProfileConfig, ProxyRouteConfig},
+    config::{AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyRouteConfig},
     connector::Connector,
     store::Store,
 };
@@ -57,6 +58,199 @@ struct AppState {
     api_rate_limiter: ApiRateLimiter,
     proxy_client: reqwest::Client,
     store: Option<Store>,
+    github_browser_auth: Option<GithubBrowserAuth>,
+}
+
+const GITHUB_AUTHORIZATION_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
+const GITHUB_TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
+const GITHUB_USER_ENDPOINT: &str = "https://api.github.com/user";
+const GITHUB_STATE_COOKIE: &str = "av_github_state";
+const GITHUB_SESSION_COOKIE: &str = "av_github_session";
+const GITHUB_AUTH_TTL: Duration = Duration::from_secs(10 * 60);
+const GITHUB_SESSION_TTL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Clone)]
+struct GithubBrowserAuth {
+    client_id: String,
+    client_secret: Arc<Zeroizing<String>>,
+    allowed_logins: BTreeSet<String>,
+    client: reqwest::Client,
+    pending: Arc<Mutex<BTreeMap<String, GithubPendingLogin>>>,
+    sessions: Arc<Mutex<BTreeMap<String, GithubBrowserSession>>>,
+}
+
+struct GithubPendingLogin {
+    verifier: String,
+    expires_at: SystemTime,
+}
+
+struct GithubBrowserSession {
+    identity: crate::auth::Identity,
+    expires_at: SystemTime,
+}
+
+#[derive(Deserialize)]
+struct GithubCallback {
+    code: Option<String>,
+    state: Option<String>,
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct GithubTokenResponse {
+    access_token: String,
+}
+
+#[derive(Deserialize)]
+struct GithubUser {
+    id: u64,
+    login: String,
+}
+
+impl GithubBrowserAuth {
+    fn new(config: &GithubAuthConfig) -> Result<Self> {
+        let client_secret = std::fs::read_to_string(&config.client_secret_file)
+            .with_context(|| format!("read GitHub client secret {}", config.client_secret_file))?;
+        let client_secret = client_secret.trim().to_owned();
+        if client_secret.is_empty() {
+            bail!("GitHub client secret file is empty");
+        }
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .user_agent(concat!("av/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .context("build GitHub OAuth client")?;
+        Ok(Self {
+            client_id: config.client_id.clone(),
+            client_secret: Arc::new(Zeroizing::new(client_secret)),
+            allowed_logins: config
+                .allowed_logins
+                .iter()
+                .map(|login| login.to_ascii_lowercase())
+                .collect(),
+            client,
+            pending: Arc::new(Mutex::new(BTreeMap::new())),
+            sessions: Arc::new(Mutex::new(BTreeMap::new())),
+        })
+    }
+
+    async fn start(&self, redirect_uri: &str) -> Result<(String, String)> {
+        let state = random_browser_token();
+        // GitHub requires a 43-128 character PKCE verifier. Two independent
+        // URL-safe values provide 256 bits without putting it in browser storage.
+        let verifier = format!("{}{}", random_browser_token(), random_browser_token());
+        let challenge = URL_SAFE_NO_PAD.encode(sha2::Sha256::digest(verifier.as_bytes()));
+        let now = SystemTime::now();
+        let mut pending = self.pending.lock().await;
+        pending.retain(|_, item| item.expires_at > now);
+        pending.insert(
+            state.clone(),
+            GithubPendingLogin {
+                verifier,
+                expires_at: now + GITHUB_AUTH_TTL,
+            },
+        );
+        let mut url = url::Url::parse(GITHUB_AUTHORIZATION_ENDPOINT)
+            .expect("constant GitHub authorization URL is valid");
+        url.query_pairs_mut()
+            .append_pair("client_id", &self.client_id)
+            .append_pair("redirect_uri", redirect_uri)
+            .append_pair("scope", "read:user")
+            .append_pair("state", &state)
+            .append_pair("code_challenge", &challenge)
+            .append_pair("code_challenge_method", "S256");
+        Ok((url.into(), state))
+    }
+
+    async fn finish(
+        &self,
+        state: &str,
+        code: &str,
+        redirect_uri: &str,
+    ) -> Result<crate::auth::Identity> {
+        let pending = self
+            .pending
+            .lock()
+            .await
+            .remove(state)
+            .filter(|item| item.expires_at > SystemTime::now())
+            .context("GitHub OAuth state was rejected")?;
+        let token: GithubTokenResponse = self
+            .client
+            .post(GITHUB_TOKEN_ENDPOINT)
+            .header(header::ACCEPT, "application/json")
+            .form(&[
+                ("client_id", self.client_id.as_str()),
+                ("client_secret", self.client_secret.as_str()),
+                ("code", code),
+                ("redirect_uri", redirect_uri),
+                ("code_verifier", pending.verifier.as_str()),
+            ])
+            .send()
+            .await
+            .context("exchange GitHub OAuth code")?
+            .error_for_status()
+            .context("GitHub OAuth code exchange failed")?
+            .json()
+            .await
+            .context("decode GitHub OAuth token response")?;
+        let user: GithubUser = self
+            .client
+            .get(GITHUB_USER_ENDPOINT)
+            .bearer_auth(&token.access_token)
+            .header(header::ACCEPT, "application/vnd.github+json")
+            .send()
+            .await
+            .context("fetch GitHub OAuth identity")?
+            .error_for_status()
+            .context("GitHub OAuth identity request failed")?
+            .json()
+            .await
+            .context("decode GitHub OAuth identity")?;
+        if !self
+            .allowed_logins
+            .contains(&user.login.to_ascii_lowercase())
+        {
+            bail!("GitHub user is not allowed");
+        }
+        Ok(crate::auth::Identity {
+            // GitHub's immutable numeric account identifier prevents a renamed
+            // or recycled login from inheriting policy grants.
+            subject: format!("github:{}", user.id),
+        })
+    }
+
+    async fn create_session(&self, identity: crate::auth::Identity) -> String {
+        let token = random_browser_token();
+        let now = SystemTime::now();
+        let mut sessions = self.sessions.lock().await;
+        sessions.retain(|_, session| session.expires_at > now);
+        sessions.insert(
+            token.clone(),
+            GithubBrowserSession {
+                identity,
+                expires_at: now + GITHUB_SESSION_TTL,
+            },
+        );
+        token
+    }
+
+    async fn session_identity(&self, token: &str) -> Option<crate::auth::Identity> {
+        let mut sessions = self.sessions.lock().await;
+        let now = SystemTime::now();
+        sessions.retain(|_, session| session.expires_at > now);
+        sessions.get(token).map(|session| session.identity.clone())
+    }
+
+    async fn remove_session(&self, token: &str) {
+        self.sessions.lock().await.remove(token);
+    }
+}
+
+fn random_browser_token() -> String {
+    SaltString::generate(&mut OsRng).as_str().to_owned()
 }
 
 #[derive(Clone)]
@@ -598,6 +792,7 @@ struct ProfileSummary<'a> {
 #[serde(rename_all = "camelCase")]
 struct PublicStatus {
     oidc_enabled: bool,
+    github_enabled: bool,
     basic_enabled: bool,
     persistence_enabled: bool,
     registration_enabled: bool,
@@ -675,6 +870,12 @@ pub async fn run(config: Config) -> Result<()> {
         ),
     };
     let auth = Authenticator::new(config.auth.clone(), store.clone()).await?;
+    let github_browser_auth = config
+        .auth
+        .github
+        .as_ref()
+        .map(GithubBrowserAuth::new)
+        .transpose()?;
     let content_security_policy = content_security_policy(&config)?;
     let mut connectors = BTreeMap::new();
     let allow_insecure_http = config.allow_insecure_connector_http();
@@ -700,6 +901,7 @@ pub async fn run(config: Config) -> Result<()> {
         ),
         proxy_client,
         store,
+        github_browser_auth,
     };
     // Register every service before translating into Axum. Mount the resulting
     // service at each generated service namespace rather than merging its
@@ -721,6 +923,9 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/healthz", get(health))
         .route("/readyz", get(health))
         .route("/v1/auth/config", get(auth_config))
+        .route("/auth/github/start", get(github_start))
+        .route("/auth/github/callback", get(github_callback))
+        .route("/auth/github/logout", post(github_logout))
         .route("/v1/status", get(status))
         .route("/v1/profiles", get(profiles))
         .route("/v1/profiles/{profile}/secrets", get(profile_secrets))
@@ -763,7 +968,11 @@ pub async fn run(config: Config) -> Result<()> {
             HeaderName::from_static("permissions-policy"),
             HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
         ))
-        .layer(TraceLayer::new_for_http())
+        // OAuth authorization codes can appear in a callback query string.
+        // Logging only the normalized path keeps credentials out of traces.
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &Request| {
+            tracing::info_span!("http_request", method = %request.method(), path = request.uri().path())
+        }))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
@@ -863,8 +1072,84 @@ async fn auth_config(State(state): State<AppState>) -> impl IntoResponse {
     no_store(axum::Json(state.auth.public_config()).into_response())
 }
 
+async fn github_start(State(state): State<AppState>) -> Response {
+    let Some(github) = &state.github_browser_auth else {
+        return ui_not_found().await;
+    };
+    let redirect_uri = github_callback_url(&state.config.public_url);
+    let (location, state_token) = match github.start(&redirect_uri).await {
+        Ok(value) => value,
+        Err(error) => return internal_error(error),
+    };
+    let cookie = github_state_cookie(&state_token);
+    no_store(
+        (
+            StatusCode::FOUND,
+            [(header::LOCATION, location), (header::SET_COOKIE, cookie)],
+        )
+            .into_response(),
+    )
+}
+
+async fn github_callback(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<GithubCallback>,
+) -> Response {
+    let Some(github) = &state.github_browser_auth else {
+        return ui_not_found().await;
+    };
+    let Some(state_token) = query.state.as_deref() else {
+        return github_callback_rejected();
+    };
+    let Some(cookie_state) = cookie_value(&headers, GITHUB_STATE_COOKIE) else {
+        return github_callback_rejected();
+    };
+    if query.error.is_some() || cookie_state != state_token {
+        return github_callback_rejected();
+    }
+    let Some(code) = query.code.as_deref() else {
+        return github_callback_rejected();
+    };
+    let redirect_uri = github_callback_url(&state.config.public_url);
+    let identity = match github.finish(state_token, code, &redirect_uri).await {
+        Ok(identity) => identity,
+        Err(error) => {
+            tracing::warn!(%error, "GitHub browser login rejected");
+            return github_callback_rejected();
+        }
+    };
+    let session = github.create_session(identity).await;
+    no_store(
+        (
+            StatusCode::FOUND,
+            [
+                (header::LOCATION, "/".to_owned()),
+                (header::SET_COOKIE, github_session_cookie(&session)),
+                (header::SET_COOKIE, clear_github_state_cookie()),
+            ],
+        )
+            .into_response(),
+    )
+}
+
+async fn github_logout(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(github) = &state.github_browser_auth
+        && let Some(session) = cookie_value(&headers, GITHUB_SESSION_COOKIE)
+    {
+        github.remove_session(session).await;
+    }
+    no_store(
+        (
+            StatusCode::NO_CONTENT,
+            [(header::SET_COOKIE, clear_github_session_cookie())],
+        )
+            .into_response(),
+    )
+}
+
 async fn ui_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    let identity = match state.auth.authorize(&headers).await {
+    let identity = match ui_identity(&state, &headers).await {
         Ok(identity) => identity,
         Err(error) => return unauthorized(error),
     };
@@ -1085,7 +1370,7 @@ async fn ui_require_owner(
     state: &AppState,
     headers: &HeaderMap,
 ) -> std::result::Result<crate::auth::Identity, Response> {
-    let identity = state.auth.authorize(headers).await.map_err(unauthorized)?;
+    let identity = ui_identity(state, headers).await.map_err(unauthorized)?;
     let Some(store) = state.store.as_ref() else {
         return Err(ui_not_found().await);
     };
@@ -1096,6 +1381,72 @@ async fn ui_require_owner(
         )),
         Err(error) => Err(internal_error(error)),
     }
+}
+
+async fn ui_identity(state: &AppState, headers: &HeaderMap) -> Result<crate::auth::Identity> {
+    if let Some(github) = &state.github_browser_auth
+        && let Some(session) = cookie_value(headers, GITHUB_SESSION_COOKIE)
+        && let Some(identity) = github.session_identity(session).await
+    {
+        return Ok(identity);
+    }
+    state.auth.authorize(headers).await
+}
+
+fn github_callback_url(public_url: &str) -> String {
+    format!("{}/auth/github/callback", public_url.trim_end_matches('/'))
+}
+
+fn github_state_cookie(state: &str) -> String {
+    format!(
+        "{GITHUB_STATE_COOKIE}={state}; Path=/auth/github; HttpOnly; SameSite=Lax; Max-Age={}",
+        GITHUB_AUTH_TTL.as_secs()
+    )
+}
+
+fn clear_github_state_cookie() -> String {
+    format!("{GITHUB_STATE_COOKIE}=; Path=/auth/github; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
+fn github_session_cookie(session: &str) -> String {
+    format!(
+        "{GITHUB_SESSION_COOKIE}={session}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+        GITHUB_SESSION_TTL.as_secs()
+    )
+}
+
+fn clear_github_session_cookie() -> String {
+    format!("{GITHUB_SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
+}
+
+fn cookie_value<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())?
+        .split(';')
+        .map(str::trim)
+        .find_map(|pair| {
+            pair.split_once('=')
+                .filter(|(key, _)| *key == name)
+                .map(|(_, value)| value)
+        })
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+}
+
+fn github_callback_rejected() -> Response {
+    no_store(
+        (
+            StatusCode::UNAUTHORIZED,
+            [(header::SET_COOKIE, clear_github_state_cookie())],
+            "GitHub login was rejected\n",
+        )
+            .into_response(),
+    )
 }
 
 async fn render_owner_panel(state: &AppState) -> Response {
@@ -1153,7 +1504,11 @@ async fn status(State(state): State<AppState>, headers: HeaderMap) -> Response {
 fn public_status(config: &Config) -> PublicStatus {
     PublicStatus {
         oidc_enabled: matches!(config.auth.mode, AuthMode::Oidc | AuthMode::OidcOrBasic),
-        basic_enabled: matches!(config.auth.mode, AuthMode::Basic | AuthMode::OidcOrBasic),
+        github_enabled: matches!(config.auth.mode, AuthMode::GithubOrBasic),
+        basic_enabled: matches!(
+            config.auth.mode,
+            AuthMode::Basic | AuthMode::OidcOrBasic | AuthMode::GithubOrBasic
+        ),
         persistence_enabled: config.mode == ConfigMode::Managed,
         registration_enabled: false,
         connectors: config
@@ -1821,6 +2176,7 @@ mod tests {
         let page = SessionTemplate {
             status: PublicStatus {
                 oidc_enabled: true,
+                github_enabled: false,
                 basic_enabled: false,
                 persistence_enabled: true,
                 registration_enabled: false,
@@ -1873,6 +2229,40 @@ mod tests {
         assert!(limiter.try_acquire().await);
         assert!(limiter.try_acquire().await);
         assert!(!limiter.try_acquire().await);
+    }
+
+    #[tokio::test]
+    async fn github_start_uses_pkce_and_never_puts_the_client_secret_in_the_redirect() {
+        let directory = tempfile::tempdir().unwrap();
+        let secret_file = directory.path().join("github-client-secret");
+        std::fs::write(&secret_file, "synthetic-client-secret\n").unwrap();
+        let github = GithubBrowserAuth::new(&GithubAuthConfig {
+            client_id: "synthetic-client-id".into(),
+            client_secret_file: secret_file.display().to_string(),
+            allowed_logins: vec!["noeljackson".into()],
+        })
+        .unwrap();
+        let (redirect, state) = github
+            .start("http://127.0.0.1:14322/auth/github/callback")
+            .await
+            .unwrap();
+        let redirect = url::Url::parse(&redirect).unwrap();
+        assert_eq!(
+            redirect.as_str().split('?').next(),
+            Some(GITHUB_AUTHORIZATION_ENDPOINT)
+        );
+        let query: BTreeMap<_, _> = redirect.query_pairs().into_owned().collect();
+        assert_eq!(query.get("client_id"), Some(&"synthetic-client-id".into()));
+        assert_eq!(query.get("state"), Some(&state));
+        assert_eq!(query.get("code_challenge_method"), Some(&"S256".into()));
+        assert!(
+            query
+                .get("code_challenge")
+                .is_some_and(|value| value.len() >= 43)
+        );
+        assert!(!redirect.as_str().contains("synthetic-client-secret"));
+        assert!(github_state_cookie(&state).contains("HttpOnly; SameSite=Lax"));
+        assert!(github_session_cookie("session").contains("HttpOnly; SameSite=Lax"));
     }
 
     #[test]

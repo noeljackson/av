@@ -2,6 +2,7 @@
   <header><span>runtime matrix</span><span>authorized view</span></header>
   <div class="capabilities">
     <div><span>oidc</span><strong class="{% if status.oidc_enabled %}on{% endif %}">{% if status.oidc_enabled %}enabled{% else %}disabled{% endif %}</strong></div>
+    <div><span>github login</span><strong class="{% if status.github_enabled %}on{% endif %}">{% if status.github_enabled %}enabled{% else %}disabled{% endif %}</strong></div>
     <div><span>basic fallback</span><strong class="{% if status.basic_enabled %}on{% endif %}">{% if status.basic_enabled %}enabled{% else %}disabled{% endif %}</strong></div>
     <div><span>persistence</span><strong class="{% if status.persistence_enabled %}on{% endif %}">{% if status.persistence_enabled %}enabled{% else %}disabled{% endif %}</strong></div>
     <div><span>registration</span><strong>disabled</strong></div>

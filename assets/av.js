@@ -6,6 +6,7 @@ const dashboard = document.querySelector("#dashboard");
 const authProgress = document.querySelector("#auth-progress");
 const authError = document.querySelector("#auth-error");
 const oidcLogin = document.querySelector("#oidc-login");
+const githubLogin = document.querySelector("#github-login");
 const basicLogin = document.querySelector("#basic-login");
 const authDivider = document.querySelector("#auth-divider");
 const basicForm = document.querySelector("#basic-form");
@@ -27,6 +28,14 @@ async function initialize() {
       await loadSession("disabled");
       return;
     }
+    if (auth.mode === "github_or_basic") {
+      try {
+        await loadSession();
+        return;
+      } catch (_) {
+        // An absent or expired browser cookie is the expected logged-out state.
+      }
+    }
     showLogin();
   } catch (cause) {
     showError(message(cause));
@@ -36,10 +45,12 @@ async function initialize() {
 function showLogin() {
   authProgress.hidden = true;
   const oidcEnabled = auth.mode === "oidc" || auth.mode === "oidc_or_basic";
-  const basicEnabled = auth.mode === "basic" || auth.mode === "oidc_or_basic";
+  const githubEnabled = auth.mode === "github_or_basic";
+  const basicEnabled = auth.mode === "basic" || auth.mode === "oidc_or_basic" || githubEnabled;
   oidcLogin.hidden = !oidcEnabled;
+  githubLogin.hidden = !githubEnabled;
   basicLogin.hidden = !basicEnabled;
-  authDivider.hidden = !(oidcEnabled && basicEnabled);
+  authDivider.hidden = !((oidcEnabled || githubEnabled) && basicEnabled);
 }
 
 oidcLogin.addEventListener("click", async () => {
@@ -66,6 +77,10 @@ oidcLogin.addEventListener("click", async () => {
   }
 });
 
+githubLogin.addEventListener("click", () => {
+  location.assign("/auth/github/start");
+});
+
 basicForm.addEventListener("submit", async (event) => {
   event.preventDefault();
   const username = document.querySelector("#username").value;
@@ -79,7 +94,12 @@ basicForm.addEventListener("submit", async (event) => {
   }
 });
 
-document.querySelector("#logout").addEventListener("click", () => {
+document.querySelector("#logout").addEventListener("click", async () => {
+  try {
+    await fetch("/auth/github/logout", { method: "POST", cache: "no-store" });
+  } catch (_) {
+    // Clearing the local view remains safe if the local-only server went away.
+  }
   authorization = "";
   sessionPanel.replaceChildren();
   dashboard.hidden = true;
@@ -119,10 +139,10 @@ async function finishOidcCallback() {
 }
 
 async function loadSession(candidate) {
-  const headers = candidate === "disabled" ? {} : { authorization: candidate };
+  const headers = !candidate || candidate === "disabled" ? {} : { authorization: candidate };
   const response = await fetch("/ui/session", { cache: "no-store", headers });
   if (!response.ok) throw new Error(`authentication failed (${response.status})`);
-  authorization = candidate;
+  authorization = candidate || "";
   sessionPanel.innerHTML = await response.text();
   window.htmx.process(sessionPanel);
   lockedScreen.hidden = true;

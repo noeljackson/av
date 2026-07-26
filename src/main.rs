@@ -217,6 +217,7 @@ fn local_init(
             allowed_groups: vec![allowed_role],
             group_claim: "urn:zitadel:iam:org:project:roles".into(),
             basic_users: vec![],
+            github: None,
         },
         connectors: BTreeMap::new(),
         profiles: BTreeMap::new(),
