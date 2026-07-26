@@ -26,11 +26,12 @@ if [[ ${AV_TEST_GITHUB_OAUTH:-0} == 1 ]]; then
   openbao_mount=${AV_TEST_GITHUB_OPENBAO_MOUNT:-apps}
   openbao_path=${AV_TEST_GITHUB_OPENBAO_PATH:-av/local}
   openbao_secret_path="${openbao_mount%/}/${openbao_path#/}"
-  # Use the explicit KV v2 data endpoint. The human policy is deliberately
-  # not allowed to enumerate OpenBao mounts, which `bao kv get` tries first.
-  bao read -field=GITHUB_CLIENT_ID "${openbao_mount%/}/data/${openbao_path#/}" \
+  # Supplying the mount prevents `bao kv get` from enumerating mounts, which
+  # the bounded human policy deliberately cannot do. It also unwraps KV v2
+  # response data before selecting the requested field.
+  bao kv get -mount="${openbao_mount%/}" -field=GITHUB_CLIENT_ID "${openbao_path#/}" \
     > "$temporary_secret_directory/client-id"
-  bao read -field=GITHUB_CLIENT_SECRET "${openbao_mount%/}/data/${openbao_path#/}" \
+  bao kv get -mount="${openbao_mount%/}" -field=GITHUB_CLIENT_SECRET "${openbao_path#/}" \
     > "$temporary_secret_directory/client-secret"
   [[ -s $temporary_secret_directory/client-id && -s $temporary_secret_directory/client-secret ]] || {
     printf '%s\n' 'OpenBao returned an empty GitHub OAuth credential field.' >&2
