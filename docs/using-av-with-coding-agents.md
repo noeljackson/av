@@ -115,15 +115,18 @@ This is the preferred design for agent actions because prompt injection cannot
 turn a capability to create a development widget into arbitrary access to the
 provider account.
 
-## Transparent proxy is a separate future feature
+## Transparent proxy is planned, not available
 
 Agent Vault takes a different approach: its clients set `HTTP_PROXY`,
 `HTTPS_PROXY`, and trust its local CA, then it MITMs normal HTTPS requests and
-substitutes credentials. That is convenient for unmodified SDKs, but it also
-requires per-session CA handling, a private proxy network, and firewall rules
-that prevent direct egress bypass.
+substitutes credentials. That makes unmodified SDKs convenient, but a safe
+implementation requires a private proxy network, short-lived sessions, CA key
+management, strict host policy, and firewall rules that prevent direct egress
+bypass.
 
 Do not configure AV as `HTTPS_PROXY` today. AV's current security contract is
-the explicit named route shown above. If transparent proxying is added later,
-it should be a separate, opt-in mode with the same private-network and
-deny-direct-egress requirements.
+the explicit named route shown above. The planned transparent design uses a
+local session helper rather than placing a reusable proxy token in the agent's
+environment, and it denies every destination not declared in AV policy. Read
+[the transparent proxy design](transparent-proxy-design.md) before evaluating
+or deploying that future feature.
