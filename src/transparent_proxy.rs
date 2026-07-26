@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, net::IpAddr};
 
 use anyhow::{Context, Result, bail};
 use argon2::password_hash::rand_core::{OsRng, RngCore};
+use axum::http::{HeaderMap, Method, Uri, header};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -28,6 +29,12 @@ pub struct TransparentRouteCatalog {
 pub struct ProxySessionCredential {
     pub session_id: String,
     pub token: Zeroizing<String>,
+    pub token_hash: [u8; 32],
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizedConnect {
+    pub route_name: String,
     pub token_hash: [u8; 32],
 }
 
@@ -92,6 +99,57 @@ impl TransparentRouteCatalog {
     pub fn is_empty(&self) -> bool {
         self.routes_by_host.is_empty()
     }
+}
+
+/// Validate the only forward-proxy request shape AV accepts. This function is
+/// deliberately free of DNS and sockets: callers must complete it before any
+/// upstream operation.
+pub fn authorize_connect_request(
+    method: &Method,
+    uri: &Uri,
+    headers: &HeaderMap,
+    catalog: &TransparentRouteCatalog,
+) -> Result<AuthorizedConnect> {
+    if method != Method::CONNECT {
+        bail!("transparent proxy accepts CONNECT only");
+    }
+    let authority = uri
+        .authority()
+        .map(|value| value.as_str())
+        .context("CONNECT request has no authority")?;
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .context("CONNECT request has no valid Host header")?;
+    if headers.get_all(header::HOST).iter().count() != 1
+        || canonical_connect_authority(host)? != canonical_connect_authority(authority)?
+    {
+        bail!("CONNECT Host header must exactly identify the requested authority");
+    }
+    let route_name = catalog
+        .route_for_connect_authority(authority)
+        .context("CONNECT destination is not configured")?;
+    let values: Vec<_> = headers.get_all("proxy-authorization").iter().collect();
+    if values.len() != 1 {
+        bail!("CONNECT request requires exactly one proxy bearer capability");
+    }
+    let value = values[0]
+        .to_str()
+        .context("CONNECT proxy authorization is not valid text")?;
+    let token = value
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty())
+        .context("CONNECT proxy authorization must use Bearer")?;
+    if token
+        .bytes()
+        .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+    {
+        bail!("CONNECT proxy bearer capability is malformed");
+    }
+    Ok(AuthorizedConnect {
+        route_name: route_name.to_owned(),
+        token_hash: proxy_session_token_hash(token.as_bytes()),
+    })
 }
 
 fn canonical_connect_authority(authority: &str) -> Result<String> {
@@ -241,5 +299,91 @@ mod tests {
         assert_eq!(first.token_hash.len(), 32);
         assert!(!first.session_id.contains('='));
         assert!(!first.token.contains('='));
+    }
+
+    #[test]
+    fn connect_authorization_requires_exact_authority_and_one_bearer() {
+        let catalog = catalog(&[("provider", "https://api.example.test/v1")]).unwrap();
+        let credential = mint_proxy_session_credential();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "api.example.test:443".parse().unwrap());
+        headers.insert(
+            "proxy-authorization",
+            format!("Bearer {}", credential.token.as_str())
+                .parse()
+                .unwrap(),
+        );
+        let authorized = authorize_connect_request(
+            &Method::CONNECT,
+            &"api.example.test:443".parse::<Uri>().unwrap(),
+            &headers,
+            &catalog,
+        )
+        .unwrap();
+        assert_eq!(authorized.route_name, "provider");
+        assert_eq!(authorized.token_hash, credential.token_hash);
+
+        let wrong_host = "other.example.test:443".parse().unwrap();
+        headers.insert(header::HOST, wrong_host);
+        assert!(
+            authorize_connect_request(
+                &Method::CONNECT,
+                &"api.example.test:443".parse::<Uri>().unwrap(),
+                &headers,
+                &catalog
+            )
+            .is_err()
+        );
+        headers.insert(header::HOST, "api.example.test:443".parse().unwrap());
+        headers.insert("proxy-authorization", "Basic Zm9vOmJhcg==".parse().unwrap());
+        assert!(
+            authorize_connect_request(
+                &Method::CONNECT,
+                &"api.example.test:443".parse::<Uri>().unwrap(),
+                &headers,
+                &catalog
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_connect_request(
+                &Method::GET,
+                &"api.example.test:443".parse::<Uri>().unwrap(),
+                &headers,
+                &catalog
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn connect_authorization_rejects_duplicate_or_unknown_destinations() {
+        let catalog = catalog(&[("provider", "https://api.example.test")]).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "api.example.test:443".parse().unwrap());
+        headers.append("proxy-authorization", "Bearer first".parse().unwrap());
+        headers.append("proxy-authorization", "Bearer second".parse().unwrap());
+        assert!(
+            authorize_connect_request(
+                &Method::CONNECT,
+                &"api.example.test:443".parse::<Uri>().unwrap(),
+                &headers,
+                &catalog
+            )
+            .is_err()
+        );
+
+        let mut unknown_headers = HeaderMap::new();
+        unknown_headers.insert(header::HOST, "unknown.example.test:443".parse().unwrap());
+        unknown_headers.insert("proxy-authorization", "Bearer capability".parse().unwrap());
+        assert!(
+            authorize_connect_request(
+                &Method::CONNECT,
+                &"unknown.example.test:443".parse::<Uri>().unwrap(),
+                &unknown_headers,
+                &catalog
+            )
+            .is_err()
+        );
     }
 }
