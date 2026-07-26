@@ -4,6 +4,7 @@ pub mod connector;
 pub mod infisical;
 pub mod keyring;
 pub mod openbao;
+pub mod proxy_ca;
 pub mod server;
 pub mod store;
 pub mod transparent_proxy;
