@@ -586,7 +586,15 @@ impl Store {
         )";
         const CREATE_AUDIT_INDEX: &str = "CREATE INDEX IF NOT EXISTS av_audit_events_created_idx \
             ON av_audit_events (created_unix_seconds)";
-        const CREATE_PROXY_SESSIONS: &str = "CREATE TABLE IF NOT EXISTS av_proxy_sessions (\
+        const CREATE_PROXY_SESSIONS_POSTGRES: &str = "CREATE TABLE IF NOT EXISTS av_proxy_sessions (\
+            session_id TEXT PRIMARY KEY,\
+            token_hash BYTEA NOT NULL UNIQUE,\
+            subject TEXT NOT NULL,\
+            profile TEXT NOT NULL,\
+            expires_unix_seconds BIGINT NOT NULL,\
+            revoked BOOLEAN NOT NULL\
+        )";
+        const CREATE_PROXY_SESSIONS_SQLITE: &str = "CREATE TABLE IF NOT EXISTS av_proxy_sessions (\
             session_id TEXT PRIMARY KEY,\
             token_hash BLOB NOT NULL UNIQUE,\
             subject TEXT NOT NULL,\
@@ -604,7 +612,9 @@ impl Store {
                 sqlx::query(CREATE_PROFILE_GRANTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_EVENTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_INDEX).execute(pool).await?;
-                sqlx::query(CREATE_PROXY_SESSIONS).execute(pool).await?;
+                sqlx::query(CREATE_PROXY_SESSIONS_POSTGRES)
+                    .execute(pool)
+                    .await?;
                 sqlx::query(CREATE_PROXY_SESSIONS_TOKEN_INDEX)
                     .execute(pool)
                     .await?;
@@ -616,7 +626,9 @@ impl Store {
                 sqlx::query(CREATE_PROFILE_GRANTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_EVENTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_INDEX).execute(pool).await?;
-                sqlx::query(CREATE_PROXY_SESSIONS).execute(pool).await?;
+                sqlx::query(CREATE_PROXY_SESSIONS_SQLITE)
+                    .execute(pool)
+                    .await?;
                 sqlx::query(CREATE_PROXY_SESSIONS_TOKEN_INDEX)
                     .execute(pool)
                     .await?;
