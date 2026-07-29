@@ -154,6 +154,91 @@ def bootstrap_openbao():
     write_secret("openbao-role-id", role_id)
     write_secret("openbao-secret-id", secret_id)
 
+    mounts = bao_request("/v1/sys/mounts")
+    if "database/" not in mounts:
+        bao_request(
+            "/v1/sys/mounts/database",
+            method="POST",
+            payload={"type": "database"},
+        )
+    bao_request(
+        "/v1/database/config/av",
+        method="POST",
+        payload={
+            "plugin_name": "postgresql-database-plugin",
+            "allowed_roles": ["av"],
+            "connection_url": "postgresql://{{username}}:{{password}}@postgres:5432/av?sslmode=require",
+            "username": "infisical",
+            "password": "integration-only",
+            "verify_connection": True,
+        },
+    )
+    bao_request(
+        "/v1/database/roles/av",
+        method="POST",
+        payload={
+            "db_name": "av",
+            "creation_statements": [
+                "CREATE ROLE \"{{name}}\" WITH LOGIN PASSWORD '{{password}}' "
+                "VALID UNTIL '{{expiration}}' IN ROLE av_owner"
+            ],
+            "revocation_statements": ['DROP ROLE IF EXISTS "{{name}}"'],
+            "default_ttl": "10s",
+            "max_ttl": "20s",
+        },
+    )
+    bao_request(
+        "/v1/sys/policies/acl/av-database-agent",
+        method="PUT",
+        payload={
+            "policy": 'path "database/creds/av" { capabilities = ["read"] }'
+        },
+    )
+    bao_request(
+        "/v1/auth/approle/role/av-database-agent",
+        method="POST",
+        payload={
+            "token_policies": ["av-database-agent"],
+            "token_ttl": "5m",
+            "token_max_ttl": "10m",
+            "secret_id_ttl": "10m",
+        },
+    )
+    database_role_id = bao_request(
+        "/v1/auth/approle/role/av-database-agent/role-id"
+    )["data"]["role_id"]
+    database_secret_id = bao_request(
+        "/v1/auth/approle/role/av-database-agent/secret-id",
+        method="POST",
+        payload={},
+    )["data"]["secret_id"]
+    write_secret("openbao-agent-role-id", database_role_id)
+    write_secret("openbao-agent-secret-id", database_secret_id)
+    write_secret(
+        "openbao-agent.hcl",
+        """
+vault {
+  address = "http://openbao:8200"
+}
+
+auto_auth {
+  method "approle" {
+    config = {
+      role_id_file_path = "/state/openbao-agent-role-id"
+      secret_id_file_path = "/state/openbao-agent-secret-id"
+      remove_secret_id_file_after_reading = false
+    }
+  }
+}
+
+template {
+  contents = "{{ with secret \\"database/creds/av\\" }}{{ .Data | toJSON }}{{ end }}"
+  destination = "/credentials/database-credentials.json"
+  perms = 0444
+}
+""".strip(),
+    )
+
 
 def write_config(project_id, environment):
     write_secret(
@@ -162,7 +247,7 @@ def write_config(project_id, environment):
     )
     write_secret(
         "av-control-plane-url",
-        "postgres://infisical:integration-only@postgres:5432/infisical",
+        "postgres://infisical:integration-only@postgres:5432/av?sslmode=require",
     )
     github_client_id = os.environ.get("AV_TEST_GITHUB_CLIENT_ID", "")
     github_owner_id = os.environ.get("AV_TEST_GITHUB_OWNER_ID", "")
@@ -210,7 +295,15 @@ def write_config(project_id, environment):
         "public_url": "http://127.0.0.1:14322",
         "mode": "managed",
         "managed": {
-            "database_url_file": "/state/av-control-plane-url",
+            "database_credentials_file": "/credentials/database-credentials.json",
+            "database_reload_interval_seconds": 1,
+            "postgres": {
+                "host": "postgres",
+                "port": 5432,
+                "database": "av",
+                "ssl_mode": "require",
+                "role": "av_owner",
+            },
             "initial_owner_oidc_subject": initial_owner_subject,
         },
         "auth": auth,

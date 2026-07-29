@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import base64
+import hashlib
 import json
 import os
+import pathlib
 import time
 import urllib.parse
 import urllib.error
@@ -9,6 +11,7 @@ import urllib.request
 
 AV_URL = os.environ["AV_URL"].rstrip("/")
 AUTH = "Basic " + base64.b64encode(b"operator:password").decode()
+CREDENTIAL_FILE = pathlib.Path("/credentials/database-credentials.json")
 
 
 def request(path, method="GET", auth=True, origin=None, body=None, headers=None, accepted=(200,)):
@@ -48,6 +51,7 @@ def wait_for_av():
 
 def main():
     wait_for_av()
+    initial_database_credential = hashlib.sha256(CREDENTIAL_FILE.read_bytes()).digest()
     _, _, _ = request("/v1/status", auth=False, accepted=(401,))
     _, status, headers = request("/v1/status")
     assert status["basicEnabled"] is True
@@ -189,6 +193,19 @@ def main():
         headers={"Sec-Fetch-Site": "same-site"},
         accepted=(403,),
     )
+
+    # OpenBao Agent must replace the leased PostgreSQL login after its maximum
+    # TTL, and AV must switch pools without an application restart or outage.
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if hashlib.sha256(CREDENTIAL_FILE.read_bytes()).digest() != initial_database_credential:
+            break
+        time.sleep(1)
+    else:
+        raise RuntimeError("OpenBao Agent did not rotate the database credential file")
+    _, status_after_rotation, _ = request("/v1/status")
+    assert status_after_rotation["persistenceEnabled"] is True
+
     print("connector_integration=ok")
 
 

@@ -227,6 +227,9 @@ fn local_init(
         mode: ConfigMode::Managed,
         managed: Some(ManagedConfig {
             database_url_file: database_url_file.display().to_string(),
+            database_credentials_file: String::new(),
+            postgres: None,
+            database_reload_interval_seconds: 0,
             initial_owner_oidc_subject: owner_subject,
         }),
         auth: AuthConfig {

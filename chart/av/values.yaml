@@ -92,9 +92,29 @@ credentialSecrets: []
 # creates that database or its Secret.
 controlPlane:
   mode: static # static | managed
+  # Existing Secret is intended for local/simple deployments. Production
+  # Kubernetes can instead enable openbaoAgent so no durable database
+  # credential is copied into a Kubernetes Secret.
   existingDatabaseSecret:
     name: ""
     key: database-url
+  openbaoAgent:
+    enabled: false
+    address: ""
+    authPath: auth/kubernetes
+    role: ""
+    secretPath: ""
+    tlsSecretName: ""
+    caCertificatePath: /vault/tls/ca.crt
+    tlsServerName: ""
+    credentialsFile: /vault/secrets/database-credentials.json
+    reloadIntervalSeconds: 5
+    postgres:
+      host: ""
+      port: 5432
+      database: ""
+      sslMode: require
+      role: ""
   # Exact OIDC `sub` for the first owner of an empty database. This is an
   # identifier, not a credential. It is ignored in static mode.
   initialOwnerOidcSubject: ""

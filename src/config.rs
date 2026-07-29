@@ -49,13 +49,49 @@ pub enum ConfigMode {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManagedConfig {
-    /// Absolute file path mounted from an existing Secret. The database URL is
-    /// never accepted from Helm values or written to AV's database.
+    /// Absolute file path containing a PostgreSQL or SQLite URL. This remains
+    /// the simple local-development and backwards-compatible source.
+    #[serde(default)]
     pub database_url_file: String,
+    /// Absolute path to an atomically rendered JSON object containing only
+    /// `username` and `password`. OpenBao Agent can renew this file without
+    /// exposing a database URL through Helm or Kubernetes Secret objects.
+    #[serde(default)]
+    pub database_credentials_file: String,
+    /// Non-secret PostgreSQL connection metadata paired with
+    /// `database_credentials_file`.
+    #[serde(default)]
+    pub postgres: Option<ManagedPostgresConfig>,
+    /// Poll interval for credential-file changes. Zero disables hot reload.
+    #[serde(default)]
+    pub database_reload_interval_seconds: u64,
     /// Exact OIDC subject that becomes the first owner on an empty shared
     /// control-plane database. Local Basic bootstrap is added by `av local init`.
     #[serde(default)]
     pub initial_owner_oidc_subject: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManagedPostgresConfig {
+    pub host: String,
+    #[serde(default = "default_postgres_port")]
+    pub port: u16,
+    pub database: String,
+    #[serde(default = "default_postgres_ssl_mode")]
+    pub ssl_mode: ManagedPostgresSslMode,
+    /// Stable NOLOGIN role used for object ownership and application access.
+    /// Every pooled connection executes `SET ROLE` before it is made available.
+    pub role: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedPostgresSslMode {
+    #[default]
+    Require,
+    VerifyCa,
+    VerifyFull,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
@@ -335,8 +371,37 @@ impl Config {
                 bail!("managed configuration is only valid when mode is managed")
             }
             (ConfigMode::Managed, Some(managed)) => {
-                if !Path::new(&managed.database_url_file).is_absolute() {
+                let has_url = !managed.database_url_file.is_empty();
+                let has_credentials = !managed.database_credentials_file.is_empty();
+                if has_url == has_credentials {
+                    bail!(
+                        "managed mode requires exactly one of database_url_file or database_credentials_file"
+                    );
+                }
+                if has_url && !Path::new(&managed.database_url_file).is_absolute() {
                     bail!("managed.database_url_file must be an absolute path");
+                }
+                if has_credentials && !Path::new(&managed.database_credentials_file).is_absolute() {
+                    bail!("managed.database_credentials_file must be an absolute path");
+                }
+                if has_credentials {
+                    let postgres = managed
+                        .postgres
+                        .as_ref()
+                        .context("managed.postgres is required with database_credentials_file")?;
+                    validate_managed_postgres(postgres)?;
+                } else if managed.postgres.is_some() {
+                    bail!("managed.postgres requires database_credentials_file");
+                }
+                if managed.database_reload_interval_seconds != 0
+                    && !(1..=3600).contains(&managed.database_reload_interval_seconds)
+                {
+                    bail!(
+                        "managed.database_reload_interval_seconds must be zero or between 1 and 3600"
+                    );
+                }
+                if managed.database_reload_interval_seconds > 0 && !has_credentials {
+                    bail!("managed database hot reload requires database_credentials_file");
                 }
                 if managed.initial_owner_oidc_subject.trim().is_empty() {
                     bail!("managed.initial_owner_oidc_subject must be non-empty");
@@ -599,6 +664,39 @@ impl Config {
             && std::env::var("AV_ALLOW_INSECURE_CONNECTORS")
                 .is_ok_and(|value| value == "integration-tests-only")
     }
+}
+
+fn validate_managed_postgres(config: &ManagedPostgresConfig) -> Result<()> {
+    if config.host.trim().is_empty()
+        || config.host.chars().any(char::is_control)
+        || config.database.trim().is_empty()
+        || config.database.chars().any(char::is_control)
+    {
+        bail!("managed.postgres host and database must be non-empty safe text");
+    }
+    if !valid_postgres_identifier(&config.role) {
+        bail!(
+            "managed.postgres.role must be a lowercase PostgreSQL identifier up to 63 characters"
+        );
+    }
+    Ok(())
+}
+
+fn valid_postgres_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some('a'..='z' | '_'))
+        && value.len() <= 63
+        && chars.all(|character| {
+            character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_'
+        })
+}
+
+fn default_postgres_port() -> u16 {
+    5432
+}
+
+fn default_postgres_ssl_mode() -> ManagedPostgresSslMode {
+    ManagedPostgresSslMode::Require
 }
 
 fn validate_connector_auth(name: &str, connector: &ConnectorConfig) -> Result<()> {
@@ -966,6 +1064,9 @@ mod tests {
         config.mode = ConfigMode::Managed;
         config.managed = Some(ManagedConfig {
             database_url_file: "relative/database-url".into(),
+            database_credentials_file: String::new(),
+            postgres: None,
+            database_reload_interval_seconds: 0,
             initial_owner_oidc_subject: String::new(),
         });
         assert!(config.validate().is_err());
@@ -977,11 +1078,57 @@ mod tests {
     }
 
     #[test]
+    fn managed_openbao_credentials_require_safe_postgres_metadata() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AV_ALLOW_INSECURE_AUTH", "1") };
+        let mut config = base_config();
+        config.mode = ConfigMode::Managed;
+        config.managed = Some(ManagedConfig {
+            database_url_file: String::new(),
+            database_credentials_file: "/vault/secrets/database-credentials.json".into(),
+            postgres: Some(ManagedPostgresConfig {
+                host: "postgres.example".into(),
+                port: 5432,
+                database: "av".into(),
+                ssl_mode: ManagedPostgresSslMode::Require,
+                role: "av_owner".into(),
+            }),
+            database_reload_interval_seconds: 5,
+            initial_owner_oidc_subject: "oidc:owner".into(),
+        });
+        assert!(config.validate().is_ok());
+
+        config
+            .managed
+            .as_mut()
+            .unwrap()
+            .postgres
+            .as_mut()
+            .unwrap()
+            .role = "av_owner; RESET ROLE".into();
+        assert!(config.validate().is_err());
+        config
+            .managed
+            .as_mut()
+            .unwrap()
+            .postgres
+            .as_mut()
+            .unwrap()
+            .role = "av_owner".into();
+        config.managed.as_mut().unwrap().database_url_file = "/run/av/database-url".into();
+        assert!(config.validate().is_err());
+        unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
+    }
+
+    #[test]
     fn github_browser_auth_is_limited_to_loopback_managed_instances() {
         let mut config = base_config();
         config.mode = ConfigMode::Managed;
         config.managed = Some(ManagedConfig {
             database_url_file: "/run/av/database-url".into(),
+            database_credentials_file: String::new(),
+            postgres: None,
+            database_reload_interval_seconds: 0,
             initial_owner_oidc_subject: "github:12345".into(),
         });
         config.auth.mode = AuthMode::GithubOrBasic;
@@ -1006,6 +1153,9 @@ mod tests {
         config.mode = ConfigMode::Managed;
         config.managed = Some(ManagedConfig {
             database_url_file: "/run/av/database-url".into(),
+            database_credentials_file: String::new(),
+            postgres: None,
+            database_reload_interval_seconds: 0,
             initial_owner_oidc_subject: "github:12345".into(),
         });
         config.auth.mode = AuthMode::GithubOrBasic;
@@ -1095,6 +1245,9 @@ mod tests {
         config.mode = ConfigMode::Managed;
         config.managed = Some(ManagedConfig {
             database_url_file: "/run/av/database-url".into(),
+            database_credentials_file: String::new(),
+            postgres: None,
+            database_reload_interval_seconds: 0,
             initial_owner_oidc_subject: "oidc:owner".into(),
         });
         config.connectors.insert(
