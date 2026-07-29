@@ -109,6 +109,13 @@ Content-Type: application/json
 The bearer token authorizes AV; it is not the provider credential. The provider
 credential never crosses into the agent or application process.
 
+If the route's profile is dynamic, AV mints one provider credential for that
+request and revokes it when the buffered or streaming response finishes. A
+dropped streaming response also triggers cleanup. For an explicitly enabled,
+bounded WebSocket, AV renews that one lease only while the session remains
+authorized and revokes it on close or failure. Callers use the same route URL
+and do not handle this lifecycle.
+
 ## Codex and Claude with the transparent proxy
 
 For a deployment that has enabled the private transparent listener and its

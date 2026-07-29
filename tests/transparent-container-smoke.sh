@@ -62,6 +62,7 @@ docker run --rm --network "container:$server" --read-only --tmpfs /tmp --cap-dro
   --volume "$tmp/transport.crt:/trust/transport.crt:ro" \
   --env AV_URL=http://127.0.0.1:14322 --env AV_BASIC_USER=operator --env AV_BASIC_PASSWORD=password \
   --env AV_PROXY_TRANSPORT_CA_FILE=/trust/transport.crt \
+  --env AV_SYSTEM_CA_FILE=/trust/transport.crt \
   "$busybox" /usr/local/bin/av run smoke -- sh -ec '
     case "${HTTPS_PROXY:-}" in http://127.0.0.1:*) ;; *) exit 1;; esac
     test -f "$SSL_CERT_FILE"
@@ -80,6 +81,7 @@ docker run --detach --name "$client" --network "container:$server" --read-only -
   --volume "$tmp/transport.crt:/trust/transport.crt:ro" \
   --env AV_URL=http://127.0.0.1:14322 --env AV_BASIC_USER=operator --env AV_BASIC_PASSWORD=password \
   --env AV_PROXY_TRANSPORT_CA_FILE=/trust/transport.crt \
+  --env AV_SYSTEM_CA_FILE=/trust/transport.crt \
   "$busybox" /usr/local/bin/av run smoke -- sleep 30 >/dev/null
 sleep 1
 docker run --rm --network "container:$server" "$busybox" \

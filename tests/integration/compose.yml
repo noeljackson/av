@@ -152,6 +152,8 @@ services:
           - upstream-auth
           - upstream-basic
           - upstream-body
+          - upstream-dynamic
+          - upstream-dynamic-stream
           - upstream-stream
           - upstream-x-api
           - upstream-ungranted
@@ -232,7 +234,7 @@ services:
         VALUES
           ('basic:operator', 'infisical-integration', 'both', NULL),
           ('basic:operator', 'openbao-integration', 'both', NULL),
-          ('basic:operator', 'openbao-dynamic', 'environment', NULL)
+          ('basic:operator', 'openbao-dynamic', 'both', NULL)
         ON CONFLICT (subject, profile) DO UPDATE SET mode = EXCLUDED.mode, expires_unix_seconds = NULL;
         -- Test-only owner fixture: production bootstraps an OIDC subject.
         INSERT INTO av_owners (subject)

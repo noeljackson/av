@@ -24,6 +24,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         authorization = self.headers.get_all("Authorization") or []
         authorized = authorization == ["Bearer openbao+ok"]
+        dynamic_authorized = (
+            len(authorization) == 1
+            and authorization[0].startswith("Bearer ")
+            and authorization[0] != "Bearer openbao+ok"
+            and len(authorization[0]) > len("Bearer ")
+        )
         query_preserved = target.query == "source=integration"
         forbidden_headers_absent = not any(
             self.headers.get(name)
@@ -32,6 +38,19 @@ class Handler(BaseHTTPRequestHandler):
         if target.path == "/verify":
             status = 200 if authorized and query_preserved and forbidden_headers_absent else 403
             body = b'{"injection":"accepted"}' if status == 200 else b'{"error":"forbidden"}'
+        elif target.path == "/dynamic" and dynamic_authorized:
+            status = 200
+            body = authorization[0].encode()
+        elif target.path == "/dynamic-stream" and dynamic_authorized:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b"data: ready\n\n")
+            self.wfile.flush()
+            time.sleep(5)
+            self.wfile.write(b"data: " + authorization[0].encode() + b"\n\n")
+            self.wfile.flush()
+            return
         elif target.path == "/basic":
             expected = "Basic " + base64.b64encode(b"av-user:openbao+ok").decode()
             status = 200 if authorization == [expected] else 403

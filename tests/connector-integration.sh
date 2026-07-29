@@ -117,6 +117,9 @@ grep --quiet '^openbao-integration' "$workdir/profiles"
 run_cli routes >"$workdir/routes"
 grep --quiet $'^openbao-upstream\tinjecting\topenbao-integration\tupstream-auth$' "$workdir/routes"
 grep --quiet $'^openbao-stream\tinjecting\topenbao-integration\tupstream-stream$' "$workdir/routes"
+grep --quiet $'^openbao-dynamic-buffered\tinjecting\topenbao-dynamic\tupstream-dynamic$' "$workdir/routes"
+grep --quiet $'^openbao-dynamic-error\tinjecting\topenbao-dynamic\tupstream$' "$workdir/routes"
+grep --quiet $'^openbao-dynamic-stream\tinjecting\topenbao-dynamic\tupstream-dynamic-stream$' "$workdir/routes"
 grep --quiet $'^openbao-x-api\tinjecting\topenbao-integration\tupstream-x-api$' "$workdir/routes"
 grep --quiet $'^credentialless-upstream\ttunnel\topenbao-integration\tupstream-tunnel$' "$workdir/routes"
 if grep --quiet '^ungranted-upstream' "$workdir/routes"; then
@@ -138,6 +141,100 @@ run_cli openbao-integration -- sh -eu -c '
   test -z "${AV_BASIC_USER:-}"
   test -z "${AV_BASIC_PASSWORD:-}"
 '
+
+dynamic_role_count() {
+  "${compose[@]}" exec --no-TTY postgres \
+    psql -U infisical -d av -tAc "
+      SELECT count(*)
+      FROM pg_auth_members memberships
+      JOIN pg_roles parent ON parent.oid = memberships.roleid
+      WHERE parent.rolname = 'av_owner'
+    "
+}
+
+wait_for_dynamic_role_count() {
+  local expected=$1
+  for _ in $(seq 1 40); do
+    if [[ $(dynamic_role_count) == "$expected" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+# A buffered Tier 2 request owns one dynamic credential and revokes it before
+# returning the redacted response.
+dynamic_role_baseline=$(dynamic_role_count)
+docker run --rm --pull never \
+  --network "container:$av_container" \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0 \
+  python -c '
+import base64
+import re
+import urllib.request
+
+request = urllib.request.Request(
+    "http://127.0.0.1:14322/v1/proxy/openbao-dynamic-buffered/dynamic",
+    headers={"Authorization": "Basic " + base64.b64encode(b"operator:password").decode()},
+)
+body = urllib.request.urlopen(request, timeout=10).read()
+assert re.fullmatch(rb"(?:\[REDACTED\])+", body)
+'
+[[ $(dynamic_role_count) == "$dynamic_role_baseline" ]]
+
+# A connect failure after acquisition also revokes rather than waiting for TTL.
+docker run --rm --pull never \
+  --network "container:$av_container" \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0 \
+  python -c '
+import base64
+import urllib.error
+import urllib.request
+
+request = urllib.request.Request(
+    "http://127.0.0.1:14322/v1/proxy/openbao-dynamic-error/dynamic-error",
+    headers={"Authorization": "Basic " + base64.b64encode(b"operator:password").decode()},
+)
+try:
+    urllib.request.urlopen(request, timeout=10)
+except urllib.error.HTTPError as error:
+    assert error.code == 502
+else:
+    raise AssertionError("dynamic proxy failure route unexpectedly succeeded")
+'
+wait_for_dynamic_role_count "$dynamic_role_baseline"
+
+# Dropping a streaming response triggers the lease guard immediately; it must
+# not wait for the upstream's delayed tail or the ten-second backend TTL.
+docker run --rm --pull never \
+  --network "container:$av_container" \
+  --read-only \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0 \
+  python -c '
+import base64
+import urllib.request
+
+request = urllib.request.Request(
+    "http://127.0.0.1:14322/v1/proxy/openbao-dynamic-stream/dynamic-stream",
+    headers={
+        "Authorization": "Basic " + base64.b64encode(b"operator:password").decode(),
+        "Accept": "text/event-stream",
+    },
+)
+response = urllib.request.urlopen(request, timeout=10)
+assert response.readline() == b"data: ready\n"
+response.close()
+'
+wait_for_dynamic_role_count "$dynamic_role_baseline"
 
 # A real OpenBao database lease is owned by the wrapped child: it stays usable
 # across renewal, is synchronously revoked when the child exits, and never

@@ -149,6 +149,24 @@ def main():
             "mode": "injecting",
         },
         {
+            "name": "openbao-dynamic-buffered",
+            "profile": "openbao-dynamic",
+            "host": "upstream-dynamic",
+            "mode": "injecting",
+        },
+        {
+            "name": "openbao-dynamic-error",
+            "profile": "openbao-dynamic",
+            "host": "upstream",
+            "mode": "injecting",
+        },
+        {
+            "name": "openbao-dynamic-stream",
+            "profile": "openbao-dynamic",
+            "host": "upstream-dynamic-stream",
+            "mode": "injecting",
+        },
+        {
             "name": "openbao-stream",
             "profile": "openbao-integration",
             "host": "upstream-stream",

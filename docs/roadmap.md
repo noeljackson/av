@@ -14,7 +14,7 @@ has its own acceptance criteria and implementation history:
 | Backend contract and Google Secret Manager | [#13](https://github.com/noeljackson/av/issues/13) | Implemented; live Workload Identity Federation validation remains |
 | Named agents and explicit RBAC grants | [#17](https://github.com/noeljackson/av/issues/17) | Implemented and covered by SQLite, PostgreSQL, CLI, and browser tests |
 | Proxy parity | [#16](https://github.com/noeljackson/av/issues/16) | Implemented: exact credentialless tunnels [#18](https://github.com/noeljackson/av/issues/18), sliding sessions [#19](https://github.com/noeljackson/av/issues/19), and streaming/typed injection/WebSockets [#20](https://github.com/noeljackson/av/issues/20) |
-| OpenBao and Infisical dynamic leases | [#14](https://github.com/noeljackson/av/issues/14) | Backend adapters [#21](https://github.com/noeljackson/av/issues/21) are implemented; child ownership and revocation [#22](https://github.com/noeljackson/av/issues/22) are in validation |
+| OpenBao and Infisical dynamic leases | [#14](https://github.com/noeljackson/av/issues/14) | Complete: backend adapters [#21](https://github.com/noeljackson/av/issues/21), child ownership [#22](https://github.com/noeljackson/av/issues/22), and Tier 2 request/stream/WebSocket cleanup [#23](https://github.com/noeljackson/av/issues/23) |
 | Production hardening, isolation, and deployment | [#15](https://github.com/noeljackson/av/issues/15) | Planned |
 
 ## Fixed product boundaries

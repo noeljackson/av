@@ -183,6 +183,56 @@ impl DynamicLeaseRegistry {
     }
 }
 
+struct DynamicLeaseOwner {
+    state: AppState,
+    handle: String,
+    subject: String,
+    expires_at: SystemTime,
+}
+
+impl DynamicLeaseOwner {
+    async fn renew(&mut self) -> Result<()> {
+        self.expires_at =
+            renew_registered_dynamic_lease(&self.state, &self.handle, &self.subject).await?;
+        Ok(())
+    }
+
+    async fn revoke(mut self) -> Result<()> {
+        let handle = std::mem::take(&mut self.handle);
+        match revoke_registered_dynamic_lease(&self.state, &handle, &self.subject).await {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.handle = handle;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl Drop for DynamicLeaseOwner {
+    fn drop(&mut self) {
+        if self.handle.is_empty() {
+            return;
+        }
+        let state = self.state.clone();
+        let handle = std::mem::take(&mut self.handle);
+        let subject = self.subject.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                if let Err(error) = revoke_registered_dynamic_lease(&state, &handle, &subject).await
+                {
+                    tracing::error!(%error, "revoke dropped dynamic proxy lease");
+                }
+            });
+        }
+    }
+}
+
+struct OwnedSecretAcquisition {
+    values: BTreeMap<String, String>,
+    lease: Option<DynamicLeaseOwner>,
+}
+
 struct TransparentProxyRuntime {
     listen: String,
     proxy_url: String,
@@ -3622,10 +3672,13 @@ async fn transparent_tunnel_response(
         proxy_websocket_request(
             &state,
             route,
-            &normalized_path,
-            &query,
-            parts.method,
-            parts.headers,
+            ProxyRequestContext {
+                subject: &session.subject,
+                normalized_path: &normalized_path,
+                query: &query,
+                method: parts.method,
+                headers: parts.headers,
+            },
             PendingWebSocketUpgrade {
                 client: client_upgrade,
                 token_hash,
@@ -3637,10 +3690,13 @@ async fn transparent_tunnel_response(
         proxy_request(
             &state,
             route,
-            &normalized_path,
-            &query,
-            parts.method,
-            parts.headers,
+            ProxyRequestContext {
+                subject: &session.subject,
+                normalized_path: &normalized_path,
+                query: &query,
+                method: parts.method,
+                headers: parts.headers,
+            },
             body,
         )
         .await
@@ -3816,10 +3872,13 @@ async fn proxy(
     match proxy_request(
         &state,
         route,
-        &normalized_path,
-        &query,
-        method,
-        headers,
+        ProxyRequestContext {
+            subject: &identity.subject,
+            normalized_path: &normalized_path,
+            query: &query,
+            method,
+            headers,
+        },
         body,
     )
     .await
@@ -3975,15 +4034,27 @@ fn websocket_subprotocols(headers: &HeaderMap) -> Result<Vec<String>> {
     Ok(protocols)
 }
 
+struct ProxyRequestContext<'a> {
+    subject: &'a str,
+    normalized_path: &'a str,
+    query: &'a [(String, String)],
+    method: Method,
+    headers: HeaderMap,
+}
+
 async fn proxy_websocket_request(
     state: &AppState,
     route: &ProxyRouteConfig,
-    normalized_path: &str,
-    query: &[(String, String)],
-    method: Method,
-    headers: HeaderMap,
+    request: ProxyRequestContext<'_>,
     upgrade: PendingWebSocketUpgrade,
 ) -> Result<Response> {
+    let ProxyRequestContext {
+        subject,
+        normalized_path,
+        query,
+        method,
+        headers,
+    } = request;
     let policy = route
         .websocket
         .clone()
@@ -3997,9 +4068,10 @@ async fn proxy_websocket_request(
         .profiles
         .get(&route.profile)
         .context("proxy profile disappeared")?;
-    let secrets = fetch_secrets(state, profile).await?;
+    let mut acquisition =
+        acquire_owned_proxy_secrets(state, &route.profile, profile, subject).await?;
     let (injection_name, injection_value, sensitive_values) =
-        build_proxy_injection(route, &secrets)?;
+        build_proxy_injection(route, &acquisition.values)?;
     let mut target =
         url::Url::parse(&route.base_url).context("proxy route base URL disappeared")?;
     let target_path = format!("{}{}", target.path().trim_end_matches('/'), normalized_path);
@@ -4074,6 +4146,7 @@ async fn proxy_websocket_request(
         profile: route.profile.clone(),
         policy,
         sensitive_values,
+        dynamic_lease: acquisition.lease.take(),
     };
     tokio::spawn(async move {
         let result = async {
@@ -4110,6 +4183,7 @@ struct WebSocketSessionContext {
     profile: String,
     policy: ProxyWebSocketConfig,
     sensitive_values: Vec<Vec<u8>>,
+    dynamic_lease: Option<DynamicLeaseOwner>,
 }
 
 async fn relay_websocket_session(
@@ -4132,6 +4206,7 @@ async fn relay_websocket_streams(
         profile,
         policy,
         sensitive_values,
+        mut dynamic_lease,
     } = session;
     let websocket_config = WebSocketConfig::default()
         .write_buffer_size(0)
@@ -4146,53 +4221,86 @@ async fn relay_websocket_streams(
     tokio::pin!(deadline);
     let mut session_check = tokio::time::interval(Duration::from_secs(1));
     session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let renewal_delay = match dynamic_lease.as_ref() {
+        Some(lease) => dynamic_proxy_renewal_delay(lease.expires_at)?,
+        None => Duration::from_secs(policy.max_duration_seconds.saturating_add(1)),
+    };
+    let renewal = tokio::time::sleep(renewal_delay);
+    tokio::pin!(renewal);
     let mut total_bytes = 0_u64;
 
-    loop {
-        tokio::select! {
-            _ = &mut deadline => bail!("WebSocket lifetime limit reached"),
-            _ = session_check.tick() => {
-                if !websocket_session_is_active(&state, &token_hash, &session_id, &profile).await? {
-                    bail!("WebSocket session was revoked, expired, or lost its grant");
+    let result = async {
+        loop {
+            tokio::select! {
+                _ = &mut deadline => bail!("WebSocket lifetime limit reached"),
+                _ = &mut renewal, if dynamic_lease.is_some() => {
+                    if !websocket_session_is_active(&state, &token_hash, &session_id, &profile).await? {
+                        bail!("WebSocket session was revoked, expired, or lost its grant");
+                    }
+                    let lease = dynamic_lease
+                        .as_mut()
+                        .context("dynamic WebSocket lease disappeared")?;
+                    lease.renew().await?;
+                    renewal.as_mut().reset(
+                        tokio::time::Instant::now() + dynamic_proxy_renewal_delay(lease.expires_at)?
+                    );
                 }
-            }
-            incoming = client.next() => {
-                let Some(message) = incoming else {
-                    return Ok(());
-                };
-                let message = message.context("read caller WebSocket message")?;
-                total_bytes = total_bytes.saturating_add(message.len() as u64);
-                if total_bytes > policy.max_total_bytes {
-                    bail!("WebSocket byte limit reached");
+                _ = session_check.tick() => {
+                    if !websocket_session_is_active(&state, &token_hash, &session_id, &profile).await? {
+                        bail!("WebSocket session was revoked, expired, or lost its grant");
+                    }
                 }
-                let closed = message.is_close();
-                let message = redact_websocket_message(message, &sensitive_values)?;
-                tokio::time::timeout(Duration::from_secs(5), upstream.send(message))
-                    .await
-                    .context("upstream WebSocket write timed out")??;
-                if closed {
-                    return Ok(());
+                incoming = client.next() => {
+                    let Some(message) = incoming else {
+                        return Ok(());
+                    };
+                    let message = message.context("read caller WebSocket message")?;
+                    total_bytes = total_bytes.saturating_add(message.len() as u64);
+                    if total_bytes > policy.max_total_bytes {
+                        bail!("WebSocket byte limit reached");
+                    }
+                    let closed = message.is_close();
+                    let message = redact_websocket_message(message, &sensitive_values)?;
+                    tokio::time::timeout(Duration::from_secs(5), upstream.send(message))
+                        .await
+                        .context("upstream WebSocket write timed out")??;
+                    if closed {
+                        return Ok(());
+                    }
                 }
-            }
-            incoming = upstream.next() => {
-                let Some(message) = incoming else {
-                    return Ok(());
-                };
-                let message = message.context("read upstream WebSocket message")?;
-                total_bytes = total_bytes.saturating_add(message.len() as u64);
-                if total_bytes > policy.max_total_bytes {
-                    bail!("WebSocket byte limit reached");
-                }
-                let closed = message.is_close();
-                let message = redact_websocket_message(message, &sensitive_values)?;
-                tokio::time::timeout(Duration::from_secs(5), client.send(message))
-                    .await
-                    .context("caller WebSocket write timed out")??;
-                if closed {
-                    return Ok(());
+                incoming = upstream.next() => {
+                    let Some(message) = incoming else {
+                        return Ok(());
+                    };
+                    let message = message.context("read upstream WebSocket message")?;
+                    total_bytes = total_bytes.saturating_add(message.len() as u64);
+                    if total_bytes > policy.max_total_bytes {
+                        bail!("WebSocket byte limit reached");
+                    }
+                    let closed = message.is_close();
+                    let message = redact_websocket_message(message, &sensitive_values)?;
+                    tokio::time::timeout(Duration::from_secs(5), client.send(message))
+                        .await
+                        .context("caller WebSocket write timed out")??;
+                    if closed {
+                        return Ok(());
+                    }
                 }
             }
         }
+    }
+    .await;
+    let revoke = match dynamic_lease {
+        Some(lease) => lease.revoke().await,
+        None => Ok(()),
+    };
+    match (result, revoke) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(error)) => Err(error).context("revoke dynamic WebSocket lease"),
+        (Err(error), Err(revoke_error)) => Err(error).context(format!(
+            "WebSocket failed and dynamic lease revocation also failed: {revoke_error:#}"
+        )),
     }
 }
 
@@ -4250,21 +4358,27 @@ fn redact_websocket_message(message: Message, sensitive_values: &[Vec<u8>]) -> R
 async fn proxy_request(
     state: &AppState,
     route: &ProxyRouteConfig,
-    normalized_path: &str,
-    query: &[(String, String)],
-    method: Method,
-    headers: HeaderMap,
+    request: ProxyRequestContext<'_>,
     body: Bytes,
 ) -> Result<Response> {
+    let ProxyRequestContext {
+        subject,
+        normalized_path,
+        query,
+        method,
+        headers,
+    } = request;
     let profile = state
         .config
         .profiles
         .get(&route.profile)
         .context("proxy profile disappeared")?;
-    let secrets = fetch_secrets(state, profile).await?;
+    let mut acquisition =
+        acquire_owned_proxy_secrets(state, &route.profile, profile, subject).await?;
     let (injection_name, injection_value, mut sensitive_values) =
-        build_proxy_injection(route, &secrets)?;
-    let (body, body_sensitive_values) = apply_body_substitutions(route, &secrets, &body)?;
+        build_proxy_injection(route, &acquisition.values)?;
+    let (body, body_sensitive_values) =
+        apply_body_substitutions(route, &acquisition.values, &body)?;
     sensitive_values.extend(body_sensitive_values);
     let mut target =
         url::Url::parse(&route.base_url).context("proxy route base URL disappeared")?;
@@ -4317,14 +4431,21 @@ async fn proxy_request(
                 bytes.extend_from_slice(&chunk);
             }
             let bytes = redact_secrets(&bytes, &sensitive_values);
-            Ok(response.body(axum::body::Body::from(bytes))?)
+            let response = response.body(axum::body::Body::from(bytes))?;
+            if let Some(lease) = acquisition.lease.take() {
+                lease
+                    .revoke()
+                    .await
+                    .context("revoke dynamic buffered proxy lease")?;
+            }
+            Ok(response)
         }
         ProxyResponseMode::Streaming => {
             let maximum = route.max_response_bytes;
             let redactor = StreamingRedactor::new_multiple(&sensitive_values);
             let body_stream = stream::try_unfold(
-                (upstream, redactor, 0_usize, false),
-                move |(mut upstream, mut redactor, mut total, finished)| async move {
+                (upstream, redactor, 0_usize, false, acquisition.lease.take()),
+                move |(mut upstream, mut redactor, mut total, finished, mut lease)| async move {
                     if finished {
                         return Ok(None);
                     }
@@ -4341,18 +4462,21 @@ async fn proxy_request(
                                 if !output.is_empty() {
                                     return Ok(Some((
                                         Bytes::from(output),
-                                        (upstream, redactor, total, false),
+                                        (upstream, redactor, total, false, lease),
                                     )));
                                 }
                             }
                             None => {
                                 let output = redactor.finish();
+                                if let Some(owner) = lease.take() {
+                                    owner.revoke().await.map_err(io::Error::other)?;
+                                }
                                 if output.is_empty() {
                                     return Ok(None);
                                 }
                                 return Ok(Some((
                                     Bytes::from(output),
-                                    (upstream, redactor, total, true),
+                                    (upstream, redactor, total, true, lease),
                                 )));
                             }
                         }
@@ -4593,6 +4717,165 @@ async fn acquire_secrets(state: &AppState, profile: &ProfileConfig) -> Result<Se
         .context("profile connector disappeared")?
         .acquire(profile)
         .await
+}
+
+async fn acquire_owned_proxy_secrets(
+    state: &AppState,
+    profile_name: &str,
+    profile: &ProfileConfig,
+    subject: &str,
+) -> Result<OwnedSecretAcquisition> {
+    let mut acquisition = acquire_secrets(state, profile).await?;
+    let lease = match acquisition.lease.take() {
+        None => None,
+        Some(lease) => {
+            let expires_at = lease.expires_at();
+            if let Err(error) = dynamic_lease_expiry(&lease) {
+                let active = ActiveDynamicLease {
+                    subject: subject.to_owned(),
+                    profile: profile_name.to_owned(),
+                    connector: profile.connector.clone(),
+                    lease,
+                };
+                if let Err(revoke_error) = revoke_dynamic_lease(state, &active).await {
+                    tracing::error!(
+                        profile = profile_name,
+                        error = %revoke_error,
+                        "revoke dynamic proxy lease with invalid expiry"
+                    );
+                }
+                return Err(error.context("dynamic proxy lease expiry is invalid"));
+            }
+            let handle = match state
+                .dynamic_leases
+                .insert(
+                    subject.to_owned(),
+                    profile_name.to_owned(),
+                    profile.connector.clone(),
+                    lease,
+                )
+                .await
+            {
+                Ok(handle) => handle,
+                Err(active) => {
+                    if let Err(error) = revoke_dynamic_lease(state, &active).await {
+                        tracing::error!(
+                            profile = profile_name,
+                            connector = %profile.connector,
+                            %error,
+                            "revoke unregistered dynamic proxy lease"
+                        );
+                    }
+                    bail!("active dynamic lease limit reached");
+                }
+            };
+            Some(DynamicLeaseOwner {
+                state: state.clone(),
+                handle,
+                subject: subject.to_owned(),
+                expires_at,
+            })
+        }
+    };
+    Ok(OwnedSecretAcquisition {
+        values: acquisition.values,
+        lease,
+    })
+}
+
+async fn renew_registered_dynamic_lease(
+    state: &AppState,
+    handle: &str,
+    subject: &str,
+) -> Result<SystemTime> {
+    let mut active = state
+        .dynamic_leases
+        .take_for_subject(handle, subject)
+        .await
+        .context("active dynamic lease not found")?;
+    let Some(connector) = state.connectors.get(&active.connector) else {
+        let _ = state
+            .dynamic_leases
+            .restore(handle.to_owned(), active)
+            .await;
+        bail!("dynamic lease connector disappeared");
+    };
+    if !active.lease.renewable() {
+        if let Err(error) = connector.revoke(&active.lease).await {
+            let _ = state
+                .dynamic_leases
+                .restore(handle.to_owned(), active)
+                .await;
+            return Err(error).context("revoke non-renewable dynamic lease");
+        }
+        bail!("dynamic lease is not renewable");
+    }
+    if let Err(error) = connector.renew(&mut active.lease).await {
+        if let Err(revoke_error) = connector.revoke(&active.lease).await {
+            let _ = state
+                .dynamic_leases
+                .restore(handle.to_owned(), active)
+                .await;
+            tracing::error!(error = %revoke_error, "revoke failed dynamic proxy lease");
+        }
+        return Err(error).context("renew dynamic proxy lease");
+    }
+    if let Err(error) = dynamic_lease_expiry(&active.lease) {
+        if let Err(revoke_error) = revoke_dynamic_lease(state, &active).await {
+            let _ = state
+                .dynamic_leases
+                .restore(handle.to_owned(), active)
+                .await;
+            tracing::error!(
+                error = %revoke_error,
+                "revoke dynamic proxy lease with invalid renewed expiry"
+            );
+        }
+        return Err(error).context("renewed dynamic proxy lease expiry is invalid");
+    }
+    let expires_at = active.lease.expires_at();
+    if let Err(active) = state
+        .dynamic_leases
+        .restore(handle.to_owned(), active)
+        .await
+    {
+        if let Err(error) = revoke_dynamic_lease(state, &active).await {
+            tracing::error!(%error, "revoke colliding dynamic proxy lease");
+        }
+        bail!("dynamic lease registry unavailable");
+    }
+    Ok(expires_at)
+}
+
+async fn revoke_registered_dynamic_lease(
+    state: &AppState,
+    handle: &str,
+    subject: &str,
+) -> Result<()> {
+    let Some(active) = state.dynamic_leases.take_for_subject(handle, subject).await else {
+        return Ok(());
+    };
+    if let Err(error) = revoke_dynamic_lease(state, &active).await {
+        if let Err(active) = state
+            .dynamic_leases
+            .restore(handle.to_owned(), active)
+            .await
+        {
+            tracing::error!(
+                profile = %active.profile,
+                "dynamic lease registry collision after proxy revocation failure"
+            );
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn dynamic_proxy_renewal_delay(expires_at: SystemTime) -> Result<Duration> {
+    let remaining = expires_at
+        .duration_since(SystemTime::now())
+        .context("dynamic proxy lease expired before renewal")?;
+    Ok(Duration::from_secs((remaining.as_secs() / 2).max(1)))
 }
 
 fn enforce_proxy_content_type(
@@ -4882,6 +5165,94 @@ mod tests {
         net::TcpStream,
     };
     use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+    async fn synthetic_lease_endpoint(
+        responses: Vec<String>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<Vec<Vec<u8>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                loop {
+                    let read = stream.read(&mut buffer).await.unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|index| index + 4)
+                    else {
+                        continue;
+                    };
+                    let header = std::str::from_utf8(&request[..header_end]).unwrap();
+                    let content_length = header
+                        .lines()
+                        .find_map(|line| {
+                            line.split_once(':').and_then(|(name, value)| {
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            })
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= header_end + content_length {
+                        break;
+                    }
+                }
+                stream.write_all(response.as_bytes()).await.unwrap();
+                requests.push(request);
+            }
+            requests
+        });
+        (address, task)
+    }
+
+    fn dynamic_lease_test_connector(
+        address: std::net::SocketAddr,
+        token_file: &std::path::Path,
+    ) -> Connector {
+        let config = serde_json::from_value(serde_json::json!({
+            "kind": "openbao",
+            "base_url": format!("http://{address}"),
+            "auth": {"type": "token", "token_file": token_file},
+        }))
+        .unwrap();
+        Connector::OpenBao(crate::openbao::OpenBaoConnector::new(config, true).unwrap())
+    }
+
+    async fn dynamic_lease_test_owner(
+        state: &AppState,
+        subject: &str,
+        profile: &str,
+        expires_after: Duration,
+    ) -> DynamicLeaseOwner {
+        let expires_at = SystemTime::now() + expires_after;
+        let lease = BackendLease::OpenBao(crate::connector::OpenBaoLease {
+            id: Zeroizing::new("database/creds/example/synthetic-proxy".into()),
+            renewable: true,
+            expires_at,
+            renew_increment: Duration::from_secs(2),
+        });
+        let handle = state
+            .dynamic_leases
+            .insert(
+                subject.to_owned(),
+                profile.to_owned(),
+                "openbao".into(),
+                lease,
+            )
+            .await
+            .unwrap_or_else(|_| panic!("synthetic lease should fit in an empty registry"));
+        DynamicLeaseOwner {
+            state: state.clone(),
+            handle,
+            subject: subject.to_owned(),
+            expires_at,
+        }
+    }
 
     fn proxy_route(methods: &[&str], prefixes: &[&str]) -> ProxyRouteConfig {
         ProxyRouteConfig {
@@ -6179,6 +6550,7 @@ mod tests {
                 profile: session.profile.clone(),
                 policy: websocket_policy(),
                 sensitive_values: vec![b"provider-secret".to_vec()],
+                dynamic_lease: None,
             },
         ));
         let mut caller = WebSocketStream::from_raw_socket(caller_io, Role::Client, None).await;
@@ -6239,6 +6611,7 @@ mod tests {
                 profile: session.profile,
                 policy,
                 sensitive_values: vec![b"provider-secret".to_vec()],
+                dynamic_lease: None,
             },
         ));
         let mut caller = WebSocketStream::from_raw_socket(caller_io, Role::Client, None).await;
@@ -6251,6 +6624,149 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_websocket_close_synchronously_revokes_its_lease() {
+        let (address, endpoint) = synthetic_lease_endpoint(vec![
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
+        ])
+        .await;
+        let token_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token_file.path(), "synthetic-token\n").unwrap();
+        let (mut state, _runtime, store, token, _ca_der) = transparent_test_context().await;
+        state.connectors = Arc::new(BTreeMap::from([(
+            "openbao".into(),
+            dynamic_lease_test_connector(address, token_file.path()),
+        )]));
+        let token_hash = proxy_session_token_hash(token.as_bytes());
+        let session = store
+            .active_proxy_session(&token_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = dynamic_lease_test_owner(
+            &state,
+            &session.subject,
+            &session.profile,
+            Duration::from_secs(60),
+        )
+        .await;
+        let (caller_io, relay_client) = tokio::io::duplex(4096);
+        let (relay_upstream, provider_io) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(relay_websocket_streams(
+            relay_client,
+            relay_upstream,
+            WebSocketSessionContext {
+                state,
+                token_hash,
+                session_id: session.session_id,
+                profile: session.profile,
+                policy: websocket_policy(),
+                sensitive_values: vec![],
+                dynamic_lease: Some(owner),
+            },
+        ));
+        let mut caller = WebSocketStream::from_raw_socket(caller_io, Role::Client, None).await;
+        let _provider = WebSocketStream::from_raw_socket(provider_io, Role::Server, None).await;
+        caller.send(Message::Close(None)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        let requests = endpoint.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(b"POST /v1/sys/leases/revoke HTTP/1.1\r\n"));
+        assert!(
+            requests[0]
+                .windows(11)
+                .any(|value| value == b"\"sync\":true")
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_websocket_renewal_failure_stops_and_revokes_the_session() {
+        let (address, endpoint) = synthetic_lease_endpoint(vec![
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into(),
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
+        ])
+        .await;
+        let token_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token_file.path(), "synthetic-token\n").unwrap();
+        let (mut state, _runtime, store, token, _ca_der) = transparent_test_context().await;
+        state.connectors = Arc::new(BTreeMap::from([(
+            "openbao".into(),
+            dynamic_lease_test_connector(address, token_file.path()),
+        )]));
+        let token_hash = proxy_session_token_hash(token.as_bytes());
+        let session = store
+            .active_proxy_session(&token_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let owner = dynamic_lease_test_owner(
+            &state,
+            &session.subject,
+            &session.profile,
+            Duration::from_secs(2),
+        )
+        .await;
+        let (caller_io, relay_client) = tokio::io::duplex(4096);
+        let (relay_upstream, provider_io) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(relay_websocket_streams(
+            relay_client,
+            relay_upstream,
+            WebSocketSessionContext {
+                state,
+                token_hash,
+                session_id: session.session_id,
+                profile: session.profile,
+                policy: websocket_policy(),
+                sensitive_values: vec![],
+                dynamic_lease: Some(owner),
+            },
+        ));
+        let _caller = WebSocketStream::from_raw_socket(caller_io, Role::Client, None).await;
+        let _provider = WebSocketStream::from_raw_socket(provider_io, Role::Server, None).await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(4), relay)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+
+        let requests = endpoint.await.unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with(b"POST /v1/sys/leases/renew HTTP/1.1\r\n"));
+        assert!(requests[1].starts_with(b"POST /v1/sys/leases/revoke HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_drains_registered_dynamic_proxy_leases() {
+        let (address, endpoint) = synthetic_lease_endpoint(vec![
+            "HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n".into(),
+        ])
+        .await;
+        let token_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token_file.path(), "synthetic-token\n").unwrap();
+        let (mut state, _runtime, _store, _token, _ca_der) = transparent_test_context().await;
+        state.connectors = Arc::new(BTreeMap::from([(
+            "openbao".into(),
+            dynamic_lease_test_connector(address, token_file.path()),
+        )]));
+        let _owner =
+            dynamic_lease_test_owner(&state, "oidc:owner", "provider", Duration::from_secs(60))
+                .await;
+
+        revoke_all_dynamic_leases(&state).await;
+        assert!(state.dynamic_leases.drain().await.is_empty());
+        let requests = endpoint.await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].starts_with(b"POST /v1/sys/leases/revoke HTTP/1.1\r\n"));
     }
 
     #[tokio::test]

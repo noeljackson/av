@@ -149,6 +149,19 @@ instance must remain available for the lifetime of leases it issued; do not
 send one lease's renewals to a different replica until distributed lease
 ownership is explicitly implemented.
 
+Tier 2 proxy routes may use the same dynamic profile. AV acquires one backend
+lease for the complete provider request—not one lease per response chunk.
+Buffered responses revoke before AV returns the body. Streaming responses keep
+the lease only until upstream EOF, error, or caller cancellation; dropping the
+response body triggers cleanup. A bounded WebSocket keeps its single lease
+while the session is active, renews it at half of the remaining TTL, and
+revokes on close, session/grant revocation, renewal failure, or lifetime/byte
+limit. All of these owners share the same bounded shutdown registry.
+
+Dynamic credentials do not change Tier 2's external contract: the caller gets
+the redacted provider response and never receives a secret value, backend
+lease ID, or AV lease handle.
+
 Infisical Dynamic Secrets is a licensed feature. Static Infisical profiles
 continue using the existing raw-secrets API and do not require it.
 
