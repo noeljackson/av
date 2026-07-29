@@ -3,11 +3,16 @@ set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 temporary_secret_directory=''
+temporary_tls_directory=''
 
 cleanup() {
   if [[ -n $temporary_secret_directory && -d $temporary_secret_directory ]]; then
     find "$temporary_secret_directory" -type f -exec shred --remove --zero {} + 2>/dev/null || true
     rmdir "$temporary_secret_directory" 2>/dev/null || true
+  fi
+  if [[ -n $temporary_tls_directory && -d $temporary_tls_directory ]]; then
+    find "$temporary_tls_directory" -type f -exec shred --remove --zero {} + 2>/dev/null || true
+    find "$temporary_tls_directory" -depth -type d -empty -delete 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
@@ -47,6 +52,16 @@ if [[ ${AV_TEST_GITHUB_OAUTH:-0} == 1 ]]; then
   export AV_TEST_GITHUB_OWNER_ID
   AV_TEST_GITHUB_OWNER_ID=$(gh api user --jq .id)
 fi
+
+temporary_tls_directory=$(mktemp -d "$root/.tmp.local-managed-tls.XXXXXX")
+export AV_POSTGRES_TLS_DIR="$temporary_tls_directory/postgres-tls"
+mkdir -p "$AV_POSTGRES_TLS_DIR"
+openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+  -keyout "$AV_POSTGRES_TLS_DIR/server.key" \
+  -out "$AV_POSTGRES_TLS_DIR/server.crt" \
+  -subj "/CN=postgres" \
+  -addext "subjectAltName=DNS:postgres" >/dev/null 2>&1
+chmod 0600 "$AV_POSTGRES_TLS_DIR/server.key"
 
 compose=(
   docker compose
