@@ -221,6 +221,33 @@ percent-encoded, and JSON-escaped credential forms split across arbitrary
 upstream chunks. Exceeding the byte ceiling terminates the body stream; it
 never silently switches to an unbounded relay.
 
+WebSockets are also denied by default. They are available only through a
+transparent proxy session because the CONNECT capability authenticates the
+caller before the inner `Authorization` header is replaced with the provider
+credential. A route opts in with a bounded policy:
+
+```json
+{
+  "websocket": {
+    "allowed_origins": ["https://app.example.internal"],
+    "allow_missing_origin": false,
+    "allowed_subprotocols": ["events.v1"],
+    "max_duration_seconds": 300,
+    "max_message_bytes": 1048576,
+    "max_total_bytes": 67108864
+  }
+}
+```
+
+Origins and subprotocols are exact; wildcards are unsupported. Non-browser
+clients may omit `Origin` only when `allow_missing_origin` is explicitly true.
+AV rejects WebSocket extensions (including compression), validates the
+challenge response and selected subprotocol, parses frames in both directions,
+redacts credential values in text, binary, ping, pong, and close payloads, and
+enforces message, connection-byte, and lifetime ceilings. It rechecks the
+session and profile grant every second, so expiry, session revocation, agent
+disablement, or grant revocation terminates a live socket.
+
 One host maps to exactly one injecting route or credentialless tunnel.
 Configuration validation rejects overlaps rather than choosing from decrypted
 paths at runtime. Ambiguity is a security failure.
@@ -361,8 +388,12 @@ The implementation is kept available only with these test layers:
 - `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and proxy-bypass behavior for Codex,
   Claude Code, curl, and at least one SDK;
 - direct TCP and UDP/443 egress denial in the Kubernetes integration fixture;
+- WebSocket handshake injection, exact Origin/subprotocol enforcement,
+  bidirectional frame redaction, bounded lifetime/bytes, and live grant
+  revocation;
 - malformed proxy authentication, replay, concurrency, rate-limit, request
-  smuggling, oversized body, WebSocket, redirect, and connection-reuse cases;
+  smuggling, oversized body, undeclared WebSocket, redirect, and
+  connection-reuse cases;
 - audit records that contain no provider secret, session credential, request
   body, or sensitive header value.
 

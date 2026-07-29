@@ -120,6 +120,12 @@ short-lived, revocable session, and removes it when the child exits. The remote
 proxy URL itself must be an HTTPS DNS origin; only the process-local loopback
 helper is HTTP.
 
+WebSocket-capable tools use the same `HTTPS_PROXY` path. The route must opt in
+to WebSockets and declare exact Origin/subprotocol and connection limits; a
+named `/v1/proxy/...` URL does not accept upgrades. This keeps AV authentication
+on the outer CONNECT request and leaves the inner `Authorization` header
+available for the provider credential.
+
 This still is not permission for arbitrary egress. AV accepts only configured
 HTTPS hosts, maps each to one immutable named route, and applies that route's
 method/path/query/header policy after TLS interception. If the workload lacks

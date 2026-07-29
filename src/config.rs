@@ -363,6 +363,10 @@ pub struct ProxyRouteConfig {
     pub response_mode: ProxyResponseMode,
     #[serde(default = "default_proxy_max_response_bytes")]
     pub max_response_bytes: usize,
+    /// Explicit WebSocket policy for transparent CONNECT/MITM sessions.
+    /// Without this block every upgrade request is denied.
+    #[serde(default)]
+    pub websocket: Option<ProxyWebSocketConfig>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -389,6 +393,26 @@ pub enum ProxyResponseMode {
     #[default]
     Buffered,
     Streaming,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyWebSocketConfig {
+    /// Exact browser Origin values. Wildcards are intentionally unsupported.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
+    /// Non-browser clients often omit Origin. This requires an explicit opt-in.
+    #[serde(default)]
+    pub allow_missing_origin: bool,
+    /// Exact WebSocket subprotocol tokens the upstream may negotiate.
+    #[serde(default)]
+    pub allowed_subprotocols: Vec<String>,
+    #[serde(default = "default_websocket_max_duration_seconds")]
+    pub max_duration_seconds: u64,
+    #[serde(default = "default_websocket_max_message_bytes")]
+    pub max_message_bytes: usize,
+    #[serde(default = "default_websocket_max_total_bytes")]
+    pub max_total_bytes: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -883,6 +907,49 @@ impl Config {
             if !(1..=4 * 1024 * 1024).contains(&route.max_body_bytes) {
                 bail!("proxy route {name} max_body_bytes must be between 1 and 4194304");
             }
+            if let Some(websocket) = &route.websocket {
+                if self.transparent_proxy.is_none()
+                    || base.scheme() != "https"
+                    || base.port_or_known_default() != Some(443)
+                {
+                    bail!(
+                        "proxy route {name} WebSockets require the transparent proxy and standard HTTPS"
+                    );
+                }
+                if !route
+                    .allowed_methods
+                    .iter()
+                    .any(|method| method.eq_ignore_ascii_case("GET"))
+                {
+                    bail!("proxy route {name} WebSockets require GET");
+                }
+                if websocket.allowed_origins.is_empty() && !websocket.allow_missing_origin {
+                    bail!(
+                        "proxy route {name} WebSockets require allowed_origins or allow_missing_origin"
+                    );
+                }
+                if websocket.allowed_origins.len() > 32 || websocket.allowed_subprotocols.len() > 16
+                {
+                    bail!("proxy route {name} WebSocket policy is too large");
+                }
+                for origin in &websocket.allowed_origins {
+                    validate_websocket_origin(origin).with_context(|| {
+                        format!("proxy route {name} has an invalid WebSocket origin")
+                    })?;
+                }
+                validate_string_allowlist(
+                    name,
+                    "WebSocket subprotocol",
+                    &websocket.allowed_subprotocols,
+                    valid_http_token,
+                )?;
+                if !(1..=24 * 60 * 60).contains(&websocket.max_duration_seconds)
+                    || !(1..=16 * 1024 * 1024).contains(&websocket.max_message_bytes)
+                    || !(1..=1024 * 1024 * 1024).contains(&websocket.max_total_bytes)
+                {
+                    bail!("proxy route {name} WebSocket limits are outside safe bounds");
+                }
+            }
         }
 
         for (name, tunnel) in &self.proxy_tunnels {
@@ -1312,6 +1379,56 @@ fn default_proxy_max_response_bytes() -> usize {
     4 * 1024 * 1024
 }
 
+fn default_websocket_max_duration_seconds() -> u64 {
+    5 * 60
+}
+
+fn default_websocket_max_message_bytes() -> usize {
+    1024 * 1024
+}
+
+fn default_websocket_max_total_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+
+fn validate_websocket_origin(value: &str) -> Result<()> {
+    let origin = Url::parse(value).context("origin must be a URL")?;
+    if !matches!(origin.scheme(), "https" | "http")
+        || origin.host_str().is_none()
+        || has_url_credentials(&origin)
+        || origin.query().is_some()
+        || origin.fragment().is_some()
+        || !matches!(origin.path(), "" | "/")
+    {
+        bail!("origin must be an exact HTTP(S) origin");
+    }
+    Ok(())
+}
+
+fn valid_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#'
+                        | b'$'
+                        | b'%'
+                        | b'&'
+                        | b'\''
+                        | b'*'
+                        | b'+'
+                        | b'-'
+                        | b'.'
+                        | b'^'
+                        | b'_'
+                        | b'`'
+                        | b'|'
+                        | b'~'
+                )
+        })
+}
+
 fn default_proxy_session_ttl_seconds() -> u64 {
     5 * 60
 }
@@ -1550,6 +1667,7 @@ mod tests {
                 max_body_bytes: default_proxy_max_body_bytes(),
                 response_mode: ProxyResponseMode::Buffered,
                 max_response_bytes: default_proxy_max_response_bytes(),
+                websocket: None,
             },
         );
         assert!(config.validate().is_err());
@@ -1627,6 +1745,7 @@ mod tests {
                 max_body_bytes: default_proxy_max_body_bytes(),
                 response_mode: ProxyResponseMode::Buffered,
                 max_response_bytes: default_proxy_max_response_bytes(),
+                websocket: None,
             },
         );
         config.transparent_proxy = Some(TransparentProxyConfig {
@@ -1640,6 +1759,32 @@ mod tests {
             session_max_lifetime_seconds: 8 * 60 * 60,
         });
         assert!(config.validate().is_ok());
+        config.proxy_routes.get_mut("provider").unwrap().websocket = Some(ProxyWebSocketConfig {
+            allowed_origins: vec!["https://app.example.test".into()],
+            allow_missing_origin: false,
+            allowed_subprotocols: vec!["events.v1".into()],
+            max_duration_seconds: 300,
+            max_message_bytes: 1024 * 1024,
+            max_total_bytes: 64 * 1024 * 1024,
+        });
+        assert!(config.validate().is_ok());
+        config
+            .proxy_routes
+            .get_mut("provider")
+            .unwrap()
+            .websocket
+            .as_mut()
+            .unwrap()
+            .allowed_origins = vec!["*".into()];
+        assert!(config.validate().is_err());
+        config
+            .proxy_routes
+            .get_mut("provider")
+            .unwrap()
+            .websocket
+            .as_mut()
+            .unwrap()
+            .allowed_origins = vec!["https://app.example.test".into()];
         config.proxy_tunnels.insert(
             "control-plane".into(),
             ProxyTunnelConfig {

@@ -29,7 +29,7 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
-use futures_util::stream;
+use futures_util::{SinkExt, StreamExt, stream};
 use http_body_util::{BodyExt, Empty};
 use hyper::{
     Request as HyperRequest, Response as HyperResponse, body::Incoming, server::conn::http1,
@@ -43,6 +43,14 @@ use tokio::{
     net::{TcpListener, TcpStream, lookup_host},
     sync::{Mutex, Semaphore},
     time::Instant,
+};
+use tokio_tungstenite::{
+    WebSocketStream,
+    tungstenite::{
+        Message,
+        handshake::derive_accept_key,
+        protocol::{Role, WebSocketConfig},
+    },
 };
 use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use zeroize::Zeroizing;
@@ -68,7 +76,7 @@ use crate::{
     },
     config::{
         AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyInjectionConfig,
-        ProxyResponseMode, ProxyRouteConfig,
+        ProxyResponseMode, ProxyRouteConfig, ProxyWebSocketConfig,
     },
     connector::Connector,
     proxy_ca::ProxyCertificateAuthority,
@@ -88,6 +96,7 @@ struct AppState {
     connector_slots: Arc<Semaphore>,
     api_rate_limiter: ApiRateLimiter,
     proxy_client: reqwest::Client,
+    websocket_client: reqwest::Client,
     store: Option<Store>,
     github_browser_auth: Option<GithubBrowserAuth>,
     transparent_proxy: Option<Arc<TransparentProxyRuntime>>,
@@ -1715,6 +1724,12 @@ pub async fn run(config: Config) -> Result<()> {
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("av-proxy/", env!("CARGO_PKG_VERSION")))
         .build()?;
+    let websocket_client = reqwest::Client::builder()
+        .http1_only()
+        .timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .user_agent(concat!("av-websocket/", env!("CARGO_PKG_VERSION")))
+        .build()?;
     let state = AppState {
         config: Arc::new(config.clone()),
         auth,
@@ -1725,6 +1740,7 @@ pub async fn run(config: Config) -> Result<()> {
             config.api_rate_limit_burst,
         ),
         proxy_client,
+        websocket_client,
         store,
         github_browser_auth,
         transparent_proxy: transparent_proxy.clone(),
@@ -3097,12 +3113,13 @@ async fn serve_transparent_tls_tunnel(
     });
     http1::Builder::new()
         .serve_connection(TokioIo::new(tls), service)
+        .with_upgrades()
         .await
         .context("serve transparent proxy TLS request")
 }
 
 async fn transparent_tunnel_response(
-    request: HyperRequest<Incoming>,
+    mut request: HyperRequest<Incoming>,
     state: AppState,
     route_name: String,
     token_hash: [u8; 32],
@@ -3155,6 +3172,19 @@ async fn transparent_tunnel_response(
             );
         }
     }
+    let websocket_attempt = is_websocket_attempt(request.headers());
+    let websocket_upgrade = if websocket_attempt {
+        let Some(websocket) = &route.websocket else {
+            return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+        };
+        if let Err(error) = validate_websocket_handshake(request.headers(), websocket) {
+            tracing::warn!(%error, route = route_name, "transparent WebSocket handshake denied");
+            return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
+        }
+        Some(hyper::upgrade::on(&mut request))
+    } else {
+        None
+    };
     let (parts, body) = request.into_parts();
     if let Err(error) = enforce_transparent_tunnel_target(route, &parts.uri, &parts.headers) {
         tracing::warn!(%error, route = route_name, "transparent proxy request target denied");
@@ -3177,6 +3207,12 @@ async fn transparent_tunnel_response(
             );
         }
     };
+    if websocket_attempt && !body.is_empty() {
+        return transparent_full_response(
+            StatusCode::FORBIDDEN,
+            "WebSocket upgrade body is forbidden\n",
+        );
+    }
     if let Err(error) = enforce_proxy_content_type(route, &parts.headers, body.len()) {
         tracing::warn!(%error, route = route_name, "transparent proxy content type rejected");
         return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
@@ -3188,17 +3224,34 @@ async fn transparent_tunnel_response(
             return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
         }
     };
-    let response = match proxy_request(
-        &state,
-        route,
-        &normalized_path,
-        &query,
-        parts.method,
-        parts.headers,
-        body,
-    )
-    .await
-    {
+    let response_result = if let Some(client_upgrade) = websocket_upgrade {
+        proxy_websocket_request(
+            &state,
+            route,
+            &normalized_path,
+            &query,
+            parts.method,
+            parts.headers,
+            PendingWebSocketUpgrade {
+                client: client_upgrade,
+                token_hash,
+                session_id: session.session_id.clone(),
+            },
+        )
+        .await
+    } else {
+        proxy_request(
+            &state,
+            route,
+            &normalized_path,
+            &query,
+            parts.method,
+            parts.headers,
+            body,
+        )
+        .await
+    };
+    let response = match response_result {
         Ok(response) => response,
         Err(error) => {
             tracing::warn!(%error, route = route_name, "transparent proxy upstream request failed");
@@ -3313,6 +3366,13 @@ async fn proxy(
     let Some(route) = state.config.proxy_routes.get(&route_name) else {
         return (StatusCode::NOT_FOUND, "proxy route not found\n").into_response();
     };
+    if is_websocket_attempt(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "WebSockets require a transparent proxy session\n",
+        )
+            .into_response();
+    }
     match profile_permitted(&state, &identity.subject, &route.profile, GrantMode::Proxy).await {
         Ok(true) => {}
         Ok(false) => return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response(),
@@ -3395,6 +3455,402 @@ async fn audit_event(
             .await?;
     }
     Ok(())
+}
+
+fn is_websocket_attempt(headers: &HeaderMap) -> bool {
+    [
+        header::UPGRADE,
+        header::SEC_WEBSOCKET_KEY,
+        header::SEC_WEBSOCKET_VERSION,
+        header::SEC_WEBSOCKET_PROTOCOL,
+        header::SEC_WEBSOCKET_EXTENSIONS,
+    ]
+    .iter()
+    .any(|name| headers.contains_key(name))
+        || header_contains_token(headers, header::CONNECTION, "upgrade")
+}
+
+fn validate_websocket_handshake(headers: &HeaderMap, policy: &ProxyWebSocketConfig) -> Result<()> {
+    if !header_contains_token(headers, header::CONNECTION, "upgrade")
+        || !single_header_equals(headers, header::UPGRADE, "websocket")
+        || !single_header_equals(headers, header::SEC_WEBSOCKET_VERSION, "13")
+        || headers.contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
+    {
+        bail!("WebSocket upgrade headers are invalid or extensions were requested");
+    }
+    let key = single_header_text(headers, header::SEC_WEBSOCKET_KEY)?;
+    if !matches!(STANDARD.decode(key.as_bytes()), Ok(decoded) if decoded.len() == 16) {
+        bail!("WebSocket key is invalid");
+    }
+    match single_optional_header_text(headers, header::ORIGIN)? {
+        Some(origin) => {
+            if !policy
+                .allowed_origins
+                .iter()
+                .any(|allowed| allowed == origin)
+            {
+                bail!("WebSocket Origin is not allowed");
+            }
+        }
+        None if !policy.allow_missing_origin => bail!("WebSocket Origin is required"),
+        None => {}
+    }
+    let requested = websocket_subprotocols(headers)?;
+    if requested.iter().any(|protocol| {
+        !policy
+            .allowed_subprotocols
+            .iter()
+            .any(|allowed| allowed == protocol)
+    }) {
+        bail!("WebSocket subprotocol is not allowed");
+    }
+    Ok(())
+}
+
+fn header_contains_token(headers: &HeaderMap, name: HeaderName, expected: &str) -> bool {
+    headers.get_all(name).iter().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            value
+                .split(',')
+                .any(|token| token.trim().eq_ignore_ascii_case(expected))
+        })
+    })
+}
+
+fn single_header_equals(headers: &HeaderMap, name: HeaderName, expected: &str) -> bool {
+    single_header_text(headers, name).is_ok_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
+fn single_header_text(headers: &HeaderMap, name: HeaderName) -> Result<&str> {
+    let values = headers.get_all(name).iter().collect::<Vec<_>>();
+    if values.len() != 1 {
+        bail!("WebSocket header must occur exactly once");
+    }
+    values[0]
+        .to_str()
+        .context("WebSocket header is not valid text")
+}
+
+fn single_optional_header_text(headers: &HeaderMap, name: HeaderName) -> Result<Option<&str>> {
+    let values = headers.get_all(name).iter().collect::<Vec<_>>();
+    match values.as_slice() {
+        [] => Ok(None),
+        [value] => Ok(Some(
+            value
+                .to_str()
+                .context("WebSocket header is not valid text")?,
+        )),
+        _ => bail!("WebSocket header may occur at most once"),
+    }
+}
+
+fn websocket_subprotocols(headers: &HeaderMap) -> Result<Vec<String>> {
+    let Some(value) = single_optional_header_text(headers, header::SEC_WEBSOCKET_PROTOCOL)? else {
+        return Ok(Vec::new());
+    };
+    let mut unique = BTreeSet::new();
+    let mut protocols = Vec::new();
+    for protocol in value.split(',').map(str::trim) {
+        if protocol.is_empty()
+            || !protocol.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#'
+                            | b'$'
+                            | b'%'
+                            | b'&'
+                            | b'\''
+                            | b'*'
+                            | b'+'
+                            | b'-'
+                            | b'.'
+                            | b'^'
+                            | b'_'
+                            | b'`'
+                            | b'|'
+                            | b'~'
+                    )
+            })
+            || !unique.insert(protocol.to_owned())
+        {
+            bail!("WebSocket subprotocol list is invalid");
+        }
+        protocols.push(protocol.to_owned());
+    }
+    Ok(protocols)
+}
+
+async fn proxy_websocket_request(
+    state: &AppState,
+    route: &ProxyRouteConfig,
+    normalized_path: &str,
+    query: &[(String, String)],
+    method: Method,
+    headers: HeaderMap,
+    upgrade: PendingWebSocketUpgrade,
+) -> Result<Response> {
+    let policy = route
+        .websocket
+        .clone()
+        .context("WebSockets are not enabled for this route")?;
+    if method != Method::GET {
+        bail!("WebSocket upgrade requires GET");
+    }
+    validate_websocket_handshake(&headers, &policy)?;
+    let profile = state
+        .config
+        .profiles
+        .get(&route.profile)
+        .context("proxy profile disappeared")?;
+    let secrets = fetch_secrets(state, profile).await?;
+    let (injection_name, injection_value, sensitive_values) =
+        build_proxy_injection(route, &secrets)?;
+    let mut target =
+        url::Url::parse(&route.base_url).context("proxy route base URL disappeared")?;
+    let target_path = format!("{}{}", target.path().trim_end_matches('/'), normalized_path);
+    target.set_path(&target_path);
+    target.set_query(None);
+    if !query.is_empty() {
+        target.query_pairs_mut().extend_pairs(query);
+    }
+
+    let mut outbound_headers = HeaderMap::new();
+    for configured in &route.allowed_request_headers {
+        let name = HeaderName::from_bytes(configured.as_bytes())?;
+        if let Some(value) = headers.get(&name) {
+            outbound_headers.insert(name, value.clone());
+        }
+    }
+    for name in [
+        header::ORIGIN,
+        header::SEC_WEBSOCKET_KEY,
+        header::SEC_WEBSOCKET_VERSION,
+        header::SEC_WEBSOCKET_PROTOCOL,
+    ] {
+        if let Some(value) = headers.get(&name) {
+            outbound_headers.insert(name, value.clone());
+        }
+    }
+    outbound_headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
+    outbound_headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
+    outbound_headers.remove(&injection_name);
+    outbound_headers.insert(injection_name, injection_value);
+
+    let upstream = state
+        .websocket_client
+        .request(method, target)
+        .headers(outbound_headers)
+        .send()
+        .await?;
+    if upstream.status() != StatusCode::SWITCHING_PROTOCOLS
+        || !header_contains_token(upstream.headers(), header::CONNECTION, "upgrade")
+        || !single_header_equals(upstream.headers(), header::UPGRADE, "websocket")
+        || upstream
+            .headers()
+            .contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
+    {
+        bail!("upstream rejected or returned an unsafe WebSocket upgrade");
+    }
+    let request_key = single_header_text(&headers, header::SEC_WEBSOCKET_KEY)?;
+    let expected_accept = derive_accept_key(request_key.as_bytes());
+    if single_header_text(upstream.headers(), header::SEC_WEBSOCKET_ACCEPT)? != expected_accept {
+        bail!("upstream returned an invalid WebSocket accept value");
+    }
+    let requested_protocols = websocket_subprotocols(&headers)?;
+    let selected_protocol =
+        single_optional_header_text(upstream.headers(), header::SEC_WEBSOCKET_PROTOCOL)?
+            .map(str::to_owned);
+    if selected_protocol.as_ref().is_some_and(|selected| {
+        !requested_protocols
+            .iter()
+            .any(|requested| requested == selected)
+            || !policy
+                .allowed_subprotocols
+                .iter()
+                .any(|allowed| allowed == selected)
+    }) {
+        bail!("upstream selected an unrequested WebSocket subprotocol");
+    }
+    let upstream_upgrade = upstream.upgrade().await?;
+    let session = WebSocketSessionContext {
+        state: state.clone(),
+        token_hash: upgrade.token_hash,
+        session_id: upgrade.session_id,
+        profile: route.profile.clone(),
+        policy,
+        sensitive_values,
+    };
+    tokio::spawn(async move {
+        let result = async {
+            let client = upgrade.client.await.context("upgrade WebSocket client")?;
+            relay_websocket_session(client, upstream_upgrade, session).await
+        }
+        .await;
+        if let Err(error) = result {
+            tracing::debug!(%error, "transparent WebSocket session ended");
+        }
+    });
+
+    let mut response = Response::builder()
+        .status(StatusCode::SWITCHING_PROTOCOLS)
+        .header(header::CONNECTION, "Upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(header::SEC_WEBSOCKET_ACCEPT, expected_accept);
+    if let Some(protocol) = selected_protocol {
+        response = response.header(header::SEC_WEBSOCKET_PROTOCOL, protocol);
+    }
+    Ok(response.body(axum::body::Body::empty())?)
+}
+
+struct PendingWebSocketUpgrade {
+    client: hyper::upgrade::OnUpgrade,
+    token_hash: [u8; 32],
+    session_id: String,
+}
+
+struct WebSocketSessionContext {
+    state: AppState,
+    token_hash: [u8; 32],
+    session_id: String,
+    profile: String,
+    policy: ProxyWebSocketConfig,
+    sensitive_values: Vec<Vec<u8>>,
+}
+
+async fn relay_websocket_session(
+    client: hyper::upgrade::Upgraded,
+    upstream: reqwest::Upgraded,
+    session: WebSocketSessionContext,
+) -> Result<()> {
+    relay_websocket_streams(TokioIo::new(client), upstream, session).await
+}
+
+async fn relay_websocket_streams(
+    client: impl AsyncRead + AsyncWrite + Unpin,
+    upstream: impl AsyncRead + AsyncWrite + Unpin,
+    session: WebSocketSessionContext,
+) -> Result<()> {
+    let WebSocketSessionContext {
+        state,
+        token_hash,
+        session_id,
+        profile,
+        policy,
+        sensitive_values,
+    } = session;
+    let websocket_config = WebSocketConfig::default()
+        .write_buffer_size(0)
+        .max_write_buffer_size(policy.max_message_bytes.saturating_add(1024))
+        .max_message_size(Some(policy.max_message_bytes))
+        .max_frame_size(Some(policy.max_message_bytes));
+    let mut client =
+        WebSocketStream::from_raw_socket(client, Role::Server, Some(websocket_config)).await;
+    let mut upstream =
+        WebSocketStream::from_raw_socket(upstream, Role::Client, Some(websocket_config)).await;
+    let deadline = tokio::time::sleep(Duration::from_secs(policy.max_duration_seconds));
+    tokio::pin!(deadline);
+    let mut session_check = tokio::time::interval(Duration::from_secs(1));
+    session_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut total_bytes = 0_u64;
+
+    loop {
+        tokio::select! {
+            _ = &mut deadline => bail!("WebSocket lifetime limit reached"),
+            _ = session_check.tick() => {
+                if !websocket_session_is_active(&state, &token_hash, &session_id, &profile).await? {
+                    bail!("WebSocket session was revoked, expired, or lost its grant");
+                }
+            }
+            incoming = client.next() => {
+                let Some(message) = incoming else {
+                    return Ok(());
+                };
+                let message = message.context("read caller WebSocket message")?;
+                total_bytes = total_bytes.saturating_add(message.len() as u64);
+                if total_bytes > policy.max_total_bytes {
+                    bail!("WebSocket byte limit reached");
+                }
+                let closed = message.is_close();
+                let message = redact_websocket_message(message, &sensitive_values)?;
+                tokio::time::timeout(Duration::from_secs(5), upstream.send(message))
+                    .await
+                    .context("upstream WebSocket write timed out")??;
+                if closed {
+                    return Ok(());
+                }
+            }
+            incoming = upstream.next() => {
+                let Some(message) = incoming else {
+                    return Ok(());
+                };
+                let message = message.context("read upstream WebSocket message")?;
+                total_bytes = total_bytes.saturating_add(message.len() as u64);
+                if total_bytes > policy.max_total_bytes {
+                    bail!("WebSocket byte limit reached");
+                }
+                let closed = message.is_close();
+                let message = redact_websocket_message(message, &sensitive_values)?;
+                tokio::time::timeout(Duration::from_secs(5), client.send(message))
+                    .await
+                    .context("caller WebSocket write timed out")??;
+                if closed {
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+async fn websocket_session_is_active(
+    state: &AppState,
+    token_hash: &[u8; 32],
+    session_id: &str,
+    profile: &str,
+) -> Result<bool> {
+    let store = state
+        .store
+        .as_ref()
+        .context("managed proxy sessions are required")?;
+    let Some(session) = store.active_proxy_session(token_hash).await? else {
+        return Ok(false);
+    };
+    if session.session_id != session_id || session.profile != profile {
+        return Ok(false);
+    }
+    profile_permitted(state, &session.subject, profile, GrantMode::Proxy).await
+}
+
+fn redact_websocket_message(message: Message, sensitive_values: &[Vec<u8>]) -> Result<Message> {
+    Ok(match message {
+        Message::Text(value) => Message::Text(
+            String::from_utf8(redact_secrets(value.as_bytes(), sensitive_values))?.into(),
+        ),
+        Message::Binary(value) => {
+            Message::Binary(Bytes::from(redact_secrets(&value, sensitive_values)))
+        }
+        Message::Ping(value) => {
+            Message::Ping(Bytes::from(redact_secrets(&value, sensitive_values)))
+        }
+        Message::Pong(value) => {
+            Message::Pong(Bytes::from(redact_secrets(&value, sensitive_values)))
+        }
+        Message::Close(frame) => Message::Close(
+            frame
+                .map(|frame| {
+                    let reason = String::from_utf8(redact_secrets(
+                        frame.reason.as_bytes(),
+                        sensitive_values,
+                    ))?;
+                    Ok::<_, anyhow::Error>(tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: frame.code,
+                        reason: reason.into(),
+                    })
+                })
+                .transpose()?,
+        ),
+        Message::Frame(_) => bail!("raw WebSocket frames are not supported"),
+    })
 }
 
 async fn proxy_request(
@@ -4032,6 +4488,7 @@ mod tests {
             max_body_bytes: 1024,
             response_mode: crate::config::ProxyResponseMode::Buffered,
             max_response_bytes: 4 * 1024 * 1024,
+            websocket: None,
         }
     }
 
@@ -4167,6 +4624,7 @@ mod tests {
             connector_slots: Arc::new(Semaphore::new(1)),
             api_rate_limiter: ApiRateLimiter::new(10, 10),
             proxy_client: reqwest::Client::builder().build().unwrap(),
+            websocket_client: reqwest::Client::builder().http1_only().build().unwrap(),
             store: Some(store.clone()),
             github_browser_auth: None,
             transparent_proxy: None,
@@ -4460,6 +4918,133 @@ mod tests {
         assert!(denied_response.starts_with(b"HTTP/1.1 403"));
         drop(denied_tunnel);
         denied_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn transparent_websocket_injects_redacts_and_stops_when_grant_is_revoked() {
+        let (mut state, mut runtime, store, token, proxy_ca_der) = transparent_test_context().await;
+        let mut config = (*state.config).clone();
+        let route = config.proxy_routes.get_mut("provider").unwrap();
+        route.websocket = Some(websocket_policy());
+        state.config = Arc::new(config);
+        Arc::get_mut(&mut runtime).unwrap().catalog =
+            TransparentRouteCatalog::from_config(&state.config.proxy_routes, &BTreeMap::new())
+                .unwrap();
+
+        let secrets_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secrets_address = secrets_listener.local_addr().unwrap();
+        let secret_file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(secret_file.path(), "connector-test-token\n").unwrap();
+        let connector_config: ConnectorConfig = serde_json::from_value(serde_json::json!({
+            "base_url": format!("http://{secrets_address}"),
+            "auth": {"type": "token", "token_file": secret_file.path()},
+        }))
+        .unwrap();
+        let connector = Connector::new(connector_config, true).await.unwrap();
+        state.connectors = Arc::new(BTreeMap::from([("unused".to_owned(), connector)]));
+        let secrets_task = tokio::spawn(async move {
+            let (mut stream, _) = secrets_listener.accept().await.unwrap();
+            let _request = read_test_http_header(&mut stream).await;
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 76\r\nConnection: close\r\n\r\n{\"secrets\":[{\"secretKey\":\"API_TOKEN\",\"secretValue\":\"upstream-test-secret\"}]}" )
+                .await
+                .unwrap();
+        });
+
+        let upstream_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let upstream_address = upstream_listener.local_addr().unwrap();
+        let (upstream_config, upstream_ca_der) = test_upstream_tls_config();
+        state.proxy_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(reqwest::Certificate::from_der(&upstream_ca_der).unwrap())
+            .resolve("api.example.com", upstream_address)
+            .build()
+            .unwrap();
+        state.websocket_client = reqwest::Client::builder()
+            .http1_only()
+            .timeout(Duration::from_secs(10))
+            .redirect(reqwest::redirect::Policy::none())
+            .add_root_certificate(reqwest::Certificate::from_der(&upstream_ca_der).unwrap())
+            .resolve("api.example.com", upstream_address)
+            .build()
+            .unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let (stream, _) = upstream_listener.accept().await.unwrap();
+            let mut stream = TlsAcceptor::from(Arc::new(upstream_config))
+                .accept(stream)
+                .await
+                .unwrap();
+            let request = read_test_http_header(&mut stream).await;
+            let request_text = String::from_utf8(request).unwrap();
+            let request_lower = request_text.to_ascii_lowercase();
+            assert!(request_text.starts_with("GET /v1/socket HTTP/1.1\r\n"));
+            assert!(request_lower.contains("authorization: bearer upstream-test-secret\r\n"));
+            assert!(request_lower.contains("origin: https://app.example.test\r\n"));
+            assert!(request_lower.contains("sec-websocket-protocol: events.v1\r\n"));
+            let accept = derive_accept_key(b"dGhlIHNhbXBsZSBub25jZQ==");
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Accept: {accept}\r\nSec-WebSocket-Protocol: events.v1\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut socket = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+            assert_eq!(
+                socket.next().await.unwrap().unwrap(),
+                Message::text("caller hello")
+            );
+            socket
+                .send(Message::text("upstream-test-secret from provider"))
+                .await
+                .unwrap();
+            let _ = socket.next().await;
+        });
+
+        let (mut proxy, proxy_task) =
+            serve_one_transparent_connection(state.clone(), runtime).await;
+        assert!(
+            raw_connect(&mut proxy, "api.example.com:443", &token)
+                .await
+                .starts_with(b"HTTP/1.1 200")
+        );
+        let mut proxy_roots = RootCertStore::empty();
+        proxy_roots.add(CertificateDer::from(proxy_ca_der)).unwrap();
+        let tls = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(proxy_roots)
+                .with_no_client_auth(),
+        ));
+        let mut tunnel = tls
+            .connect(ServerName::try_from("api.example.com").unwrap(), proxy)
+            .await
+            .unwrap();
+        const RFC_WEBSOCKET_REQUEST: &[u8] = b"GET /v1/socket HTTP/1.1\r\nHost: api.example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: events.v1\r\nOrigin: https://app.example.test\r\n\r\n"; // gitleaks:allow -- RFC 6455 public example nonce
+        tunnel.write_all(RFC_WEBSOCKET_REQUEST).await.unwrap();
+        let response = read_test_http_header(&mut tunnel).await;
+        assert!(response.starts_with(b"HTTP/1.1 101"));
+        let mut socket = WebSocketStream::from_raw_socket(tunnel, Role::Client, None).await;
+        socket.send(Message::text("caller hello")).await.unwrap();
+        assert_eq!(
+            socket.next().await.unwrap().unwrap(),
+            Message::text("[REDACTED] from provider")
+        );
+
+        store
+            .revoke_profile("basic:operator", "infra")
+            .await
+            .unwrap();
+        let closed = tokio::time::timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("WebSocket remained open after grant revocation");
+        assert!(closed.is_none() || closed.is_some_and(|result| result.is_err()));
+
+        proxy_task.await.unwrap().unwrap();
+        upstream_task.await.unwrap();
+        secrets_task.await.unwrap();
     }
 
     #[tokio::test]
@@ -5099,6 +5684,156 @@ mod tests {
         assert!(apply_body_substitutions(&route, &secrets, b"missing").is_err());
         assert!(
             apply_body_substitutions(&route, &secrets, b"__AV_SECRET_TOKEN____AV_SECRET_TOKEN__")
+                .is_err()
+        );
+    }
+
+    fn websocket_policy() -> ProxyWebSocketConfig {
+        ProxyWebSocketConfig {
+            allowed_origins: vec!["https://app.example.test".into()],
+            allow_missing_origin: false,
+            allowed_subprotocols: vec!["events.v1".into()],
+            max_duration_seconds: 60,
+            max_message_bytes: 1024,
+            max_total_bytes: 4096,
+        }
+    }
+
+    fn websocket_headers() -> HeaderMap {
+        HeaderMap::from_iter([
+            (
+                header::CONNECTION,
+                HeaderValue::from_static("keep-alive, Upgrade"),
+            ),
+            (header::UPGRADE, HeaderValue::from_static("websocket")),
+            (
+                header::SEC_WEBSOCKET_VERSION,
+                HeaderValue::from_static("13"),
+            ),
+            (
+                header::SEC_WEBSOCKET_KEY,
+                HeaderValue::from_static("dGhlIHNhbXBsZSBub25jZQ=="),
+            ),
+            (
+                header::SEC_WEBSOCKET_PROTOCOL,
+                HeaderValue::from_static("events.v1"),
+            ),
+            (
+                header::ORIGIN,
+                HeaderValue::from_static("https://app.example.test"),
+            ),
+        ])
+    }
+
+    #[test]
+    fn websocket_handshake_is_explicit_and_rejects_extensions_or_untrusted_origins() {
+        let policy = websocket_policy();
+        let mut headers = websocket_headers();
+        assert!(validate_websocket_handshake(&headers, &policy).is_ok());
+        headers.insert(
+            header::SEC_WEBSOCKET_EXTENSIONS,
+            HeaderValue::from_static("permessage-deflate"),
+        );
+        assert!(validate_websocket_handshake(&headers, &policy).is_err());
+        headers.remove(header::SEC_WEBSOCKET_EXTENSIONS);
+        headers.insert(
+            header::ORIGIN,
+            HeaderValue::from_static("https://hostile.example"),
+        );
+        assert!(validate_websocket_handshake(&headers, &policy).is_err());
+    }
+
+    #[tokio::test]
+    async fn websocket_relay_redacts_both_directions_and_stops_on_revocation() {
+        let (state, _runtime, store, token, _ca_der) = transparent_test_context().await;
+        let token_hash = proxy_session_token_hash(token.as_bytes());
+        let session = store
+            .active_proxy_session(&token_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let (caller_io, relay_client) = tokio::io::duplex(4096);
+        let (relay_upstream, provider_io) = tokio::io::duplex(4096);
+        let relay = tokio::spawn(relay_websocket_streams(
+            relay_client,
+            relay_upstream,
+            WebSocketSessionContext {
+                state,
+                token_hash,
+                session_id: session.session_id.clone(),
+                profile: session.profile.clone(),
+                policy: websocket_policy(),
+                sensitive_values: vec![b"provider-secret".to_vec()],
+            },
+        ));
+        let mut caller = WebSocketStream::from_raw_socket(caller_io, Role::Client, None).await;
+        let mut provider = WebSocketStream::from_raw_socket(provider_io, Role::Server, None).await;
+
+        provider
+            .send(Message::text("provider-secret from upstream"))
+            .await
+            .unwrap();
+        assert_eq!(
+            caller.next().await.unwrap().unwrap(),
+            Message::text("[REDACTED] from upstream")
+        );
+        caller
+            .send(Message::binary(b"caller provider-secret".as_slice()))
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.next().await.unwrap().unwrap(),
+            Message::binary(b"caller [REDACTED]".as_slice())
+        );
+
+        assert!(
+            store
+                .revoke_proxy_session(&session.session_id)
+                .await
+                .unwrap()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), relay)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn websocket_relay_enforces_the_bidirectional_byte_ceiling() {
+        let (state, _runtime, store, token, _ca_der) = transparent_test_context().await;
+        let token_hash = proxy_session_token_hash(token.as_bytes());
+        let session = store
+            .active_proxy_session(&token_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let (caller_io, relay_client) = tokio::io::duplex(4096);
+        let (relay_upstream, provider_io) = tokio::io::duplex(4096);
+        let mut policy = websocket_policy();
+        policy.max_total_bytes = 4;
+        let relay = tokio::spawn(relay_websocket_streams(
+            relay_client,
+            relay_upstream,
+            WebSocketSessionContext {
+                state,
+                token_hash,
+                session_id: session.session_id,
+                profile: session.profile,
+                policy,
+                sensitive_values: vec![b"provider-secret".to_vec()],
+            },
+        ));
+        let mut caller = WebSocketStream::from_raw_socket(caller_io, Role::Client, None).await;
+        let _provider = WebSocketStream::from_raw_socket(provider_io, Role::Server, None).await;
+        caller.send(Message::text("12345")).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), relay)
+                .await
+                .unwrap()
+                .unwrap()
                 .is_err()
         );
     }

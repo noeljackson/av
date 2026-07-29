@@ -276,6 +276,7 @@ mod tests {
             max_body_bytes: 1024,
             response_mode: crate::config::ProxyResponseMode::Buffered,
             max_response_bytes: 4 * 1024 * 1024,
+            websocket: None,
         }
     }
 

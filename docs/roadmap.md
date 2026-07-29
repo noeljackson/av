@@ -13,7 +13,7 @@ has its own acceptance criteria and implementation history:
 | --- | --- | --- |
 | Backend contract and Google Secret Manager | [#13](https://github.com/noeljackson/av/issues/13) | Implemented; live Workload Identity Federation validation remains |
 | Named agents and explicit RBAC grants | [#17](https://github.com/noeljackson/av/issues/17) | Implemented and covered by SQLite, PostgreSQL, CLI, and browser tests |
-| Proxy parity | [#16](https://github.com/noeljackson/av/issues/16) | In progress: exact tunnels [#18](https://github.com/noeljackson/av/issues/18), sessions [#19](https://github.com/noeljackson/av/issues/19), and streaming/typed injection implemented; WebSockets remain in [#20](https://github.com/noeljackson/av/issues/20) |
+| Proxy parity | [#16](https://github.com/noeljackson/av/issues/16) | In progress: exact tunnels [#18](https://github.com/noeljackson/av/issues/18); sessions [#19](https://github.com/noeljackson/av/issues/19) and streaming/typed injection/WebSockets [#20](https://github.com/noeljackson/av/issues/20) are implemented |
 | OpenBao and Infisical dynamic leases | [#14](https://github.com/noeljackson/av/issues/14) | Planned |
 | Production hardening, isolation, and deployment | [#15](https://github.com/noeljackson/av/issues/15) | Planned |
 

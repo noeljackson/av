@@ -61,6 +61,9 @@ deployment CA, a private listener, and workload egress enforcement. Use
 `av run <profile> -- codex` or `av run <profile> -- claude`; never set a remote
 AV listener directly as a child's `HTTPS_PROXY`. The complete deployment and
 security contract is in [transparent proxy design](docs/transparent-proxy-design.md).
+WebSocket upgrades remain denied unless the route declares exact
+Origin/subprotocol policy plus message, byte, and lifetime limits; live grants
+and sessions remain enforced after the upgrade.
 The stable product boundaries and active implementation sequence are tracked in
 the [roadmap](docs/roadmap.md).
 
