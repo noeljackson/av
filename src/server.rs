@@ -67,8 +67,8 @@ use crate::{
         Status as RpcStatus, UpsertBasicUserRequest,
     },
     config::{
-        AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyResponseMode,
-        ProxyRouteConfig,
+        AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyInjectionConfig,
+        ProxyResponseMode, ProxyRouteConfig,
     },
     connector::Connector,
     proxy_ca::ProxyCertificateAuthority,
@@ -3412,9 +3412,10 @@ async fn proxy_request(
         .get(&route.profile)
         .context("proxy profile disappeared")?;
     let secrets = fetch_secrets(state, profile).await?;
-    let secret = secrets
-        .get(&route.secret_key)
-        .context("proxy credential is unavailable")?;
+    let (injection_name, injection_value, mut sensitive_values) =
+        build_proxy_injection(route, &secrets)?;
+    let (body, body_sensitive_values) = apply_body_substitutions(route, &secrets, &body)?;
+    sensitive_values.extend(body_sensitive_values);
     let mut target =
         url::Url::parse(&route.base_url).context("proxy route base URL disappeared")?;
     let target_path = format!("{}{}", target.path().trim_end_matches('/'), normalized_path);
@@ -3430,10 +3431,7 @@ async fn proxy_request(
             outbound_headers.insert(name, value.clone());
         }
     }
-    let injection_name = HeaderName::from_bytes(route.header.as_bytes())?;
     outbound_headers.remove(&injection_name);
-    let mut injection_value = HeaderValue::from_str(&format!("{}{}", route.header_prefix, secret))?;
-    injection_value.set_sensitive(true);
     outbound_headers.insert(injection_name, injection_value);
     let mut upstream = state
         .proxy_client
@@ -3454,7 +3452,7 @@ async fn proxy_request(
     for configured in &route.allowed_response_headers {
         let name = HeaderName::from_bytes(configured.as_bytes())?;
         if let Some(value) = upstream_headers.get(&name)
-            && let Some(value) = redact_header(value, secret.as_bytes())
+            && let Some(value) = redact_header(value, &sensitive_values)
         {
             response = response.header(name, value);
         }
@@ -3468,12 +3466,12 @@ async fn proxy_request(
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            let bytes = redact(&bytes, secret.as_bytes());
+            let bytes = redact_secrets(&bytes, &sensitive_values);
             Ok(response.body(axum::body::Body::from(bytes))?)
         }
         ProxyResponseMode::Streaming => {
             let maximum = route.max_response_bytes;
-            let redactor = StreamingRedactor::new(secret.as_bytes());
+            let redactor = StreamingRedactor::new_multiple(&sensitive_values);
             let body_stream = stream::try_unfold(
                 (upstream, redactor, 0_usize, false),
                 move |(mut upstream, mut redactor, mut total, finished)| async move {
@@ -3514,6 +3512,106 @@ async fn proxy_request(
             Ok(response.body(axum::body::Body::from_stream(body_stream))?)
         }
     }
+}
+
+fn build_proxy_injection(
+    route: &ProxyRouteConfig,
+    secrets: &BTreeMap<String, String>,
+) -> Result<(HeaderName, HeaderValue, Vec<Vec<u8>>)> {
+    let (name, value, mut sensitive_values) = match &route.injection {
+        None => {
+            let secret = secrets
+                .get(&route.secret_key)
+                .context("proxy credential is unavailable")?;
+            (
+                route.header.as_str(),
+                format!("{}{}", route.header_prefix, secret),
+                vec![secret.as_bytes().to_vec()],
+            )
+        }
+        Some(ProxyInjectionConfig::Bearer { secret_key }) => {
+            let secret = secrets
+                .get(secret_key)
+                .context("proxy bearer credential is unavailable")?;
+            (
+                "authorization",
+                format!("Bearer {secret}"),
+                vec![secret.as_bytes().to_vec()],
+            )
+        }
+        Some(ProxyInjectionConfig::Header {
+            secret_key,
+            header,
+            prefix,
+        }) => {
+            let secret = secrets
+                .get(secret_key)
+                .context("proxy header credential is unavailable")?;
+            (
+                header.as_str(),
+                format!("{prefix}{secret}"),
+                vec![secret.as_bytes().to_vec()],
+            )
+        }
+        Some(ProxyInjectionConfig::Basic {
+            username,
+            password_secret_key,
+        }) => {
+            let password = secrets
+                .get(password_secret_key)
+                .context("proxy basic password is unavailable")?;
+            let pair = format!("{username}:{password}");
+            let value = format!("Basic {}", STANDARD.encode(pair.as_bytes()));
+            (
+                "authorization",
+                value,
+                vec![password.as_bytes().to_vec(), pair.into_bytes()],
+            )
+        }
+    };
+    sensitive_values.push(value.as_bytes().to_vec());
+    let name = HeaderName::from_bytes(name.as_bytes())?;
+    let mut value = HeaderValue::from_str(&value)?;
+    value.set_sensitive(true);
+    Ok((name, value, sensitive_values))
+}
+
+fn apply_body_substitutions(
+    route: &ProxyRouteConfig,
+    secrets: &BTreeMap<String, String>,
+    body: &[u8],
+) -> Result<(Bytes, Vec<Vec<u8>>)> {
+    let mut output = body.to_vec();
+    let mut sensitive_values = Vec::with_capacity(route.body_substitutions.len());
+    for (placeholder, secret_key) in &route.body_substitutions {
+        let secret = secrets
+            .get(secret_key)
+            .with_context(|| format!("body substitution secret {secret_key} is unavailable"))?;
+        let occurrences = output
+            .windows(placeholder.len())
+            .filter(|window| *window == placeholder.as_bytes())
+            .count();
+        if occurrences != 1 {
+            bail!("body placeholder must appear exactly once");
+        }
+        let position = output
+            .windows(placeholder.len())
+            .position(|window| window == placeholder.as_bytes())
+            .context("body placeholder disappeared")?;
+        let resulting_length = output
+            .len()
+            .saturating_sub(placeholder.len())
+            .saturating_add(secret.len());
+        if resulting_length > route.max_body_bytes {
+            bail!("substituted request body is too large");
+        }
+        output.splice(
+            position..position + placeholder.len(),
+            secret.as_bytes().iter().copied(),
+        );
+        sensitive_values.push(secret.as_bytes().to_vec());
+    }
+    Ok((Bytes::from(output), sensitive_values))
 }
 
 fn enforce_proxy_policy(route: &ProxyRouteConfig, path: &str, method: &Method) -> Result<String> {
@@ -3708,11 +3806,19 @@ struct StreamingRedactor {
 }
 
 impl StreamingRedactor {
+    #[cfg(test)]
     fn new(secret: &[u8]) -> Self {
-        let patterns = credential_encodings(secret)
-            .into_iter()
+        Self::new_multiple(&[secret.to_vec()])
+    }
+
+    fn new_multiple(secrets: &[Vec<u8>]) -> Self {
+        let mut patterns = secrets
+            .iter()
+            .flat_map(|secret| credential_encodings(secret))
             .filter(|pattern| !pattern.is_empty())
             .collect::<Vec<_>>();
+        patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
+        patterns.dedup();
         let maximum_pattern_length = patterns.iter().map(Vec::len).max().unwrap_or(1);
         Self {
             pending: Vec::new(),
@@ -3758,10 +3864,21 @@ impl StreamingRedactor {
     }
 }
 
+#[cfg(test)]
 fn redact(body: &[u8], secret: &[u8]) -> Vec<u8> {
+    redact_secrets(body, &[secret.to_vec()])
+}
+
+fn redact_secrets(body: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
     let mut output = body.to_vec();
-    for encoding in credential_encodings(secret) {
-        output = redact_exact(&output, &encoding);
+    let mut patterns = secrets
+        .iter()
+        .flat_map(|secret| credential_encodings(secret))
+        .collect::<Vec<_>>();
+    patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
+    patterns.dedup();
+    for pattern in patterns {
+        output = redact_exact(&output, &pattern);
     }
     output
 }
@@ -3821,8 +3938,8 @@ fn lowercase_percent_hex(value: &str) -> String {
     String::from_utf8(bytes).expect("percent encoding is ASCII")
 }
 
-fn redact_header(value: &HeaderValue, secret: &[u8]) -> Option<HeaderValue> {
-    let redacted = redact(value.as_bytes(), secret);
+fn redact_header(value: &HeaderValue, secrets: &[Vec<u8>]) -> Option<HeaderValue> {
+    let redacted = redact_secrets(value.as_bytes(), secrets);
     HeaderValue::from_bytes(&redacted).ok()
 }
 
@@ -3904,6 +4021,8 @@ mod tests {
             secret_key: "API_TOKEN".into(),
             header: "Authorization".into(),
             header_prefix: "Bearer ".into(),
+            injection: None,
+            body_substitutions: BTreeMap::new(),
             allowed_methods: methods.iter().map(|value| (*value).into()).collect(),
             allowed_path_prefixes: prefixes.iter().map(|value| (*value).into()).collect(),
             allowed_request_headers: vec!["accept".into(), "content-type".into()],
@@ -4939,5 +5058,48 @@ mod tests {
             HeaderValue::from_static("application/json; charset=utf-8"),
         );
         assert!(enforce_proxy_content_type(&route, &headers, 1).is_ok());
+    }
+
+    #[test]
+    fn typed_proxy_injection_constructs_credentials_inside_av() {
+        let secrets = BTreeMap::from([("API_TOKEN".into(), "secret+value".into())]);
+        let mut route = proxy_route(&["POST"], &["/"]);
+        route.secret_key.clear();
+        route.header.clear();
+        route.header_prefix.clear();
+        route.injection = Some(ProxyInjectionConfig::Basic {
+            username: "service-user".into(),
+            password_secret_key: "API_TOKEN".into(),
+        });
+        let (name, value, sensitive) = build_proxy_injection(&route, &secrets).unwrap();
+        assert_eq!(name, header::AUTHORIZATION);
+        assert_eq!(
+            value,
+            HeaderValue::from_static("Basic c2VydmljZS11c2VyOnNlY3JldCt2YWx1ZQ==")
+        );
+        let reflected = redact_secrets(value.as_bytes(), &sensitive);
+        assert_eq!(reflected, b"[REDACTED]");
+    }
+
+    #[test]
+    fn body_substitution_requires_every_placeholder_exactly_once() {
+        let secrets = BTreeMap::from([("API_TOKEN".into(), "secret+value".into())]);
+        let mut route = proxy_route(&["POST"], &["/"]);
+        route
+            .body_substitutions
+            .insert("__AV_SECRET_TOKEN__".into(), "API_TOKEN".into());
+        let (body, sensitive) =
+            apply_body_substitutions(&route, &secrets, br#"{"token":"__AV_SECRET_TOKEN__"}"#)
+                .unwrap();
+        assert_eq!(body, r#"{"token":"secret+value"}"#);
+        assert_eq!(
+            redact_secrets(&body, &sensitive),
+            br#"{"token":"[REDACTED]"}"#
+        );
+        assert!(apply_body_substitutions(&route, &secrets, b"missing").is_err());
+        assert!(
+            apply_body_substitutions(&route, &secrets, b"__AV_SECRET_TOKEN____AV_SECRET_TOKEN__")
+                .is_err()
+        );
     }
 }

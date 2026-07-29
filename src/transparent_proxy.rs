@@ -265,6 +265,8 @@ mod tests {
             secret_key: "TOKEN".into(),
             header: "Authorization".into(),
             header_prefix: "Bearer ".into(),
+            injection: None,
+            body_substitutions: BTreeMap::new(),
             allowed_methods: vec!["GET".into()],
             allowed_path_prefixes: vec!["/v1/".into()],
             allowed_request_headers: vec![],

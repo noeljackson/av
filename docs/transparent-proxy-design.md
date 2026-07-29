@@ -185,7 +185,10 @@ creating a free-form "service" database. Each policy entry must contain:
 
 - the exact HTTPS origin and hostname;
 - one profile whose grant permits use of the service;
-- the credential key and a fixed injection location;
+- one fixed typed injection mode: Bearer, constrained `Authorization`/`X-*`
+  header, or Basic with a configured username and backend-sourced password;
+- optionally, exact one-use `__AV_SECRET_NAME__` request-body placeholders
+  mapped to backend keys;
 - allowed methods and canonical path prefixes;
 - explicit query, request-header, response-header, content-type, and body-size
   allowlists;
@@ -201,6 +204,14 @@ overwrites the caller's `Authorization`; it never appends a second value.
 Only routes whose fixed origin is standard HTTPS on port 443 are eligible for
 transparent interception. Other explicit named routes remain usable through
 `/v1/proxy/<route>/...` but are absent from the CONNECT destination catalog.
+
+Typed injection is intentionally small. AV constructs the wire value itself and
+never accepts the username, header name, prefix, or credential key from the
+proxied request. Body substitution is exact and bounded: every declared
+placeholder must occur once, undeclared placeholders have no meaning, the
+content type must be allowlisted, and the substituted result must remain under
+`max_body_bytes`. Both header and body credential values feed the response
+redactor.
 
 Streaming is opt-in per route with `response_mode: "streaming"` and a bounded
 `max_response_bytes`. AV begins forwarding ordinary and `text/event-stream`

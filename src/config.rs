@@ -330,10 +330,21 @@ pub struct ProfileExportConfig {
 pub struct ProxyRouteConfig {
     pub profile: String,
     pub base_url: String,
+    /// Legacy header injection fields. New configuration should use the typed
+    /// `injection` block; mixing both forms is rejected.
+    #[serde(default)]
     pub secret_key: String,
+    #[serde(default)]
     pub header: String,
     #[serde(default)]
     pub header_prefix: String,
+    #[serde(default)]
+    pub injection: Option<ProxyInjectionConfig>,
+    /// Exact one-use request-body placeholders mapped to profile secret keys.
+    /// Substitution is bounded by max_body_bytes and never acts as a template
+    /// language.
+    #[serde(default)]
+    pub body_substitutions: BTreeMap<String, String>,
     #[serde(default)]
     pub allowed_methods: Vec<String>,
     #[serde(default)]
@@ -352,6 +363,24 @@ pub struct ProxyRouteConfig {
     pub response_mode: ProxyResponseMode,
     #[serde(default = "default_proxy_max_response_bytes")]
     pub max_response_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProxyInjectionConfig {
+    Bearer {
+        secret_key: String,
+    },
+    Header {
+        secret_key: String,
+        header: String,
+        #[serde(default)]
+        prefix: String,
+    },
+    Basic {
+        username: String,
+        password_secret_key: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
@@ -733,19 +762,78 @@ impl Config {
             }) {
                 bail!("proxy route {name} contains an unsafe path prefix");
             }
-            if !route.header.eq_ignore_ascii_case("authorization")
-                && !route.header.to_ascii_lowercase().starts_with("x-")
+            let (injection_header, injection_secret_keys): (&str, Vec<&str>) = match &route
+                .injection
+            {
+                None => {
+                    if route.secret_key.is_empty() || route.header.is_empty() {
+                        bail!("proxy route {name} legacy injection requires secret_key and header");
+                    }
+                    (route.header.as_str(), vec![route.secret_key.as_str()])
+                }
+                Some(ProxyInjectionConfig::Bearer { secret_key }) => {
+                    if !route.secret_key.is_empty()
+                        || !route.header.is_empty()
+                        || !route.header_prefix.is_empty()
+                    {
+                        bail!("proxy route {name} may not mix typed and legacy injection fields");
+                    }
+                    ("authorization", vec![secret_key.as_str()])
+                }
+                Some(ProxyInjectionConfig::Header {
+                    secret_key,
+                    header,
+                    prefix,
+                }) => {
+                    if !route.secret_key.is_empty()
+                        || !route.header.is_empty()
+                        || !route.header_prefix.is_empty()
+                    {
+                        bail!("proxy route {name} may not mix typed and legacy injection fields");
+                    }
+                    if prefix.chars().any(char::is_control) {
+                        bail!("proxy route {name} injection prefix contains control characters");
+                    }
+                    (header.as_str(), vec![secret_key.as_str()])
+                }
+                Some(ProxyInjectionConfig::Basic {
+                    username,
+                    password_secret_key,
+                }) => {
+                    if !route.secret_key.is_empty()
+                        || !route.header.is_empty()
+                        || !route.header_prefix.is_empty()
+                    {
+                        bail!("proxy route {name} may not mix typed and legacy injection fields");
+                    }
+                    if username.is_empty()
+                        || username.len() > 256
+                        || username.contains(':')
+                        || username.chars().any(char::is_control)
+                    {
+                        bail!("proxy route {name} basic username is invalid");
+                    }
+                    ("authorization", vec![password_secret_key.as_str()])
+                }
+            };
+            for secret_key in injection_secret_keys {
+                validate_environment_name(secret_key).with_context(|| {
+                    format!("proxy route {name} injection secret key is invalid")
+                })?;
+            }
+            if !injection_header.eq_ignore_ascii_case("authorization")
+                && !injection_header.to_ascii_lowercase().starts_with("x-")
             {
                 bail!("proxy route {name} may inject Authorization or an X-* header only");
             }
-            if axum::http::HeaderName::from_bytes(route.header.as_bytes()).is_err() {
+            if axum::http::HeaderName::from_bytes(injection_header.as_bytes()).is_err() {
                 bail!("proxy route {name} injection header is invalid");
             }
             validate_proxy_header_allowlist(
                 name,
                 "request",
                 &route.allowed_request_headers,
-                Some(&route.header),
+                Some(injection_header),
             )?;
             validate_proxy_header_allowlist(
                 name,
@@ -764,6 +852,22 @@ impl Config {
                         })
                 },
             )?;
+            if route.body_substitutions.len() > 16 {
+                bail!("proxy route {name} may define at most 16 body substitutions");
+            }
+            if !route.body_substitutions.is_empty() && route.allowed_content_types.is_empty() {
+                bail!(
+                    "proxy route {name} body substitutions require explicit allowed content types"
+                );
+            }
+            for (placeholder, secret_key) in &route.body_substitutions {
+                if !valid_body_placeholder(placeholder) {
+                    bail!("proxy route {name} contains an invalid body placeholder");
+                }
+                validate_environment_name(secret_key).with_context(|| {
+                    format!("proxy route {name} body substitution secret key is invalid")
+                })?;
+            }
             validate_string_allowlist(
                 name,
                 "content type",
@@ -1226,6 +1330,20 @@ fn valid_github_organization(organization: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
+fn valid_body_placeholder(value: &str) -> bool {
+    let Some(name) = value
+        .strip_prefix("__AV_SECRET_")
+        .and_then(|value| value.strip_suffix("__"))
+    else {
+        return false;
+    };
+    !name.is_empty()
+        && value.len() <= 128
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1421,6 +1539,8 @@ mod tests {
                 secret_key: "TOKEN".into(),
                 header: "Authorization".into(),
                 header_prefix: "Bearer ".into(),
+                injection: None,
+                body_substitutions: BTreeMap::new(),
                 allowed_methods: vec![],
                 allowed_path_prefixes: vec![],
                 allowed_request_headers: default_allowed_request_headers(),
@@ -1496,6 +1616,8 @@ mod tests {
                 secret_key: "TOKEN".into(),
                 header: "Authorization".into(),
                 header_prefix: "Bearer ".into(),
+                injection: None,
+                body_substitutions: BTreeMap::new(),
                 allowed_methods: vec!["GET".into()],
                 allowed_path_prefixes: vec!["/v1/".into()],
                 allowed_request_headers: vec![],

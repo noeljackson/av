@@ -72,8 +72,11 @@ https://av.tail.noel.sh/v1/proxy/cloudflare-dns/zones/<zone>/dns_records
 
 The caller supplies its OIDC bearer token. `av` forwards only explicitly
 allowlisted headers and query keys, checks method, canonical path, content type,
-and body size, then inserts exactly one credential header at the fixed upstream
-origin. Redirect and credential-bearing response headers are never forwarded.
+and body size, then constructs one typed Bearer, fixed-header, or Basic
+credential at the fixed upstream origin. Optional request-body injection uses
+declared `__AV_SECRET_NAME__` placeholders that must each occur exactly once;
+it is deliberately not a template language. Redirect and credential-bearing
+response headers are never forwarded.
 There is no arbitrary destination parameter. Hetzner is intentionally not part
 of the initial route set.
 

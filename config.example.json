@@ -85,9 +85,10 @@
     "cloudflare-dns": {
       "profile": "infra",
       "base_url": "https://api.cloudflare.com/client/v4",
-      "secret_key": "CLOUDFLARE_API_TOKEN",
-      "header": "Authorization",
-      "header_prefix": "Bearer ",
+      "injection": {
+        "type": "bearer",
+        "secret_key": "CLOUDFLARE_API_TOKEN"
+      },
       "allowed_methods": ["GET", "POST", "PUT", "PATCH"],
       "allowed_path_prefixes": ["/zones/"],
       "allowed_request_headers": ["accept", "content-type", "if-match", "if-none-match"],

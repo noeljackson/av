@@ -66,20 +66,29 @@ orchard-api or an agent tool
        └─ fixed provider origin with the configured credential injected
 ```
 
-The route configuration fixes the upstream origin, profile, credential key,
-allowed methods, path prefixes, query keys, request headers, response headers,
-content types, and request-size limit. AV then performs the following for each
-request:
+The route configuration fixes the upstream origin, profile, typed credential
+injection, allowed methods, path prefixes, query keys, request headers, response
+headers, content types, and request-size limit. AV then performs the following
+for each request:
 
 1. Authenticates the caller with its AV identity.
 2. Checks that identity has the route's profile capability.
 3. Rejects undeclared paths, methods, query fields, and headers.
 4. Fetches the configured credential from Infisical, OpenBao, or Google Secret
    Manager.
-5. Removes any caller-provided injection header and inserts AV's credential.
+5. Removes any caller-provided injection header and constructs AV's configured
+   Bearer, fixed-header, or Basic credential.
 6. Sends the request only to the fixed upstream origin.
 7. Returns only allowlisted response headers and redacts the injected secret if
    an upstream body or header echoes it.
+
+For provider APIs that require a secret in a request body, configure an exact
+placeholder map such as
+`"__AV_SECRET_WEBHOOK__": "PROVIDER_WEBHOOK_SECRET"`. Every configured
+placeholder must occur exactly once in the bounded request body and the route
+must allow its content type. AV performs byte-for-byte replacement after policy
+validation. There are no expressions, loops, includes, or environment
+expansion, so this cannot become a general template interpreter.
 
 For example, an `orchard-api` tool can call its configured AV endpoint rather
 than the provider directly:

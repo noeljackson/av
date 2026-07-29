@@ -130,6 +130,18 @@ def main():
     )
     assert destinations["destinations"] == [
         {
+            "name": "openbao-basic",
+            "profile": "openbao-integration",
+            "host": "upstream-basic",
+            "mode": "injecting",
+        },
+        {
+            "name": "openbao-body",
+            "profile": "openbao-integration",
+            "host": "upstream-body",
+            "mode": "injecting",
+        },
+        {
             "name": "openbao-stream",
             "profile": "openbao-integration",
             "host": "upstream-stream",
@@ -276,13 +288,38 @@ def main():
         },
     )
     assert proxy == {"injection": "accepted"}
-    assert proxy_headers["x-reflected-secret"] == "Bearer [REDACTED]"
+    assert proxy_headers["x-reflected-secret"] == "[REDACTED]"
     assert "location" not in proxy_headers
     _, x_header, _ = request(
         "/v1/proxy/openbao-x-api/x-header",
         headers={"X-Api-Key": "attacker-controlled"},
     )
     assert x_header == {"singleHeader": "accepted"}
+    _, basic, basic_headers = request("/v1/proxy/openbao-basic/basic")
+    assert b"openbao+ok" not in basic
+    assert b"[REDACTED]" in basic
+    assert basic_headers["x-reflected-secret"] == "Bearer [REDACTED]"
+    _, substituted, _ = request(
+        "/v1/proxy/openbao-body/body",
+        method="POST",
+        body=b'{"token":"__AV_SECRET_TOKEN__"}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert substituted == {"token": "[REDACTED]"}
+    request(
+        "/v1/proxy/openbao-body/body",
+        method="POST",
+        body=b'{"token":"missing"}',
+        headers={"Content-Type": "application/json"},
+        accepted=(502,),
+    )
+    request(
+        "/v1/proxy/openbao-body/body",
+        method="POST",
+        body=b'{"a":"__AV_SECRET_TOKEN__","b":"__AV_SECRET_TOKEN__"}',
+        headers={"Content-Type": "application/json"},
+        accepted=(502,),
+    )
     request("/v1/proxy/ungranted-upstream/verify", accepted=(403,))
     _, encoded, _ = request(
         "/v1/proxy/openbao-upstream/encoded?source=integration"
