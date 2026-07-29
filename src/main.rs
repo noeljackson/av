@@ -189,9 +189,9 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<u8> {
     let cli = Cli::parse();
+    init_tracing();
     match cli.command {
         Some(Command::Serve { config }) => {
-            init_tracing();
             server::run(Config::load(&config)?).await?;
             Ok(0)
         }
@@ -764,7 +764,13 @@ async fn run_transparent_proxy(
         let proxy_url = format!("http://{listener_address}");
         let listener_task = tokio::spawn(listener);
         let status = tokio::select! {
-            status = run_proxy_child(executable, arguments, &proxy_url, &ca.path) => status,
+            status = run_proxy_child(
+                executable,
+                arguments,
+                &proxy_url,
+                &ca.bundle_path,
+                &ca.additional_path,
+            ) => status,
             renewal = renew_proxy_session_loop(
                 api_url,
                 &session_id,
@@ -848,10 +854,11 @@ async fn renew_proxy_session_loop(
 }
 
 struct ProxyCaFile {
-    // Dropping TempDir removes the temporary certificate after the child exits.
-    // The CA private key is never present here.
+    // Dropping TempDir removes both temporary certificate files after the child
+    // exits. The CA private key is never present here.
     _directory: tempfile::TempDir,
-    path: PathBuf,
+    bundle_path: PathBuf,
+    additional_path: PathBuf,
 }
 
 fn write_proxy_ca(certificate_pem: &str) -> Result<ProxyCaFile> {
@@ -865,12 +872,55 @@ fn write_proxy_ca(certificate_pem: &str) -> Result<ProxyCaFile> {
         .tempdir()
         .context("create private proxy CA directory")?;
     restrict_directory(directory.path())?;
-    let path = directory.path().join("proxy-ca.pem");
-    write_private_file(&path, certificate_pem.as_bytes())?;
+    let additional_path = directory.path().join("proxy-ca.pem");
+    write_private_file(&additional_path, certificate_pem.as_bytes())?;
+    let system_ca = read_system_ca_bundle()?;
+    let mut bundle = Vec::with_capacity(system_ca.len() + certificate_pem.len() + 1);
+    bundle.extend_from_slice(&system_ca);
+    if !bundle.ends_with(b"\n") {
+        bundle.push(b'\n');
+    }
+    bundle.extend_from_slice(certificate_pem.as_bytes());
+    let bundle_path = directory.path().join("ca-bundle.pem");
+    write_private_file(&bundle_path, &bundle)?;
     Ok(ProxyCaFile {
         _directory: directory,
-        path,
+        bundle_path,
+        additional_path,
     })
+}
+
+fn read_system_ca_bundle() -> Result<Vec<u8>> {
+    const MAX_SYSTEM_CA_BUNDLE_BYTES: u64 = 4 * 1024 * 1024;
+    const SYSTEM_CA_BUNDLES: [&str; 4] = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+    ];
+    let explicit = std::env::var_os("AV_SYSTEM_CA_FILE").map(PathBuf::from);
+    let path = explicit
+        .as_deref()
+        .into_iter()
+        .chain(SYSTEM_CA_BUNDLES.iter().map(Path::new))
+        .find(|path| path.is_absolute() && path.is_file())
+        .context(
+            "no system CA bundle found; set AV_SYSTEM_CA_FILE to an absolute PEM bundle path",
+        )?;
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("inspect system CA bundle {}", path.display()))?;
+    if metadata.len() == 0 || metadata.len() > MAX_SYSTEM_CA_BUNDLE_BYTES {
+        bail!("system CA bundle has an unsafe size");
+    }
+    let bundle =
+        fs::read(path).with_context(|| format!("read system CA bundle {}", path.display()))?;
+    if !bundle
+        .windows("-----BEGIN CERTIFICATE-----".len())
+        .any(|window| window == b"-----BEGIN CERTIFICATE-----")
+    {
+        bail!("system CA bundle does not contain PEM certificates");
+    }
+    Ok(bundle)
 }
 
 async fn start_loopback_proxy(
@@ -1112,10 +1162,15 @@ async fn run_proxy_child(
     executable: OsString,
     arguments: Vec<OsString>,
     proxy_url: &str,
-    ca_path: &Path,
+    ca_bundle_path: &Path,
+    additional_ca_path: &Path,
 ) -> Result<u8> {
     let mut command = tokio::process::Command::from(proxy_child_command(
-        executable, arguments, proxy_url, ca_path,
+        executable,
+        arguments,
+        proxy_url,
+        ca_bundle_path,
+        additional_ca_path,
     )?);
     command.kill_on_drop(true);
     let mut child = command.spawn().context("start proxied child process")?;
@@ -1134,7 +1189,8 @@ fn proxy_child_command(
     executable: OsString,
     arguments: Vec<OsString>,
     proxy_url: &str,
-    ca_path: &Path,
+    ca_bundle_path: &Path,
+    additional_ca_path: &Path,
 ) -> Result<ProcessCommand> {
     let proxy_url = Url::parse(proxy_url).context("local proxy URL is invalid")?;
     if proxy_url.scheme() != "http"
@@ -1155,18 +1211,23 @@ fn proxy_child_command(
         .env("HTTPS_PROXY", proxy_url.as_str())
         .env("http_proxy", proxy_url.as_str())
         .env("https_proxy", proxy_url.as_str())
-        .env("SSL_CERT_FILE", ca_path)
-        .env("NODE_EXTRA_CA_CERTS", ca_path)
-        .env("CURL_CA_BUNDLE", ca_path)
-        .env("REQUESTS_CA_BUNDLE", ca_path)
-        .env("GIT_SSL_CAINFO", ca_path)
-        .env("CODEX_CA_CERTIFICATE", ca_path)
+        // Most TLS clients treat these variables as a replacement trust store,
+        // so give them the system roots plus AV's deployment CA. Node and Codex
+        // explicitly accept an additional CA and should not receive the larger
+        // replacement bundle.
+        .env("SSL_CERT_FILE", ca_bundle_path)
+        .env("NODE_EXTRA_CA_CERTS", additional_ca_path)
+        .env("CURL_CA_BUNDLE", ca_bundle_path)
+        .env("REQUESTS_CA_BUNDLE", ca_bundle_path)
+        .env("GIT_SSL_CAINFO", ca_bundle_path)
+        .env("CODEX_CA_CERTIFICATE", additional_ca_path)
         .env_remove("AV_AGENT_TOKEN_FILE")
         .env_remove("AV_AGENT_TOKEN")
         .env_remove("AV_TOKEN")
         .env_remove("AV_BASIC_USER")
         .env_remove("AV_BASIC_PASSWORD")
         .env_remove("AV_PROXY_TRANSPORT_CA_FILE")
+        .env_remove("AV_SYSTEM_CA_FILE")
         .env_remove("NO_PROXY")
         .env_remove("no_proxy")
         .env_remove("ALL_PROXY")
@@ -1461,6 +1522,7 @@ mod tests {
             OsString::from("example"),
             Vec::new(),
             "http://127.0.0.1:42173",
+            Path::new("/private/ca-bundle.pem"),
             Path::new("/private/proxy-ca.pem"),
         )
         .unwrap();
@@ -1482,6 +1544,7 @@ mod tests {
             "AV_BASIC_USER",
             "AV_BASIC_PASSWORD",
             "AV_PROXY_TRANSPORT_CA_FILE",
+            "AV_SYSTEM_CA_FILE",
             "NO_PROXY",
             "no_proxy",
             "ALL_PROXY",
@@ -1491,12 +1554,16 @@ mod tests {
         }
         for name in [
             "SSL_CERT_FILE",
-            "NODE_EXTRA_CA_CERTS",
             "CURL_CA_BUNDLE",
             "REQUESTS_CA_BUNDLE",
             "GIT_SSL_CAINFO",
-            "CODEX_CA_CERTIFICATE",
         ] {
+            assert_eq!(
+                envs.get(&OsString::from(name)),
+                Some(&Some(OsString::from("/private/ca-bundle.pem")))
+            );
+        }
+        for name in ["NODE_EXTRA_CA_CERTS", "CODEX_CA_CERTIFICATE"] {
             assert_eq!(
                 envs.get(&OsString::from(name)),
                 Some(&Some(OsString::from("/private/proxy-ca.pem")))
@@ -1507,6 +1574,7 @@ mod tests {
                 OsString::from("example"),
                 Vec::new(),
                 "http://token@proxy.example.test:14323",
+                Path::new("/private/ca-bundle.pem"),
                 Path::new("/private/proxy-ca.pem"),
             )
             .is_err()
@@ -1516,6 +1584,7 @@ mod tests {
                 OsString::from("example"),
                 Vec::new(),
                 "http://proxy.example.test:14323",
+                Path::new("/private/ca-bundle.pem"),
                 Path::new("/private/proxy-ca.pem"),
             )
             .is_err()

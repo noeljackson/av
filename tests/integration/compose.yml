@@ -136,6 +136,7 @@ services:
     read_only: true
     volumes:
       - ./upstream.py:/test/upstream.py:ro
+      - ${AV_POSTGRES_TLS_DIR:-/dev/null}:/test-tls:ro
     healthcheck:
       test:
         - CMD
@@ -154,6 +155,7 @@ services:
           - upstream-stream
           - upstream-x-api
           - upstream-ungranted
+          - upstream-tunnel
 
   setup:
     image: docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0

@@ -23,18 +23,50 @@ openssl req -x509 -newkey ed25519 -nodes -days 1 \
   -keyout "$AV_POSTGRES_TLS_DIR/proxy-ca.key" \
   -out "$AV_POSTGRES_TLS_DIR/proxy-ca.crt" \
   -subj "/CN=av-integration-proxy-ca" >/dev/null 2>&1
-openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+openssl req -x509 -newkey ed25519 -nodes -days 1 \
+  -keyout "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.key" \
+  -out "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt" \
+  -subj "/CN=AV synthetic transport test CA" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
   -keyout "$AV_POSTGRES_TLS_DIR/proxy-transport.key" \
-  -out "$AV_POSTGRES_TLS_DIR/proxy-transport.crt" \
+  -out "$AV_POSTGRES_TLS_DIR/proxy-transport.csr" \
   -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost" >/dev/null 2>&1
+openssl x509 -req -days 1 \
+  -in "$AV_POSTGRES_TLS_DIR/proxy-transport.csr" \
+  -CA "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt" \
+  -CAkey "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.key" \
+  -CAcreateserial \
+  -copy_extensions copy \
+  -out "$AV_POSTGRES_TLS_DIR/proxy-transport.crt" >/dev/null 2>&1
+openssl req -x509 -newkey ed25519 -nodes -days 1 \
+  -keyout "$AV_POSTGRES_TLS_DIR/tunnel-ca.key" \
+  -out "$AV_POSTGRES_TLS_DIR/tunnel-ca.crt" \
+  -subj "/CN=AV synthetic tunnel test CA" \
+  -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
+openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+  -keyout "$AV_POSTGRES_TLS_DIR/tunnel.key" \
+  -out "$AV_POSTGRES_TLS_DIR/tunnel.csr" \
+  -subj "/CN=upstream-tunnel" \
+  -addext "subjectAltName=DNS:upstream-tunnel" >/dev/null 2>&1
+openssl x509 -req -days 1 \
+  -in "$AV_POSTGRES_TLS_DIR/tunnel.csr" \
+  -CA "$AV_POSTGRES_TLS_DIR/tunnel-ca.crt" \
+  -CAkey "$AV_POSTGRES_TLS_DIR/tunnel-ca.key" \
+  -CAcreateserial \
+  -copy_extensions copy \
+  -out "$AV_POSTGRES_TLS_DIR/tunnel.crt" >/dev/null 2>&1
 # Disposable synthetic fixtures are bind-mounted read-only for AV's non-root
 # runtime UID and removed by the harness trap.
 chmod 0444 \
   "$AV_POSTGRES_TLS_DIR/proxy-ca.key" \
   "$AV_POSTGRES_TLS_DIR/proxy-ca.crt" \
+  "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt" \
   "$AV_POSTGRES_TLS_DIR/proxy-transport.key" \
-  "$AV_POSTGRES_TLS_DIR/proxy-transport.crt"
+  "$AV_POSTGRES_TLS_DIR/proxy-transport.crt" \
+  "$AV_POSTGRES_TLS_DIR/tunnel.crt" \
+  "$AV_POSTGRES_TLS_DIR/tunnel.key"
 
 "${compose[@]}" config --quiet
 if [[ -n ${AV_IMAGE:-} ]]; then
@@ -81,6 +113,7 @@ run_cli routes >"$workdir/routes"
 grep --quiet $'^openbao-upstream\tinjecting\topenbao-integration\tupstream-auth$' "$workdir/routes"
 grep --quiet $'^openbao-stream\tinjecting\topenbao-integration\tupstream-stream$' "$workdir/routes"
 grep --quiet $'^openbao-x-api\tinjecting\topenbao-integration\tupstream-x-api$' "$workdir/routes"
+grep --quiet $'^credentialless-upstream\ttunnel\topenbao-integration\tupstream-tunnel$' "$workdir/routes"
 if grep --quiet '^ungranted-upstream' "$workdir/routes"; then
   echo "ungranted route was disclosed by CLI discovery" >&2
   exit 1
@@ -100,5 +133,30 @@ run_cli openbao-integration -- sh -eu -c '
   test -z "${AV_BASIC_USER:-}"
   test -z "${AV_BASIC_PASSWORD:-}"
 '
+
+# The wrapped child trusts a synthetic upstream CA that is deliberately
+# distinct from AV's interception CA. Successful HTTPS therefore proves that
+# the configured credentialless destination remained opaque end to end.
+if ! docker run --rm --pull never \
+  --network "container:$av_container" \
+  --read-only \
+  --tmpfs /tmp \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --volume "$workdir/av:/usr/local/bin/av:ro" \
+  --volume "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt:/trust/transport.crt:ro" \
+  --volume "$AV_POSTGRES_TLS_DIR/tunnel-ca.crt:/trust/tunnel-ca.crt:ro" \
+  --env AV_URL=http://127.0.0.1:14322 \
+  --env AV_BASIC_USER=operator \
+  --env AV_BASIC_PASSWORD=password \
+  --env AV_PROXY_TRANSPORT_CA_FILE=/trust/transport.crt \
+  --env AV_SYSTEM_CA_FILE=/trust/tunnel-ca.crt \
+  --env RUST_LOG=av=debug \
+  docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0 \
+  /usr/local/bin/av run openbao-integration -- python -c \
+  'import os, urllib.request; assert "AV_SYSTEM_CA_FILE" not in os.environ; assert urllib.request.urlopen("https://upstream-tunnel/tunnel", timeout=10).read() == b"credentialless-tunnel-ok"'; then
+  "${compose[@]}" logs --no-color av upstream >&2
+  exit 1
+fi
 
 printf 'connector_cli_integration=ok\n'

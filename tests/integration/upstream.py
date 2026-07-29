@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import base64
+import ssl
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit
@@ -11,6 +13,14 @@ class Handler(BaseHTTPRequestHandler):
         if target.path == "/healthz":
             self.send_response(200)
             self.end_headers()
+            return
+        if target.path == "/tunnel":
+            body = b"credentialless-tunnel-ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
             return
         authorization = self.headers.get_all("Authorization") or []
         authorized = authorization == ["Bearer openbao+ok"]
@@ -77,5 +87,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, _format, *_args):
         pass
 
-
-ThreadingHTTPServer(("0.0.0.0", 8081), Handler).serve_forever()
+plain = ThreadingHTTPServer(("0.0.0.0", 8081), Handler)
+threading.Thread(target=plain.serve_forever, daemon=True).start()
+tls = ThreadingHTTPServer(("0.0.0.0", 443), Handler)
+context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+context.load_cert_chain("/test-tls/tunnel.crt", "/test-tls/tunnel.key")
+tls.socket = context.wrap_socket(tls.socket, server_side=True)
+tls.serve_forever()

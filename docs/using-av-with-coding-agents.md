@@ -120,6 +120,13 @@ short-lived, revocable session, and removes it when the child exits. The remote
 proxy URL itself must be an HTTPS DNS origin; only the process-local loopback
 helper is HTTP.
 
+For ordinary HTTPS and credentialless tunnels, `av run` preserves the system
+trust roots. It creates a private temporary bundle containing those roots plus
+AV's interception certificate; it does not modify the machine trust store. If
+your platform has no standard Linux PEM bundle, set `AV_SYSTEM_CA_FILE` to an
+absolute PEM bundle when launching `av`. The helper consumes that path and
+removes it from the child environment.
+
 WebSocket-capable tools use the same `HTTPS_PROXY` path. The route must opt in
 to WebSockets and declare exact Origin/subprotocol and connection limits; a
 named `/v1/proxy/...` URL does not accept upgrades. This keeps AV authentication

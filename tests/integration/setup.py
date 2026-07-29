@@ -442,6 +442,11 @@ def write_config(project_id, environment):
             },
         },
         "proxy_tunnels": {
+            "credentialless-upstream": {
+                "profile": "openbao-integration",
+                "host": "upstream-tunnel",
+                "allow_private_ips": True,
+            },
             "ungranted-session-fixture": {
                 "profile": "ungranted-integration",
                 "host": "example.com",

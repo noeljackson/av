@@ -130,6 +130,12 @@ def main():
     )
     assert destinations["destinations"] == [
         {
+            "name": "credentialless-upstream",
+            "profile": "openbao-integration",
+            "host": "upstream-tunnel",
+            "mode": "tunnel",
+        },
+        {
             "name": "openbao-basic",
             "profile": "openbao-integration",
             "host": "upstream-basic",

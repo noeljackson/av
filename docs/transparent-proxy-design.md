@@ -112,7 +112,10 @@ therefore remain narrow.
 3. AV records the identity, profile, expiry, and session identifier; it returns
    a session credential only to the local helper over authenticated TLS.
 4. The helper starts a loopback HTTP forward proxy, configures CA trust for the
-   child, and launches `codex`.
+   child, and launches `codex`. Replacement-style trust variables receive a
+   private bundle containing the normal system roots plus AV's interception CA;
+   additional-CA variables receive only AV's CA. Credentialless tunnels
+   therefore retain ordinary upstream trust.
 5. A client request reaches the helper. The helper first authenticates the
    network proxy's HTTPS transport certificate, then sends its session
    capability. AV accepts only a configured `CONNECT host:443`; plaintext
@@ -349,6 +352,15 @@ This trust anchor authenticates only the outer helper-to-AV transport. It is
 separate from the deployment's MITM CA certificate, which AV supplies to the
 child for configured provider hosts.
 
+`av run` discovers the host's system PEM trust bundle and appends AV's public
+interception certificate in a mode-`0600` temporary directory. On a platform
+without a standard Linux bundle path, set `AV_SYSTEM_CA_FILE` to an absolute
+PEM bundle. The helper reads it and removes that variable from the child
+environment. It never modifies the machine trust store. This distinction is
+required for credentialless tunnels: their upstream certificate must chain to
+the normal system bundle (or an explicitly supplied private upstream CA), not
+to AV's interception CA.
+
 For a high-impact operation, prefer a narrow application tool backed by an
 explicit named route over giving the agent broad transparent access to a
 provider API. Human confirmation and a distinct operations profile remain
@@ -387,6 +399,8 @@ The implementation is kept available only with these test layers:
 - CA key non-disclosure, certificate hostname restrictions, and rotation;
 - `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, and proxy-bypass behavior for Codex,
   Claude Code, curl, and at least one SDK;
+- an end-to-end credentialless HTTPS tunnel whose upstream certificate is
+  signed by a CA distinct from AV's interception CA;
 - direct TCP and UDP/443 egress denial in the Kubernetes integration fixture;
 - WebSocket handshake injection, exact Origin/subprotocol enforcement,
   bidirectional frame redaction, bounded lifetime/bytes, and live grant
