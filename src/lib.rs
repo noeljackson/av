@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod connector;
+pub mod google_secret_manager;
 pub mod infisical;
 pub mod keyring;
 pub mod openbao;

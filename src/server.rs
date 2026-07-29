@@ -1158,7 +1158,7 @@ pub async fn run(config: Config) -> Result<()> {
     for (name, connector) in &config.connectors {
         connectors.insert(
             name.clone(),
-            Connector::new(connector.clone(), allow_insecure_http)?,
+            Connector::new(connector.clone(), allow_insecure_http).await?,
         );
     }
     let proxy_client = reqwest::Client::builder()
@@ -2892,6 +2892,7 @@ mod tests {
                 environment: "dev".into(),
                 secret_path: "/".into(),
                 allowed_keys: vec![],
+                exports: BTreeMap::new(),
             },
         );
         let route = proxy_route(&["GET"], &["/v1/"]);
@@ -3110,7 +3111,7 @@ mod tests {
             "auth": {"type": "token", "token_file": secret_file.path()},
         }))
         .unwrap();
-        let connector = Connector::new(connector_config, true).unwrap();
+        let connector = Connector::new(connector_config, true).await.unwrap();
         state.connectors = Arc::new(BTreeMap::from([("unused".to_owned(), connector)]));
         let secrets_task = tokio::spawn(async move {
             let (mut stream, _) = secrets_listener.accept().await.unwrap();

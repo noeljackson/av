@@ -1,9 +1,9 @@
 # av
 
 `av` is an OIDC-authenticated connector and credential proxy. It does not have
-registration or an application-secret database. Infisical and OpenBao are
-connector backends; neither is embedded in `av`, and switching a profile
-between them does not change the CLI or proxy contract.
+registration or an application-secret database. Infisical, OpenBao, and Google
+Secret Manager are connector backends; none is embedded in `av`, and switching
+a profile between them does not change the CLI or proxy contract.
 
 AV has two deliberately separate operating modes:
 
@@ -26,6 +26,9 @@ An Infisical profile maps directly to an existing project, environment, and
 path; no dedicated `av` project is required. OpenBao profiles currently map to
 non-leased KV API paths such as `secret/data/infra`. Responses carrying a lease
 are rejected until AV implements lease ownership and revocation.
+Google Secret Manager profiles map each exported local name to an exact secret
+version resource and authenticate with ADC/Workload Identity Federation. See
+[secret backends](docs/secret-backends.md) for the backend and IAM contract.
 
 ## Daily use
 
@@ -172,7 +175,8 @@ Configuration is strict JSON; unknown fields fail startup. Start from
 references, never literal values in the config. Infisical supports Kubernetes,
 Universal, and token auth. OpenBao supports Kubernetes, AppRole, and token auth;
 Kubernetes is preferred for in-cluster workloads and AppRole for external
-automation.
+automation. Google Secret Manager uses Application Default Credentials; use
+Workload Identity Federation in Kubernetes and never a service-account key.
 
 ```bash
 AV_ALLOW_INSECURE_AUTH=1 cargo run -- serve --config config.local.json

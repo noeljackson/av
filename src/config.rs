@@ -178,13 +178,15 @@ pub enum OidcSigningAlgorithm {
 pub enum ConnectorConfig {
     OpenBao(OpenBaoConfig),
     Infisical(InfisicalConfig),
+    GoogleSecretManager(GoogleSecretManagerConfig),
 }
 
 impl ConnectorConfig {
-    pub fn base_url(&self) -> &str {
+    pub fn base_url(&self) -> Option<&str> {
         match self {
-            Self::OpenBao(config) => &config.base_url,
-            Self::Infisical(config) => &config.base_url,
+            Self::OpenBao(config) => Some(&config.base_url),
+            Self::Infisical(config) => Some(&config.base_url),
+            Self::GoogleSecretManager(_) => None,
         }
     }
 
@@ -192,8 +194,31 @@ impl ConnectorConfig {
         match self {
             Self::OpenBao(_) => "openbao",
             Self::Infisical(_) => "infisical",
+            Self::GoogleSecretManager(_) => "google_secret_manager",
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum GoogleSecretManagerKind {
+    GoogleSecretManager,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GoogleSecretManagerConfig {
+    #[serde(rename = "kind")]
+    _kind: GoogleSecretManagerKind,
+    pub auth: GoogleSecretManagerAuth,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GoogleSecretManagerAuth {
+    /// Application Default Credentials. In production this is expected to be
+    /// backed by workload identity, not by a service-account key.
+    Adc,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -281,6 +306,19 @@ pub struct ProfileConfig {
     pub secret_path: String,
     #[serde(default)]
     pub allowed_keys: Vec<String>,
+    /// Explicit local key exports. Google Secret Manager requires `resource`;
+    /// path-oriented backends may use `field` to rename an existing key.
+    #[serde(default)]
+    pub exports: BTreeMap<String, ProfileExportConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileExportConfig {
+    #[serde(default)]
+    pub resource: String,
+    #[serde(default)]
+    pub field: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -518,19 +556,23 @@ impl Config {
         let allow_insecure_connector_http = self.allow_insecure_connector_http();
         for (name, connector) in &self.connectors {
             validate_name("connector", name)?;
-            let base = Url::parse(connector.base_url())
-                .with_context(|| format!("connector {name} base_url must be a URL"))?;
-            if base.host_str().is_none()
-                || has_url_credentials(&base)
-                || base.query().is_some()
-                || base.fragment().is_some()
-            {
-                bail!("connector {name} base_url may not contain credentials, query, or fragment");
-            }
-            if base.scheme() != "https"
-                && !(base.scheme() == "http" && allow_insecure_connector_http)
-            {
-                bail!("connector {name} base_url must use HTTPS");
+            if let Some(base_url) = connector.base_url() {
+                let base = Url::parse(base_url)
+                    .with_context(|| format!("connector {name} base_url must be a URL"))?;
+                if base.host_str().is_none()
+                    || has_url_credentials(&base)
+                    || base.query().is_some()
+                    || base.fragment().is_some()
+                {
+                    bail!(
+                        "connector {name} base_url may not contain credentials, query, or fragment"
+                    );
+                }
+                if base.scheme() != "https"
+                    && !(base.scheme() == "http" && allow_insecure_connector_http)
+                {
+                    bail!("connector {name} base_url must use HTTPS");
+                }
             }
             validate_connector_auth(name, connector)?;
         }
@@ -554,6 +596,56 @@ impl Config {
                 }
                 ConnectorConfig::OpenBao(_) => {
                     validate_openbao_secret_path(name, &profile.secret_path)?;
+                }
+                ConnectorConfig::GoogleSecretManager(_) => {
+                    if profile.exports.is_empty() {
+                        bail!("Google Secret Manager profile {name} requires explicit exports");
+                    }
+                    if !profile.project_id.is_empty()
+                        || !profile.environment.is_empty()
+                        || profile.secret_path != "/"
+                        || !profile.allowed_keys.is_empty()
+                    {
+                        bail!(
+                            "Google Secret Manager profile {name} uses exports, not project_id, environment, secret_path, or allowed_keys"
+                        );
+                    }
+                }
+            }
+            for (local_name, export) in &profile.exports {
+                validate_environment_name(local_name).with_context(|| {
+                    format!("profile {name} export {local_name} is not a portable environment name")
+                })?;
+                match connector {
+                    ConnectorConfig::GoogleSecretManager(_) => {
+                        if !export.field.is_empty()
+                            || !valid_google_secret_resource(&export.resource)
+                        {
+                            bail!(
+                                "Google Secret Manager profile {name} export {local_name} requires a canonical secret version resource and no field"
+                            );
+                        }
+                    }
+                    ConnectorConfig::Infisical(_) | ConnectorConfig::OpenBao(_) => {
+                        if !export.resource.is_empty() {
+                            bail!(
+                                "path-oriented profile {name} export {local_name} may not set resource"
+                            );
+                        }
+                        if !profile.allowed_keys.is_empty() {
+                            bail!(
+                                "path-oriented profile {name} may use allowed_keys or exports, but not both"
+                            );
+                        }
+                        let field = if export.field.is_empty() {
+                            local_name
+                        } else {
+                            &export.field
+                        };
+                        validate_environment_name(field).with_context(|| {
+                            format!("profile {name} export {local_name} has an invalid field")
+                        })?;
+                    }
                 }
             }
         }
@@ -746,6 +838,9 @@ fn validate_connector_auth(name: &str, connector: &ConnectorConfig) -> Result<()
                 OpenBaoAuth::Token { token_file } => vec![token_file],
             }
         }
+        ConnectorConfig::GoogleSecretManager(config) => match config.auth {
+            GoogleSecretManagerAuth::Adc => vec![],
+        },
     };
     if credential_files
         .iter()
@@ -754,6 +849,50 @@ fn validate_connector_auth(name: &str, connector: &ConnectorConfig) -> Result<()
         bail!("connector {name} credential files must use absolute paths");
     }
     Ok(())
+}
+
+fn validate_environment_name(value: &str) -> Result<()> {
+    let mut bytes = value.bytes();
+    let Some(first) = bytes.next() else {
+        bail!("environment name is empty");
+    };
+    if !(first == b'_' || first.is_ascii_alphabetic())
+        || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+    {
+        bail!("environment name must match [A-Za-z_][A-Za-z0-9_]*");
+    }
+    Ok(())
+}
+
+fn valid_google_secret_resource(value: &str) -> bool {
+    let parts: Vec<_> = value.split('/').collect();
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    };
+    match parts.as_slice() {
+        ["projects", project, "secrets", secret, "versions", version] => {
+            valid_segment(project) && valid_segment(secret) && valid_segment(version)
+        }
+        [
+            "projects",
+            project,
+            "locations",
+            location,
+            "secrets",
+            secret,
+            "versions",
+            version,
+        ] => {
+            valid_segment(project)
+                && valid_segment(location)
+                && valid_segment(secret)
+                && valid_segment(version)
+        }
+        _ => false,
+    }
 }
 
 fn validate_proxy_header_allowlist(
@@ -1197,6 +1336,7 @@ mod tests {
                 environment: "prod".into(),
                 secret_path: "/".into(),
                 allowed_keys: vec![],
+                exports: BTreeMap::new(),
             },
         );
         config.proxy_routes.insert(
@@ -1269,6 +1409,7 @@ mod tests {
                 environment: "dev".into(),
                 secret_path: "/".into(),
                 allowed_keys: vec![],
+                exports: BTreeMap::new(),
             },
         );
         config.proxy_routes.insert(
@@ -1344,7 +1485,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_legacy_infisical_and_typed_openbao_connectors() {
+    fn parses_legacy_infisical_and_typed_connectors() {
         let legacy: ConnectorConfig = serde_json::from_value(serde_json::json!({
             "base_url": "https://infisical.example",
             "auth": {
@@ -1367,5 +1508,105 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(openbao, ConnectorConfig::OpenBao(_)));
+
+        let google: ConnectorConfig = serde_json::from_value(serde_json::json!({
+            "kind": "google_secret_manager",
+            "auth": {
+                "type": "adc"
+            }
+        }))
+        .unwrap();
+        assert!(matches!(google, ConnectorConfig::GoogleSecretManager(_)));
+    }
+
+    #[test]
+    fn google_profiles_require_exact_secret_resources() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AV_ALLOW_INSECURE_AUTH", "1") };
+        let mut config = base_config();
+        config.connectors.insert(
+            "google".into(),
+            ConnectorConfig::GoogleSecretManager(GoogleSecretManagerConfig {
+                _kind: GoogleSecretManagerKind::GoogleSecretManager,
+                auth: GoogleSecretManagerAuth::Adc,
+            }),
+        );
+        config.profiles.insert(
+            "example".into(),
+            ProfileConfig {
+                connector: "google".into(),
+                project_id: String::new(),
+                environment: String::new(),
+                secret_path: "/".into(),
+                allowed_keys: vec![],
+                exports: BTreeMap::from([(
+                    "API_TOKEN".into(),
+                    ProfileExportConfig {
+                        resource: "projects/example/secrets/provider-token/versions/latest".into(),
+                        field: String::new(),
+                    },
+                )]),
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config
+            .profiles
+            .get_mut("example")
+            .unwrap()
+            .exports
+            .get_mut("API_TOKEN")
+            .unwrap()
+            .resource = "provider-token".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("canonical secret version resource")
+        );
+        unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
+    }
+
+    #[test]
+    fn path_profiles_cannot_mix_legacy_and_explicit_key_selection() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AV_ALLOW_INSECURE_AUTH", "1") };
+        let mut config = base_config();
+        config.connectors.insert(
+            "main".into(),
+            ConnectorConfig::Infisical(InfisicalConfig {
+                _kind: InfisicalKind::Infisical,
+                base_url: "https://infisical.example".into(),
+                auth: InfisicalAuth::Token {
+                    token_file: "/run/token".into(),
+                },
+            }),
+        );
+        config.profiles.insert(
+            "example".into(),
+            ProfileConfig {
+                connector: "main".into(),
+                project_id: "project".into(),
+                environment: "dev".into(),
+                secret_path: "/".into(),
+                allowed_keys: vec!["UPSTREAM_TOKEN".into()],
+                exports: BTreeMap::from([(
+                    "API_TOKEN".into(),
+                    ProfileExportConfig {
+                        resource: String::new(),
+                        field: "UPSTREAM_TOKEN".into(),
+                    },
+                )]),
+            },
+        );
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("allowed_keys or exports")
+        );
+        unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
     }
 }

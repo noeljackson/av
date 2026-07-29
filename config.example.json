@@ -37,6 +37,12 @@
         "token_file": "/var/run/secrets/kubernetes.io/serviceaccount/token",
         "mount_path": "kubernetes"
       }
+    },
+    "google": {
+      "kind": "google_secret_manager",
+      "auth": {
+        "type": "adc"
+      }
     }
   },
   "profiles": {
@@ -65,6 +71,14 @@
       "connector": "openbao",
       "secret_path": "secret/data/infra",
       "allowed_keys": []
+    },
+    "google-example": {
+      "connector": "google",
+      "exports": {
+        "EXAMPLE_API_TOKEN": {
+          "resource": "projects/example-project/secrets/example-api-token/versions/latest"
+        }
+      }
     }
   },
   "proxy_routes": {
