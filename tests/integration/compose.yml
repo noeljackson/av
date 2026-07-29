@@ -14,7 +14,10 @@ services:
         chmod 0600 /tls/server.key
     read_only: true
     volumes:
-      - ${AV_POSTGRES_TLS_DIR:?set AV_POSTGRES_TLS_DIR}:/input:ro
+      # /dev/null makes an omitted fixture fail closed inside the init
+      # container while still allowing `docker compose down` without retaining
+      # the temporary host directory path.
+      - ${AV_POSTGRES_TLS_DIR:-/dev/null}:/input:ro
       - postgres-tls:/tls
     networks: [connectors]
 
