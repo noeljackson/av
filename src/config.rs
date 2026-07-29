@@ -278,9 +278,13 @@ pub struct TransparentProxyConfig {
     /// Private TCP listener for CONNECT traffic. This must be exposed only by
     /// a private Service; public exposure is rejected by chart policy as well.
     pub listen: String,
-    /// Private HTTP forward-proxy URL used by local helpers. This is separate
+    /// Private HTTPS forward-proxy URL used by local helpers. This is separate
     /// from the public control API URL and must not include credentials.
     pub proxy_url: String,
+    /// Publicly trusted TLS certificate for the outer helper-to-AV transport.
+    pub transport_tls_certificate_file: String,
+    /// Private key matching the outer transport certificate.
+    pub transport_tls_private_key_file: String,
     /// PEM-encoded deployment CA certificate mounted from an existing Secret.
     pub ca_certificate_file: String,
     /// PEM-encoded deployment CA private key mounted from an existing Secret.
@@ -739,8 +743,11 @@ fn validate_transparent_proxy(config: &Config, proxy: &TransparentProxyConfig) -
     }
     let proxy_url =
         Url::parse(&proxy.proxy_url).context("transparent_proxy.proxy_url must be a URL")?;
-    if proxy_url.scheme() != "http"
+    if proxy_url.scheme() != "https"
         || proxy_url.host_str().is_none()
+        || proxy_url
+            .host_str()
+            .is_some_and(|host| host.parse::<IpAddr>().is_ok())
         || proxy_url.port().is_none()
         || has_url_credentials(&proxy_url)
         || proxy_url.query().is_some()
@@ -748,13 +755,26 @@ fn validate_transparent_proxy(config: &Config, proxy: &TransparentProxyConfig) -
         || !matches!(proxy_url.path(), "" | "/")
     {
         bail!(
-            "transparent_proxy.proxy_url must be a credential-free HTTP origin with an explicit port"
+            "transparent_proxy.proxy_url must be a credential-free HTTPS DNS origin with an explicit port"
         );
     }
     let certificate = Path::new(&proxy.ca_certificate_file);
     let private_key = Path::new(&proxy.ca_private_key_file);
-    if !certificate.is_absolute() || !private_key.is_absolute() || certificate == private_key {
-        bail!("transparent proxy CA certificate and key must be distinct absolute file paths");
+    let transport_certificate = Path::new(&proxy.transport_tls_certificate_file);
+    let transport_private_key = Path::new(&proxy.transport_tls_private_key_file);
+    let paths = [
+        certificate,
+        private_key,
+        transport_certificate,
+        transport_private_key,
+    ];
+    if paths.iter().any(|path| !path.is_absolute())
+        || paths
+            .iter()
+            .enumerate()
+            .any(|(index, path)| paths[index + 1..].contains(path))
+    {
+        bail!("transparent proxy CA and transport TLS files must use four distinct absolute paths");
     }
     if !(60..=3600).contains(&proxy.session_ttl_seconds) {
         bail!("transparent proxy session_ttl_seconds must be between 60 and 3600");
@@ -1117,7 +1137,9 @@ mod tests {
         );
         config.transparent_proxy = Some(TransparentProxyConfig {
             listen: "127.0.0.1:14323".into(),
-            proxy_url: "http://av-proxy.example.test:14323".into(),
+            proxy_url: "https://av-proxy.example.test:14323".into(),
+            transport_tls_certificate_file: "/run/av/transport/tls.crt".into(),
+            transport_tls_private_key_file: "/run/av/transport/tls.key".into(),
             ca_certificate_file: "/run/av/proxy/ca.crt".into(),
             ca_private_key_file: "/run/av/proxy/ca.key".into(),
             session_ttl_seconds: 900,
@@ -1143,16 +1165,16 @@ mod tests {
         );
         config.transparent_proxy.as_mut().unwrap().listen = "127.0.0.1:14323".into();
         config.transparent_proxy.as_mut().unwrap().proxy_url =
-            "https://av-proxy.example.test:14323".into();
+            "http://av-proxy.example.test:14323".into();
         assert!(
             config
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("credential-free HTTP origin")
+                .contains("credential-free HTTPS DNS origin")
         );
         config.transparent_proxy.as_mut().unwrap().proxy_url =
-            "http://av-proxy.example.test:14323".into();
+            "https://av-proxy.example.test:14323".into();
         config
             .transparent_proxy
             .as_mut()

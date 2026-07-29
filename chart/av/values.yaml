@@ -26,12 +26,16 @@ service:
 
 # The transparent listener is deliberately opt-in. It is a private CONNECT/TLS
 # interception service, never an Ingress backend. proxyUrl is the private
-# origin local `av run` helpers reach; it must resolve only inside the chosen
-# trusted network boundary.
+# HTTPS origin local `av run` helpers reach; it must resolve only inside the
+# chosen trusted network boundary.
 transparentProxy:
   enabled: false
   port: 14323
   proxyUrl: ""
+  transportTlsSecret:
+    name: ""
+    certificateKey: tls.crt
+    privateKeyKey: tls.key
   caSecret:
     name: ""
     certificateKey: ca.crt

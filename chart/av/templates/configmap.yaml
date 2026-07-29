@@ -15,9 +15,11 @@
 {{- fail "transparentProxy.enabled requires controlPlane.mode=managed for revocable sessions" -}}
 {{- end -}}
 {{- $proxyURL := required "transparentProxy.proxyUrl is required when transparentProxy.enabled" .Values.transparentProxy.proxyUrl -}}
+{{- $transportTlsSecretName := required "transparentProxy.transportTlsSecret.name is required when transparentProxy.enabled" .Values.transparentProxy.transportTlsSecret.name -}}
 {{- $caSecretName := required "transparentProxy.caSecret.name is required when transparentProxy.enabled" .Values.transparentProxy.caSecret.name -}}
+{{- $_ := $transportTlsSecretName -}}
 {{- $_ := $caSecretName -}}
-{{- $_ := set $config "transparent_proxy" (dict "listen" (printf "0.0.0.0:%v" .Values.transparentProxy.port) "proxy_url" $proxyURL "ca_certificate_file" "/var/run/av/transparent-proxy/ca.crt" "ca_private_key_file" "/var/run/av/transparent-proxy/ca.key") -}}
+{{- $_ := set $config "transparent_proxy" (dict "listen" (printf "0.0.0.0:%v" .Values.transparentProxy.port) "proxy_url" $proxyURL "transport_tls_certificate_file" "/var/run/av/transparent-proxy-transport/tls.crt" "transport_tls_private_key_file" "/var/run/av/transparent-proxy-transport/tls.key" "ca_certificate_file" "/var/run/av/transparent-proxy-ca/ca.crt" "ca_private_key_file" "/var/run/av/transparent-proxy-ca/ca.key") -}}
 {{- else -}}
 {{- $_ := unset $config "transparent_proxy" -}}
 {{- end -}}

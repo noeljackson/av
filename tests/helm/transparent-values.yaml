@@ -9,7 +9,9 @@ controlPlane:
 
 transparentProxy:
   enabled: true
-  proxyUrl: http://av-proxy.test.internal:14323
+  proxyUrl: https://av-proxy.test.internal:14323
+  transportTlsSecret:
+    name: test-av-proxy-transport
   caSecret:
     name: test-av-proxy-ca
   networkPolicy:

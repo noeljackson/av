@@ -8,5 +8,6 @@ pub mod proxy_ca;
 pub mod server;
 pub mod store;
 pub mod transparent_proxy;
+pub mod transport_tls;
 
 connectrpc::include_generated!();

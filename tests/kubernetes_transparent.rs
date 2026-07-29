@@ -48,7 +48,9 @@ controlPlane:
 transparentProxy:
   enabled: true
   port: 14323
-  proxyUrl: http://av-av-proxy.{namespace}.svc.cluster.local:14323
+  proxyUrl: https://av-av-proxy.{namespace}.svc.cluster.local:14323
+  transportTlsSecret:
+    name: synthetic-proxy-transport
   caSecret:
     name: synthetic-proxy-ca
   networkPolicy:

@@ -111,9 +111,10 @@ therefore remain narrow.
    a session credential only to the local helper over authenticated TLS.
 4. The helper starts a loopback HTTP forward proxy, configures CA trust for the
    child, and launches `codex`.
-5. A client request reaches the helper. The helper authenticates to AV's
-   private proxy listener; AV accepts only a configured `CONNECT host:443` or
-   an allowed plaintext HTTP destination.
+5. A client request reaches the helper. The helper first authenticates the
+   network proxy's HTTPS transport certificate, then sends its session
+   capability. AV accepts only a configured `CONNECT host:443`; plaintext
+   network proxy traffic and plaintext upstream destinations are rejected.
 6. AV maps the host to exactly one connector route, enforces that route's
    method/path/query/header/content policy, fetches the provider credential,
    strips caller auth, and injects the fixed credential form.
@@ -155,11 +156,12 @@ The initial implementation must use these rules:
   transparently intercepted; use a named route, a provider-supported dynamic
   credential, or a deliberate Tier 3 exception for that integration.
 
-The proxy listener itself may use plain HTTP *inside a private, authenticated
-transport* because the TLS being intercepted belongs to the upstream request.
-Where the network has any untrusted hop, wrap the proxy transport in mTLS or
-keep the session helper and proxy on an authenticated private overlay. A public
-HTTP proxy listener is never acceptable.
+The network-exposed proxy listener uses HTTPS independently of the upstream TLS
+that AV intercepts. The helper validates its configured DNS name against public
+WebPKI roots, or an explicitly configured private trust anchor, before sending
+the session capability. The process-local helper remains an HTTP proxy bound
+only to loopback so existing SDKs can use it without learning the remote
+capability. A plaintext network proxy listener is never supported.
 
 ## Connector policy
 
@@ -233,6 +235,19 @@ Inside Codex or Claude, the normal workflow is simply to use a configured
 provider tool or SDK. The agent does not run `av ... -- env`, does not copy a
 token into a prompt, and does not add provider keys to a `.env` file. AV's
 profile and connector policy determine which provider operations succeed.
+
+The proxy origin returned by AV must use a publicly trusted HTTPS certificate.
+For a deliberately private test deployment, point the helper at one additional
+PEM trust anchor without exposing it to the child:
+
+```bash
+AV_PROXY_TRANSPORT_CA_FILE=/absolute/path/to/transport-ca.pem \
+  av run orchard-dev -- ./bin/orchard-worker
+```
+
+This trust anchor authenticates only the outer helper-to-AV transport. It is
+separate from the deployment's MITM CA certificate, which AV supplies to the
+child for configured provider hosts.
 
 For a high-impact operation, prefer a narrow application tool backed by an
 explicit named route over giving the agent broad transparent access to a
