@@ -44,6 +44,13 @@ environment, so treat Tier 3 as the compatibility path: grant the smallest
 possible profile and do not put production and development credentials in the
 same profile.
 
+When the profile uses an OpenBao or Infisical dynamic secret, the same command
+owns the entire lease lifecycle. AV renews the short-lived provider credential
+while the child is alive and synchronously revokes it when the child exits.
+Removing the subject's environment grant makes the next renewal fail closed
+and terminates the child. The child sees only the exported credential fields,
+never the backend lease ID or AV's opaque renewal handle.
+
 For an agent task, the practical workflow is:
 
 1. Give the agent an `orchard-dev` profile, never an unrestricted platform
@@ -52,8 +59,8 @@ For an agent task, the practical workflow is:
    `av orchard-dev -- claude`.
 3. Keep irreversible production operations in a separate `orchard-ops`
    profile with a separate grant and human review.
-4. End the child process when the task finishes. The profile values disappear
-   with that process.
+4. End the child process when the task finishes. Static profile values
+   disappear with that process; dynamic provider credentials are also revoked.
 
 ## Tier 2: use a named proxy route
 

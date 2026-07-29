@@ -121,6 +121,7 @@ def main():
     _, profiles, _ = request("/v1/profiles")
     assert profiles == [
         {"name": "infisical-integration", "environment": "dev", "path": "/"},
+        {"name": "openbao-dynamic", "environment": "", "path": "database/creds/av"},
         {"name": "openbao-integration", "environment": "", "path": "secret/data/av-integration"},
     ]
     _, destinations, _ = connect(

@@ -8,6 +8,8 @@ service SessionService {
   rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
   rpc ListProxyDestinations(ListProxyDestinationsRequest) returns (ListProxyDestinationsResponse);
   rpc GetProfileEnvironment(GetProfileEnvironmentRequest) returns (ProfileEnvironment);
+  rpc RenewProfileEnvironmentLease(RenewProfileEnvironmentLeaseRequest) returns (ProfileEnvironmentLease);
+  rpc RevokeProfileEnvironmentLease(RevokeProfileEnvironmentLeaseRequest) returns (ProfileEnvironmentLease);
   rpc CreateProxySession(CreateProxySessionRequest) returns (ProxySessionLease);
   rpc RenewProxySession(RenewProxySessionRequest) returns (ProxySessionLease);
   rpc RevokeProxySession(RevokeProxySessionRequest) returns (ProxySessionLease);
@@ -99,6 +101,23 @@ message EnvironmentValue {
 
 message ProfileEnvironment {
   repeated EnvironmentValue values = 1;
+  // Opaque AV handle. Backend lease IDs are never returned.
+  string lease_id = 2;
+  int64 expires_unix_seconds = 3;
+}
+
+message RenewProfileEnvironmentLeaseRequest {
+  string lease_id = 1;
+}
+
+message RevokeProfileEnvironmentLeaseRequest {
+  string lease_id = 1;
+}
+
+message ProfileEnvironmentLease {
+  string lease_id = 1;
+  int64 expires_unix_seconds = 2;
+  bool revoked = 3;
 }
 
 message CreateProxySessionRequest {

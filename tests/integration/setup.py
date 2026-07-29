@@ -129,7 +129,12 @@ def bootstrap_openbao():
         "/v1/sys/policies/acl/av-integration",
         method="PUT",
         payload={
-            "policy": 'path "secret/data/av-integration" { capabilities = ["read"] }'
+            "policy": (
+                'path "secret/data/av-integration" { capabilities = ["read"] }\n'
+                'path "database/creds/av" { capabilities = ["read"] }\n'
+                'path "sys/leases/renew" { capabilities = ["update"] }\n'
+                'path "sys/leases/revoke" { capabilities = ["update"] }'
+            )
         },
     )
     bao_request(
@@ -335,6 +340,17 @@ def write_config(project_id, environment):
                 "connector": "openbao",
                 "secret_path": "secret/data/av-integration",
                 "allowed_keys": ["OPENBAO_MARKER"],
+            },
+            "openbao-dynamic": {
+                "connector": "openbao",
+                "secret_path": "database/creds/av",
+                "exports": {
+                    "DATABASE_USER": {"field": "username"},
+                    "DATABASE_PASSWORD": {"field": "password"},
+                },
+                "dynamic_secret": {
+                    "ttl_seconds": 30,
+                },
             },
             "ungranted-integration": {
                 "connector": "openbao",

@@ -68,17 +68,19 @@ use crate::{
         ListProfileGrantsRequest, ListProfileGrantsResponse, ListProfilesRequest,
         ListProfilesResponse, ListProxyDestinationsRequest, ListProxyDestinationsResponse,
         PrincipalRole as RpcPrincipalRole, Profile as RpcProfile, ProfileEnvironment,
-        ProfileGrant as RpcProfileGrant, ProxyDestination as RpcProxyDestination,
-        ProxySessionLease, RenewProxySessionRequest, RevokeProfileRequest,
-        RevokeProxySessionRequest, RotateAgentRequest, SessionService, SessionServiceExt,
-        SetAgentEnabledRequest, SetBasicUserEnabledRequest, SetPrincipalRoleRequest,
-        Status as RpcStatus, UpsertBasicUserRequest,
+        ProfileEnvironmentLease, ProfileGrant as RpcProfileGrant,
+        ProxyDestination as RpcProxyDestination, ProxySessionLease,
+        RenewProfileEnvironmentLeaseRequest, RenewProxySessionRequest,
+        RevokeProfileEnvironmentLeaseRequest, RevokeProfileRequest, RevokeProxySessionRequest,
+        RotateAgentRequest, SessionService, SessionServiceExt, SetAgentEnabledRequest,
+        SetBasicUserEnabledRequest, SetPrincipalRoleRequest, Status as RpcStatus,
+        UpsertBasicUserRequest,
     },
     config::{
         AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyInjectionConfig,
         ProxyResponseMode, ProxyRouteConfig, ProxyWebSocketConfig,
     },
-    connector::Connector,
+    connector::{BackendLease, Connector, SecretAcquisition},
     proxy_ca::ProxyCertificateAuthority,
     store::{GrantMode, PrincipalRole, Store},
     transparent_proxy::{
@@ -100,6 +102,85 @@ struct AppState {
     store: Option<Store>,
     github_browser_auth: Option<GithubBrowserAuth>,
     transparent_proxy: Option<Arc<TransparentProxyRuntime>>,
+    dynamic_leases: DynamicLeaseRegistry,
+}
+
+const MAX_ACTIVE_DYNAMIC_LEASES: usize = 1024;
+
+#[derive(Clone, Default)]
+struct DynamicLeaseRegistry {
+    active: Arc<Mutex<BTreeMap<String, ActiveDynamicLease>>>,
+}
+
+struct ActiveDynamicLease {
+    subject: String,
+    profile: String,
+    connector: String,
+    lease: BackendLease,
+}
+
+impl DynamicLeaseRegistry {
+    async fn insert(
+        &self,
+        subject: String,
+        profile: String,
+        connector: String,
+        lease: BackendLease,
+    ) -> std::result::Result<String, ActiveDynamicLease> {
+        let item = ActiveDynamicLease {
+            subject,
+            profile,
+            connector,
+            lease,
+        };
+        let mut active = self.active.lock().await;
+        let now = SystemTime::now();
+        active.retain(|_, item| item.lease.expires_at() > now);
+        if active.len() >= MAX_ACTIVE_DYNAMIC_LEASES {
+            return Err(item);
+        }
+        let mut selected = None;
+        for _ in 0..8 {
+            let handle = format!("av_lease_{}", random_browser_token());
+            if !active.contains_key(&handle) {
+                selected = Some(handle);
+                break;
+            }
+        }
+        let Some(handle) = selected else {
+            return Err(item);
+        };
+        active.insert(handle.clone(), item);
+        Ok(handle)
+    }
+
+    async fn take_for_subject(&self, handle: &str, subject: &str) -> Option<ActiveDynamicLease> {
+        let mut active = self.active.lock().await;
+        let item = active.get(handle)?;
+        if item.subject != subject || item.lease.expires_at() <= SystemTime::now() {
+            return None;
+        }
+        active.remove(handle)
+    }
+
+    async fn restore(
+        &self,
+        handle: String,
+        lease: ActiveDynamicLease,
+    ) -> std::result::Result<(), ActiveDynamicLease> {
+        let mut active = self.active.lock().await;
+        if active.contains_key(&handle) {
+            return Err(lease);
+        }
+        active.insert(handle, lease);
+        Ok(())
+    }
+
+    async fn drain(&self) -> Vec<ActiveDynamicLease> {
+        std::mem::take(&mut *self.active.lock().await)
+            .into_values()
+            .collect()
+    }
 }
 
 struct TransparentProxyRuntime {
@@ -1209,20 +1290,72 @@ impl SessionService for ConnectSessionService {
                 "executable_basename must be a basename without control characters",
             ));
         }
-        let secrets = fetch_secrets(&self.state, profile)
+        let mut acquisition = acquire_secrets(&self.state, profile)
             .await
             .map_err(|error| {
                 tracing::warn!(subject = %identity.subject, profile = profile_name, error = %error, "profile environment unavailable");
                 connectrpc::ConnectError::internal("profile environment unavailable")
             })?;
+        let (lease_id, expires_unix_seconds) = if let Some(lease) = acquisition.lease.take() {
+            let expires = match dynamic_lease_expiry(&lease) {
+                Ok(expires) => expires,
+                Err(error) => {
+                    tracing::error!(profile = profile_name, %error, "dynamic lease expiry invalid");
+                    let active = ActiveDynamicLease {
+                        subject: identity.subject.clone(),
+                        profile: profile_name.to_owned(),
+                        connector: profile.connector.clone(),
+                        lease,
+                    };
+                    if let Err(revoke_error) = revoke_dynamic_lease(&self.state, &active).await {
+                        tracing::error!(
+                            profile = profile_name,
+                            error = %revoke_error,
+                            "revoke dynamic lease with invalid expiry"
+                        );
+                    }
+                    return Err(connectrpc::ConnectError::internal(
+                        "profile environment unavailable",
+                    ));
+                }
+            };
+            match self
+                .state
+                .dynamic_leases
+                .insert(
+                    identity.subject.clone(),
+                    profile_name.to_owned(),
+                    profile.connector.clone(),
+                    lease,
+                )
+                .await
+            {
+                Ok(handle) => (handle, expires),
+                Err(active) => {
+                    if let Err(error) = revoke_dynamic_lease(&self.state, &active).await {
+                        tracing::error!(
+                            profile = profile_name,
+                            connector = %profile.connector,
+                            %error,
+                            "revoke unregistered dynamic lease"
+                        );
+                    }
+                    return Err(connectrpc::ConnectError::resource_exhausted(
+                        "active dynamic lease limit reached",
+                    ));
+                }
+            }
+        } else {
+            (String::new(), 0)
+        };
         tracing::info!(
             subject = %identity.subject,
             profile = profile_name,
             executable,
-            key_count = secrets.len(),
+            key_count = acquisition.values.len(),
             "profile leased"
         );
-        audit_event(
+        if let Err(error) = audit_event(
             &self.state,
             &identity.subject,
             "profile_lease",
@@ -1231,9 +1364,29 @@ impl SessionService for ConnectSessionService {
             Some(executable),
         )
         .await
-        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        {
+            if !lease_id.is_empty()
+                && let Some(active) = self
+                    .state
+                    .dynamic_leases
+                    .take_for_subject(&lease_id, &identity.subject)
+                    .await
+                && let Err(revoke_error) = revoke_dynamic_lease(&self.state, &active).await
+            {
+                tracing::error!(
+                    profile = profile_name,
+                    error = %revoke_error,
+                    "revoke dynamic lease after audit failure"
+                );
+            }
+            tracing::error!(%error, "persist profile lease audit event");
+            return Err(connectrpc::ConnectError::internal(
+                "audit persistence unavailable",
+            ));
+        }
         connectrpc::Response::ok(ProfileEnvironment {
-            values: secrets
+            values: acquisition
+                .values
                 .into_iter()
                 .map(|(name, value)| EnvironmentValue {
                     name,
@@ -1241,6 +1394,198 @@ impl SessionService for ConnectSessionService {
                     ..Default::default()
                 })
                 .collect(),
+            lease_id,
+            expires_unix_seconds,
+            ..Default::default()
+        })
+    }
+
+    async fn renew_profile_environment_lease(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, RenewProfileEnvironmentLeaseRequest>,
+    ) -> connectrpc::ServiceResult<ProfileEnvironmentLease> {
+        let identity = authorize_connect(&self.state, ctx.headers()).await?;
+        let handle = request.lease_id;
+        validate_dynamic_lease_handle(handle)?;
+        let Some(mut active) = self
+            .state
+            .dynamic_leases
+            .take_for_subject(handle, &identity.subject)
+            .await
+        else {
+            return Err(connectrpc::ConnectError::not_found(
+                "active dynamic lease not found",
+            ));
+        };
+        if !profile_permitted(
+            &self.state,
+            &identity.subject,
+            &active.profile,
+            GrantMode::Environment,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        {
+            if let Err(error) = revoke_dynamic_lease(&self.state, &active).await {
+                tracing::error!(profile = %active.profile, %error, "revoke ungranted dynamic lease");
+            }
+            return Err(connectrpc::ConnectError::permission_denied(
+                "profile access is not granted",
+            ));
+        }
+        let Some(connector) = self.state.connectors.get(&active.connector) else {
+            let _ = self
+                .state
+                .dynamic_leases
+                .restore(handle.to_owned(), active)
+                .await;
+            return Err(connectrpc::ConnectError::internal(
+                "profile connector unavailable",
+            ));
+        };
+        if !active.lease.renewable() {
+            if let Err(error) = connector.revoke(&active.lease).await {
+                tracing::error!(profile = %active.profile, %error, "revoke non-renewable dynamic lease");
+            }
+            return Err(connectrpc::ConnectError::failed_precondition(
+                "dynamic lease is not renewable",
+            ));
+        }
+        if let Err(error) = connector.renew(&mut active.lease).await {
+            tracing::warn!(profile = %active.profile, %error, "dynamic lease renewal failed");
+            if let Err(revoke_error) = connector.revoke(&active.lease).await {
+                tracing::error!(profile = %active.profile, error = %revoke_error, "revoke failed dynamic lease");
+                if let Err(active) = self
+                    .state
+                    .dynamic_leases
+                    .restore(handle.to_owned(), active)
+                    .await
+                {
+                    tracing::error!(
+                        profile = %active.profile,
+                        "dynamic lease registry collision after failed revocation"
+                    );
+                }
+            }
+            return Err(connectrpc::ConnectError::internal(
+                "dynamic lease renewal failed",
+            ));
+        }
+        let expires_unix_seconds = match dynamic_lease_expiry(&active.lease) {
+            Ok(expires) => expires,
+            Err(error) => {
+                tracing::error!(profile = %active.profile, %error, "renewed dynamic lease expiry invalid");
+                if let Err(revoke_error) = revoke_dynamic_lease(&self.state, &active).await {
+                    tracing::error!(
+                        profile = %active.profile,
+                        error = %revoke_error,
+                        "revoke dynamic lease with invalid renewed expiry"
+                    );
+                    let _ = self
+                        .state
+                        .dynamic_leases
+                        .restore(handle.to_owned(), active)
+                        .await;
+                }
+                return Err(connectrpc::ConnectError::internal(
+                    "dynamic lease expiry is invalid",
+                ));
+            }
+        };
+        let profile = active.profile.clone();
+        if let Err(error) = audit_event(
+            &self.state,
+            &identity.subject,
+            "profile_lease_renewed",
+            Some(&profile),
+            None,
+            None,
+        )
+        .await
+        {
+            if let Err(revoke_error) = revoke_dynamic_lease(&self.state, &active).await {
+                tracing::error!(
+                    profile = %active.profile,
+                    error = %revoke_error,
+                    "revoke dynamic lease after renewal audit failure"
+                );
+            }
+            tracing::error!(%error, "persist dynamic lease renewal audit event");
+            return Err(connectrpc::ConnectError::internal(
+                "audit persistence unavailable",
+            ));
+        }
+        if let Err(active) = self
+            .state
+            .dynamic_leases
+            .restore(handle.to_owned(), active)
+            .await
+        {
+            if let Err(error) = revoke_dynamic_lease(&self.state, &active).await {
+                tracing::error!(profile = %active.profile, %error, "revoke colliding dynamic lease");
+            }
+            return Err(connectrpc::ConnectError::internal(
+                "dynamic lease registry unavailable",
+            ));
+        }
+        connectrpc::Response::ok(ProfileEnvironmentLease {
+            lease_id: handle.to_owned(),
+            expires_unix_seconds,
+            revoked: false,
+            ..Default::default()
+        })
+    }
+
+    async fn revoke_profile_environment_lease(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, RevokeProfileEnvironmentLeaseRequest>,
+    ) -> connectrpc::ServiceResult<ProfileEnvironmentLease> {
+        let identity = authorize_connect(&self.state, ctx.headers()).await?;
+        let handle = request.lease_id;
+        validate_dynamic_lease_handle(handle)?;
+        let Some(active) = self
+            .state
+            .dynamic_leases
+            .take_for_subject(handle, &identity.subject)
+            .await
+        else {
+            return Err(connectrpc::ConnectError::not_found(
+                "active dynamic lease not found",
+            ));
+        };
+        if let Err(error) = revoke_dynamic_lease(&self.state, &active).await {
+            tracing::error!(profile = %active.profile, %error, "dynamic lease revocation failed");
+            if let Err(active) = self
+                .state
+                .dynamic_leases
+                .restore(handle.to_owned(), active)
+                .await
+            {
+                tracing::error!(
+                    profile = %active.profile,
+                    "dynamic lease registry collision after failed revocation"
+                );
+            }
+            return Err(connectrpc::ConnectError::internal(
+                "dynamic lease revocation failed",
+            ));
+        }
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "profile_lease_revoked",
+            Some(&active.profile),
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(ProfileEnvironmentLease {
+            lease_id: handle.to_owned(),
+            expires_unix_seconds: 0,
+            revoked: true,
             ..Default::default()
         })
     }
@@ -1744,6 +2089,7 @@ pub async fn run(config: Config) -> Result<()> {
         store,
         github_browser_auth,
         transparent_proxy: transparent_proxy.clone(),
+        dynamic_leases: DynamicLeaseRegistry::default(),
     };
     if let Some(transparent_proxy) = transparent_proxy {
         let listener = TcpListener::bind(&transparent_proxy.listen)
@@ -1839,15 +2185,63 @@ pub async fn run(config: Config) -> Result<()> {
         .layer(TraceLayer::new_for_http().make_span_with(|request: &Request| {
             tracing::info_span!("http_request", method = %request.method(), path = request.uri().path())
         }))
-        .with_state(state);
+        .with_state(state.clone());
 
     let listener = tokio::net::TcpListener::bind(&config.listen)
         .await
         .with_context(|| format!("listen on {}", config.listen))?;
     tracing::info!(listen = %config.listen, "av is ready");
-    axum::serve(listener, app)
+    let result = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown())
-        .await?;
+        .await;
+    revoke_all_dynamic_leases(&state).await;
+    result?;
+    Ok(())
+}
+
+async fn revoke_all_dynamic_leases(state: &AppState) {
+    for active in state.dynamic_leases.drain().await {
+        if let Err(error) = revoke_dynamic_lease(state, &active).await {
+            tracing::error!(
+                profile = %active.profile,
+                connector = %active.connector,
+                %error,
+                "dynamic lease revocation failed during shutdown"
+            );
+        }
+    }
+}
+
+async fn revoke_dynamic_lease(state: &AppState, active: &ActiveDynamicLease) -> Result<()> {
+    state
+        .connectors
+        .get(&active.connector)
+        .context("dynamic lease connector disappeared")?
+        .revoke(&active.lease)
+        .await
+}
+
+fn dynamic_lease_expiry(lease: &BackendLease) -> Result<i64> {
+    let duration = lease
+        .expires_at()
+        .duration_since(UNIX_EPOCH)
+        .context("dynamic lease expiry predates the Unix epoch")?;
+    i64::try_from(duration.as_secs()).context("dynamic lease expiry is outside supported range")
+}
+
+fn validate_dynamic_lease_handle(
+    handle: &str,
+) -> std::result::Result<(), connectrpc::ConnectError> {
+    if !handle.starts_with("av_lease_")
+        || handle.len() != "av_lease_".len() + 43
+        || !handle["av_lease_".len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(connectrpc::ConnectError::invalid_argument(
+            "dynamic lease handle is invalid",
+        ));
+    }
     Ok(())
 }
 
@@ -4170,15 +4564,11 @@ async fn fetch_secrets(
     state: &AppState,
     profile: &ProfileConfig,
 ) -> Result<BTreeMap<String, String>> {
-    let _permit = tokio::time::timeout(Duration::from_secs(5), state.connector_slots.acquire())
-        .await
-        .context("connector concurrency queue timed out")?
-        .context("connector concurrency limiter is closed")?;
+    let mut acquisition = acquire_secrets(state, profile).await?;
     let connector = state
         .connectors
         .get(&profile.connector)
         .context("profile connector disappeared")?;
-    let mut acquisition = connector.acquire(profile).await?;
     if let Some(lease) = acquisition.lease.take() {
         if let Err(error) = connector.revoke(&lease).await {
             tracing::error!(
@@ -4190,6 +4580,19 @@ async fn fetch_secrets(
         bail!("dynamic lease delivery is not available through this path yet");
     }
     Ok(acquisition.values)
+}
+
+async fn acquire_secrets(state: &AppState, profile: &ProfileConfig) -> Result<SecretAcquisition> {
+    let _permit = tokio::time::timeout(Duration::from_secs(5), state.connector_slots.acquire())
+        .await
+        .context("connector concurrency queue timed out")?
+        .context("connector concurrency limiter is closed")?;
+    state
+        .connectors
+        .get(&profile.connector)
+        .context("profile connector disappeared")?
+        .acquire(profile)
+        .await
 }
 
 fn enforce_proxy_content_type(
@@ -4639,6 +5042,7 @@ mod tests {
             store: Some(store.clone()),
             github_browser_auth: None,
             transparent_proxy: None,
+            dynamic_leases: DynamicLeaseRegistry::default(),
         };
         let runtime = Arc::new(TransparentProxyRuntime {
             listen: "127.0.0.1:0".into(),
@@ -5847,5 +6251,47 @@ mod tests {
                 .unwrap()
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_lease_handles_are_subject_bound_and_non_replayable() {
+        let registry = DynamicLeaseRegistry::default();
+        let lease = BackendLease::OpenBao(crate::connector::OpenBaoLease {
+            id: Zeroizing::new("database/creds/example/synthetic".into()),
+            renewable: true,
+            expires_at: SystemTime::now() + Duration::from_secs(60),
+            renew_increment: Duration::from_secs(30),
+        });
+        let handle = match registry
+            .insert(
+                "oidc:owner".into(),
+                "database".into(),
+                "openbao".into(),
+                lease,
+            )
+            .await
+        {
+            Ok(handle) => handle,
+            Err(_) => panic!("synthetic lease should fit in an empty registry"),
+        };
+        assert!(validate_dynamic_lease_handle(&handle).is_ok());
+        assert!(
+            registry
+                .take_for_subject(&handle, "oidc:other")
+                .await
+                .is_none()
+        );
+        let active = registry
+            .take_for_subject(&handle, "oidc:owner")
+            .await
+            .unwrap();
+        assert_eq!(active.profile, "database");
+        assert!(
+            registry
+                .take_for_subject(&handle, "oidc:owner")
+                .await
+                .is_none()
+        );
+        assert!(validate_dynamic_lease_handle("database/creds/provider/id").is_err());
     }
 }

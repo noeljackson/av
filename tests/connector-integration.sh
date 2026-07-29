@@ -5,8 +5,12 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 compose=(docker compose --project-name "av-connectors-${UID}-$$" --file "$root/tests/integration/compose.yml")
 workdir=$(mktemp -d "$root/.tmp.connector-cli.XXXXXX")
 export AV_POSTGRES_TLS_DIR="$workdir/postgres-tls"
+test_containers=()
 
 cleanup() {
+  if ((${#test_containers[@]})); then
+    docker rm --force "${test_containers[@]}" >/dev/null 2>&1 || true
+  fi
   "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$workdir"
 }
@@ -107,6 +111,7 @@ run_cli() {
 
 run_cli profiles >"$workdir/profiles"
 grep --quiet '^infisical-integration' "$workdir/profiles"
+grep --quiet '^openbao-dynamic' "$workdir/profiles"
 grep --quiet '^openbao-integration' "$workdir/profiles"
 
 run_cli routes >"$workdir/routes"
@@ -133,6 +138,120 @@ run_cli openbao-integration -- sh -eu -c '
   test -z "${AV_BASIC_USER:-}"
   test -z "${AV_BASIC_PASSWORD:-}"
 '
+
+# A real OpenBao database lease is owned by the wrapped child: it stays usable
+# across renewal, is synchronously revoked when the child exits, and never
+# exposes the backend lease ID to the child.
+mkdir "$workdir/dynamic-credentials"
+chmod 0700 "$workdir/dynamic-credentials"
+docker run --rm --pull never \
+  --network "container:$av_container" \
+  --user "$(id -u):$(id -g)" \
+  --read-only \
+  --tmpfs /tmp \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --volume "$workdir/av:/usr/local/bin/av:ro" \
+  --volume "$workdir/dynamic-credentials:/capture" \
+  --env AV_URL=http://127.0.0.1:14322 \
+  --env AV_BASIC_USER=operator \
+  --env AV_BASIC_PASSWORD=password \
+  --entrypoint /usr/local/bin/av \
+  docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579 \
+  openbao-dynamic -- sh -ec '
+    umask 077
+    printf "%s\n" "$DATABASE_USER" > /capture/user
+    printf "%s\n" "$DATABASE_PASSWORD" > /capture/password
+    PGPASSWORD="$DATABASE_PASSWORD" psql -h postgres -U "$DATABASE_USER" -d av -tAc "SELECT 1" >/dev/null
+    sleep 12
+    PGPASSWORD="$DATABASE_PASSWORD" psql -h postgres -U "$DATABASE_USER" -d av -tAc "SELECT 1" >/dev/null
+  '
+if docker run --rm --pull never \
+  --network "container:$av_container" \
+  --user "$(id -u):$(id -g)" \
+  --read-only \
+  --tmpfs /tmp \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --volume "$workdir/dynamic-credentials:/capture:ro" \
+  --entrypoint sh \
+  docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579 \
+  -ec '
+    IFS= read -r user < /capture/user
+    IFS= read -r password < /capture/password
+    PGPASSWORD="$password" psql -h postgres -U "$user" -d av -tAc "SELECT 1" >/dev/null 2>&1
+  '; then
+  echo "revoked OpenBao database credential remained usable" >&2
+  exit 1
+fi
+
+# Grant removal is enforced at renewal time. The wrapper must terminate the
+# child and AV must revoke the credential rather than letting the environment
+# grant remain usable until the backend's maximum TTL.
+mkdir "$workdir/revoked-grant-credentials"
+chmod 0700 "$workdir/revoked-grant-credentials"
+revoked_grant_container=$(docker run --detach --pull never \
+  --network "container:$av_container" \
+  --user "$(id -u):$(id -g)" \
+  --read-only \
+  --tmpfs /tmp \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --volume "$workdir/av:/usr/local/bin/av:ro" \
+  --volume "$workdir/revoked-grant-credentials:/capture" \
+  --env AV_URL=http://127.0.0.1:14322 \
+  --env AV_BASIC_USER=operator \
+  --env AV_BASIC_PASSWORD=password \
+  --entrypoint /usr/local/bin/av \
+  docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579 \
+  openbao-dynamic -- sh -ec '
+    umask 077
+    printf "%s\n" "$DATABASE_USER" > /capture/user
+    printf "%s\n" "$DATABASE_PASSWORD" > /capture/password
+    PGPASSWORD="$DATABASE_PASSWORD" psql -h postgres -U "$DATABASE_USER" -d av -tAc "SELECT 1" >/dev/null
+    sleep 120
+  ')
+test_containers+=("$revoked_grant_container")
+for _ in $(seq 1 50); do
+  if [[ -s "$workdir/revoked-grant-credentials/user" && -s "$workdir/revoked-grant-credentials/password" ]]; then
+    break
+  fi
+  sleep 0.2
+done
+[[ -s "$workdir/revoked-grant-credentials/user" ]]
+[[ -s "$workdir/revoked-grant-credentials/password" ]]
+# shellcheck disable=SC2016 # The disposable database container expands this.
+"${compose[@]}" run --no-deps --rm managed-seed sh -ec '
+  database_url="$(cat /state/av-control-plane-url)"
+  psql "$database_url" -v ON_ERROR_STOP=1 -c \
+    "DELETE FROM av_capability_grants WHERE subject = '\''basic:operator'\'' AND profile = '\''openbao-dynamic'\''" >/dev/null
+'
+if ! revoked_grant_status=$(timeout 20s docker wait "$revoked_grant_container"); then
+  echo "dynamic profile child survived grant revocation" >&2
+  exit 1
+fi
+if [[ "$revoked_grant_status" == 0 ]]; then
+  echo "dynamic profile wrapper exited successfully after grant revocation" >&2
+  exit 1
+fi
+if docker run --rm --pull never \
+  --network "container:$av_container" \
+  --user "$(id -u):$(id -g)" \
+  --read-only \
+  --tmpfs /tmp \
+  --cap-drop ALL \
+  --security-opt no-new-privileges:true \
+  --volume "$workdir/revoked-grant-credentials:/capture:ro" \
+  --entrypoint sh \
+  docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579 \
+  -ec '
+    IFS= read -r user < /capture/user
+    IFS= read -r password < /capture/password
+    PGPASSWORD="$password" psql -h postgres -U "$user" -d av -tAc "SELECT 1" >/dev/null 2>&1
+  '; then
+  echo "grant-revoked OpenBao database credential remained usable" >&2
+  exit 1
+fi
 
 # The wrapped child trusts a synthetic upstream CA that is deliberately
 # distinct from AV's interception CA. Successful HTTPS therefore proves that

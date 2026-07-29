@@ -10,7 +10,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use av::{
     av::v1::{
         AgentCredential, AuthConfig as RpcAuthConfig, CreateAgentRequest,
@@ -18,9 +18,10 @@ use av::{
         GetProfileEnvironmentRequest, GrantProfileRequest, ListAgentsRequest, ListAgentsResponse,
         ListPrincipalRolesRequest, ListPrincipalRolesResponse, ListProfilesRequest,
         ListProfilesResponse, ListProxyDestinationsRequest, ListProxyDestinationsResponse,
-        ProfileEnvironment, ProxySessionLease, RenewProxySessionRequest, RevokeProfileRequest,
-        RevokeProxySessionRequest, RotateAgentRequest, SetAgentEnabledRequest,
-        SetPrincipalRoleRequest,
+        ProfileEnvironment, ProfileEnvironmentLease, ProxySessionLease,
+        RenewProfileEnvironmentLeaseRequest, RenewProxySessionRequest,
+        RevokeProfileEnvironmentLeaseRequest, RevokeProfileRequest, RevokeProxySessionRequest,
+        RotateAgentRequest, SetAgentEnabledRequest, SetPrincipalRoleRequest,
     },
     config::{AuthConfig, AuthMode, Config, ConfigMode, ManagedConfig, OidcSigningAlgorithm},
     keyring,
@@ -715,10 +716,97 @@ async fn run_profile(api_url: &str, mut arguments: Vec<OsString>) -> Result<u8> 
             bail!("profile contains a key that is not a valid environment variable: {key}");
         }
     }
-    let status = profile_command(executable, arguments, secrets)
-        .status()
-        .context("start child process")?;
+    if environment.lease_id.is_empty() {
+        if environment.expires_unix_seconds != 0 {
+            bail!("AV returned an invalid static profile environment");
+        }
+        return run_profile_child(executable, arguments, secrets).await;
+    }
+    if environment.expires_unix_seconds <= 0 {
+        bail!("AV returned an invalid dynamic profile lease");
+    }
+    let lease_id = environment.lease_id;
+    let status = tokio::select! {
+        status = run_profile_child(executable, arguments, secrets) => status,
+        renewal = renew_profile_environment_lease_loop(
+            api_url,
+            &lease_id,
+            environment.expires_unix_seconds,
+        ) => {
+            match renewal {
+                Ok(()) => Err(anyhow!("dynamic profile lease renewal stopped unexpectedly")),
+                Err(error) => Err(error),
+            }
+        }
+    };
+    let revoke = connect_request::<_, ProfileEnvironmentLease>(
+        api_url,
+        "av.v1.SessionService/RevokeProfileEnvironmentLease",
+        &RevokeProfileEnvironmentLeaseRequest {
+            lease_id,
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    match (status, revoke) {
+        (Ok(status), Ok(response)) if response.revoked => Ok(status),
+        (Ok(_), Ok(_)) => bail!("AV returned an invalid dynamic lease revocation"),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("revoke dynamic profile lease"),
+        (Err(error), Err(revoke_error)) => Err(error).context(format!(
+            "profile child failed and dynamic lease revocation also failed: {revoke_error:#}"
+        )),
+    }
+}
+
+async fn run_profile_child(
+    executable: OsString,
+    arguments: Vec<OsString>,
+    secrets: BTreeMap<String, String>,
+) -> Result<u8> {
+    let mut command =
+        tokio::process::Command::from(profile_command(executable, arguments, secrets));
+    command.kill_on_drop(true);
+    let mut child = command.spawn().context("start profile child process")?;
+    let status = tokio::select! {
+        status = child.wait() => status.context("wait for profile child process")?,
+        signal = tokio::signal::ctrl_c() => {
+            signal.context("wait for interrupt")?;
+            let _ = child.kill().await;
+            child.wait().await.context("wait for interrupted profile child process")?
+        }
+    };
     Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
+}
+
+async fn renew_profile_environment_lease_loop(
+    api_url: &str,
+    lease_id: &str,
+    mut expires_unix_seconds: i64,
+) -> Result<()> {
+    loop {
+        let delay = renewal_delay(expires_unix_seconds, "dynamic profile lease")?;
+        tokio::time::sleep(delay).await;
+        let renewed: ProfileEnvironmentLease = connect_request(
+            api_url,
+            "av.v1.SessionService/RenewProfileEnvironmentLease",
+            &RenewProfileEnvironmentLeaseRequest {
+                lease_id: lease_id.to_owned(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .context("renew dynamic profile lease")?;
+        if renewed.lease_id != lease_id
+            || renewed.revoked
+            || renewed.expires_unix_seconds <= unix_now()?
+        {
+            bail!("AV returned an invalid dynamic profile lease renewal");
+        }
+        expires_unix_seconds = renewed.expires_unix_seconds;
+    }
 }
 
 async fn run_transparent_proxy(
@@ -810,22 +898,12 @@ async fn renew_proxy_session_loop(
     session_id: &str,
     mut expires_unix_seconds: i64,
 ) -> Result<()> {
-    if expires_unix_seconds <= 0 {
-        bail!("AV returned an invalid proxy session expiry");
-    }
     loop {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before Unix epoch")?
-            .as_secs();
-        let now = i64::try_from(now).context("system clock is outside supported range")?;
-        let remaining = expires_unix_seconds
-            .checked_sub(now)
-            .filter(|remaining| *remaining > 0)
-            .context("transparent proxy session expired before renewal")?;
-        let delay = u64::try_from((remaining / 2).max(1))
-            .context("proxy renewal delay is outside supported range")?;
-        tokio::time::sleep(Duration::from_secs(delay)).await;
+        tokio::time::sleep(renewal_delay(
+            expires_unix_seconds,
+            "transparent proxy session",
+        )?)
+        .await;
         let renewed: ProxySessionLease = connect_request(
             api_url,
             "av.v1.SessionService/RenewProxySession",
@@ -837,20 +915,32 @@ async fn renew_proxy_session_loop(
         )
         .await
         .context("renew transparent proxy session")?;
-        let renewed_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .context("system clock is before Unix epoch")?
-            .as_secs();
-        let renewed_now =
-            i64::try_from(renewed_now).context("system clock is outside supported range")?;
         if renewed.session_id != session_id
             || renewed.revoked
-            || renewed.expires_unix_seconds <= renewed_now
+            || renewed.expires_unix_seconds <= unix_now()?
         {
             bail!("AV returned an invalid proxy session renewal");
         }
         expires_unix_seconds = renewed.expires_unix_seconds;
     }
+}
+
+fn unix_now() -> Result<i64> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_secs();
+    i64::try_from(now).context("system clock is outside supported range")
+}
+
+fn renewal_delay(expires_unix_seconds: i64, label: &str) -> Result<Duration> {
+    let remaining = expires_unix_seconds
+        .checked_sub(unix_now()?)
+        .filter(|remaining| *remaining > 0)
+        .with_context(|| format!("{label} expired before renewal"))?;
+    let delay = u64::try_from((remaining / 2).max(1))
+        .with_context(|| format!("{label} renewal delay is outside supported range"))?;
+    Ok(Duration::from_secs(delay))
 }
 
 struct ProxyCaFile {
@@ -1392,6 +1482,14 @@ mod tests {
         assert!(valid_env_name("_PRIVATE"));
         assert!(!valid_env_name("1TOKEN"));
         assert!(!valid_env_name("BAD-NAME"));
+    }
+
+    #[test]
+    fn dynamic_renewal_uses_half_of_the_remaining_lease() {
+        let expiry = unix_now().unwrap() + 60;
+        let delay = renewal_delay(expiry, "test lease").unwrap();
+        assert!((29..=30).contains(&delay.as_secs()));
+        assert!(renewal_delay(unix_now().unwrap(), "expired lease").is_err());
     }
 
     #[test]

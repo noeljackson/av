@@ -127,6 +127,28 @@ memory; values remain only in the request or child that owns them. The
 configured TTL must be between 30 seconds and 24 hours. A shorter backend TTL
 is the crash backstop and is always authoritative.
 
+Run a dynamic profile through the normal child wrapper:
+
+```bash
+av example-database -- ./bin/example-api
+```
+
+AV assigns the backend lease to that one authenticated subject and child
+lifetime. It returns an opaque, subject-bound AV handle to the CLI instead of
+the OpenBao or Infisical lease ID, renews at half of the remaining TTL, and
+synchronously revokes the provider credential when the child exits or is
+interrupted. Renewal rechecks the subject's environment grant. If the grant is
+removed or renewal fails, the wrapper terminates the child and attempts
+revocation. On an ungraceful AV crash, the backend TTL is the final cleanup
+boundary.
+
+Active dynamic leases are intentionally process-local. They are bounded,
+cannot be replayed by another subject, are drained during graceful shutdown,
+and are not written to AV's database or audit log. This also means an AV
+instance must remain available for the lifetime of leases it issued; do not
+send one lease's renewals to a different replica until distributed lease
+ownership is explicitly implemented.
+
 Infisical Dynamic Secrets is a licensed feature. Static Infisical profiles
 continue using the existing raw-secrets API and do not require it.
 
