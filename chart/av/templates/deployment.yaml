@@ -20,6 +20,21 @@ spec:
         {{- end }}
       annotations:
         checksum/config: {{ printf "%s:%s:%s:%s" (.Values.config | toJson) .Values.controlPlane.mode .Values.controlPlane.initialOwnerOidcSubject (.Values.transparentProxy | toJson) | sha256sum }}
+        {{- if and (eq .Values.controlPlane.mode "managed") .Values.controlPlane.openbaoAgent.enabled }}
+        vault.hashicorp.com/agent-inject: "true"
+        vault.hashicorp.com/auth-path: {{ .Values.controlPlane.openbaoAgent.authPath | quote }}
+        vault.hashicorp.com/role: {{ required "controlPlane.openbaoAgent.role is required" .Values.controlPlane.openbaoAgent.role | quote }}
+        vault.hashicorp.com/service: {{ required "controlPlane.openbaoAgent.address is required" .Values.controlPlane.openbaoAgent.address | quote }}
+        vault.hashicorp.com/tls-secret: {{ required "controlPlane.openbaoAgent.tlsSecretName is required" .Values.controlPlane.openbaoAgent.tlsSecretName | quote }}
+        vault.hashicorp.com/ca-cert: {{ .Values.controlPlane.openbaoAgent.caCertificatePath | quote }}
+        vault.hashicorp.com/tls-server-name: {{ required "controlPlane.openbaoAgent.tlsServerName is required" .Values.controlPlane.openbaoAgent.tlsServerName | quote }}
+        vault.hashicorp.com/agent-inject-secret-database-credentials.json: {{ required "controlPlane.openbaoAgent.secretPath is required" .Values.controlPlane.openbaoAgent.secretPath | quote }}
+        vault.hashicorp.com/agent-inject-file-database-credentials.json: "database-credentials.json"
+        vault.hashicorp.com/agent-inject-template-database-credentials.json: |
+          {{`{{- with secret "`}}{{ required "controlPlane.openbaoAgent.secretPath is required" .Values.controlPlane.openbaoAgent.secretPath }}{{`" -}}`}}
+          {{`{{ .Data | toJSON }}`}}
+          {{`{{- end }}`}}
+        {{- end }}
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -69,7 +84,7 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            {{- if eq .Values.controlPlane.mode "managed" }}
+            {{- if and (eq .Values.controlPlane.mode "managed") (not .Values.controlPlane.openbaoAgent.enabled) }}
             - name: control-plane-database
               mountPath: /var/run/av/control-plane
               readOnly: true
@@ -93,7 +108,7 @@ spec:
             name: {{ include "av.fullname" . }}
         - name: tmp
           emptyDir: {}
-        {{- if eq .Values.controlPlane.mode "managed" }}
+        {{- if and (eq .Values.controlPlane.mode "managed") (not .Values.controlPlane.openbaoAgent.enabled) }}
         - name: control-plane-database
           secret:
             secretName: {{ required "controlPlane.existingDatabaseSecret.name is required in managed mode" .Values.controlPlane.existingDatabaseSecret.name }}

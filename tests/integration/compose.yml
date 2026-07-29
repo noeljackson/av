@@ -1,8 +1,46 @@
 name: av-connectors
 
 services:
+  postgres-tls-init:
+    image: docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        cp /input/server.crt /tls/server.crt
+        cp /input/server.key /tls/server.key
+        chown 70:70 /tls/server.crt /tls/server.key
+        chmod 0444 /tls/server.crt
+        chmod 0600 /tls/server.key
+    read_only: true
+    volumes:
+      - ${AV_POSTGRES_TLS_DIR:?set AV_POSTGRES_TLS_DIR}:/input:ro
+      - postgres-tls:/tls
+    networks: [connectors]
+
+  agent-credentials-init:
+    image: docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579
+    user: "0:0"
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown 65532:65532 /credentials && chmod 0700 /credentials"]
+    read_only: true
+    volumes:
+      - agent-credentials:/credentials
+    networks: [connectors]
+
   postgres:
     image: docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579
+    command:
+      - postgres
+      - -c
+      - ssl=on
+      - -c
+      - ssl_cert_file=/tls/server.crt
+      - -c
+      - ssl_key_file=/tls/server.key
+    depends_on:
+      postgres-tls-init:
+        condition: service_completed_successfully
     environment:
       POSTGRES_DB: infisical
       POSTGRES_PASSWORD: integration-only
@@ -15,6 +53,30 @@ services:
     networks: [connectors]
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      - postgres-tls:/tls:ro
+
+  av-database-bootstrap:
+    image: docker.io/library/postgres:14-alpine@sha256:f1341c01408dc7278e9d365ed4f860cd3f87dd16b4464ac326fc0f422083a579
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: integration-only
+      PGSSLMODE: require
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        psql -h postgres -U infisical -d postgres -tAc \
+          "SELECT 1 FROM pg_roles WHERE rolname = 'av_owner'" | grep -qx 1 ||
+          psql -h postgres -U infisical -d postgres -v ON_ERROR_STOP=1 -c \
+            "CREATE ROLE av_owner NOLOGIN"
+        psql -h postgres -U infisical -d postgres -tAc \
+          "SELECT 1 FROM pg_database WHERE datname = 'av'" | grep -qx 1 ||
+          psql -h postgres -U infisical -d postgres -v ON_ERROR_STOP=1 -c \
+            "CREATE DATABASE av OWNER av_owner"
+    read_only: true
+    networks: [connectors]
 
   redis:
     image: docker.io/library/redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
@@ -91,6 +153,8 @@ services:
         condition: service_healthy
       openbao:
         condition: service_healthy
+      av-database-bootstrap:
+        condition: service_completed_successfully
     environment:
       INFISICAL_URL: http://infisical:8080
       OPENBAO_ROOT_TOKEN: integration-only-root
@@ -100,6 +164,25 @@ services:
       - ./setup.py:/test/setup.py:ro
     networks: [connectors]
 
+  openbao-agent:
+    image: docker.io/openbao/openbao:2.5.4@sha256:436eaf9778cad75507ff70ea26ace30dcbe15606e619ac3823495663d7f7c115
+    command: ["agent", "-config=/state/openbao-agent.hcl"]
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+      agent-credentials-init:
+        condition: service_completed_successfully
+    user: "65532:65532"
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /credentials/database-credentials.json"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - connector-state:/state:ro
+      - agent-credentials:/credentials
+    networks: [connectors]
+
   av:
     image: ${AV_IMAGE:-av:integration}
     build:
@@ -107,14 +190,15 @@ services:
     command: ["serve", "--config", "/state/config.json"]
     read_only: true
     depends_on:
-      setup:
-        condition: service_completed_successfully
+      openbao-agent:
+        condition: service_healthy
       upstream:
         condition: service_healthy
     environment:
       AV_ALLOW_INSECURE_CONNECTORS: integration-tests-only
     volumes:
       - connector-state:/state:ro
+      - agent-credentials:/credentials:ro
     networks: [connectors]
 
   managed-seed:
@@ -158,6 +242,7 @@ services:
       AV_URL: http://av:14322
     volumes:
       - connector-state:/state:ro
+      - agent-credentials:/credentials:ro
       - ./verify.py:/test/verify.py:ro
     networks: [connectors]
 
@@ -193,4 +278,6 @@ networks:
 
 volumes:
   connector-state:
+  agent-credentials:
   postgres-data:
+  postgres-tls:

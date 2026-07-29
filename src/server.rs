@@ -2835,6 +2835,9 @@ mod tests {
         std::fs::write(&database_url_file, format!("sqlite:{}", database.display())).unwrap();
         let store = Store::connect(&ManagedConfig {
             database_url_file: database_url_file.display().to_string(),
+            database_credentials_file: String::new(),
+            postgres: None,
+            database_reload_interval_seconds: 0,
             initial_owner_oidc_subject: "basic:operator".into(),
         })
         .await
@@ -2900,6 +2903,9 @@ mod tests {
             mode: ConfigMode::Managed,
             managed: Some(ManagedConfig {
                 database_url_file: database_url_file.display().to_string(),
+                database_credentials_file: String::new(),
+                postgres: None,
+                database_reload_interval_seconds: 0,
                 initial_owner_oidc_subject: "basic:operator".into(),
             }),
             auth: AuthConfig {

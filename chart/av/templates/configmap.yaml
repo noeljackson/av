@@ -1,9 +1,26 @@
 {{- $config := deepCopy .Values.config -}}
 {{- if eq .Values.controlPlane.mode "managed" -}}
-{{- $databaseSecretName := required "controlPlane.existingDatabaseSecret.name is required in managed mode" .Values.controlPlane.existingDatabaseSecret.name -}}
 {{- $ownerSubject := required "controlPlane.initialOwnerOidcSubject is required in managed mode" .Values.controlPlane.initialOwnerOidcSubject -}}
 {{- $_ := set $config "mode" "managed" -}}
+{{- if .Values.controlPlane.openbaoAgent.enabled -}}
+{{- $agent := .Values.controlPlane.openbaoAgent -}}
+{{- $postgres := $agent.postgres -}}
+{{- $managed := dict
+    "database_credentials_file" $agent.credentialsFile
+    "database_reload_interval_seconds" $agent.reloadIntervalSeconds
+    "postgres" (dict
+      "host" (required "controlPlane.openbaoAgent.postgres.host is required" $postgres.host)
+      "port" $postgres.port
+      "database" (required "controlPlane.openbaoAgent.postgres.database is required" $postgres.database)
+      "ssl_mode" $postgres.sslMode
+      "role" (required "controlPlane.openbaoAgent.postgres.role is required" $postgres.role))
+    "initial_owner_oidc_subject" $ownerSubject -}}
+{{- $_ := set $config "managed" $managed -}}
+{{- else -}}
+{{- $databaseSecretName := required "controlPlane.existingDatabaseSecret.name is required in managed mode when openbaoAgent is disabled" .Values.controlPlane.existingDatabaseSecret.name -}}
+{{- $_ := $databaseSecretName -}}
 {{- $_ := set $config "managed" (dict "database_url_file" "/var/run/av/control-plane/database-url" "initial_owner_oidc_subject" $ownerSubject) -}}
+{{- end -}}
 {{- else if eq .Values.controlPlane.mode "static" -}}
 {{- $_ := set $config "mode" "static" -}}
 {{- $_ := unset $config "managed" -}}
