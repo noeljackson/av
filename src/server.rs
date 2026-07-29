@@ -3,7 +3,10 @@ use std::{
     convert::Infallible,
     io,
     net::{IpAddr, Ipv4Addr},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -103,6 +106,7 @@ struct AppState {
     github_browser_auth: Option<GithubBrowserAuth>,
     transparent_proxy: Option<Arc<TransparentProxyRuntime>>,
     dynamic_leases: DynamicLeaseRegistry,
+    shutting_down: Arc<AtomicBool>,
 }
 
 const MAX_ACTIVE_DYNAMIC_LEASES: usize = 1024;
@@ -2140,6 +2144,7 @@ pub async fn run(config: Config) -> Result<()> {
         github_browser_auth,
         transparent_proxy: transparent_proxy.clone(),
         dynamic_leases: DynamicLeaseRegistry::default(),
+        shutting_down: Arc::new(AtomicBool::new(false)),
     };
     if let Some(transparent_proxy) = transparent_proxy {
         let listener = TcpListener::bind(&transparent_proxy.listen)
@@ -2177,7 +2182,7 @@ pub async fn run(config: Config) -> Result<()> {
         .route("/assets/av.js", get(ui_js))
         .route("/assets/htmx-2.0.10.min.js", get(ui_htmx))
         .route("/healthz", get(health))
-        .route("/readyz", get(health))
+        .route("/readyz", get(readiness))
         .route("/v1/auth/config", get(auth_config))
         .route("/auth/github/start", get(github_start))
         .route("/auth/github/callback", get(github_callback))
@@ -2241,8 +2246,9 @@ pub async fn run(config: Config) -> Result<()> {
         .await
         .with_context(|| format!("listen on {}", config.listen))?;
     tracing::info!(listen = %config.listen, "av is ready");
+    let shutting_down = state.shutting_down.clone();
     let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown())
+        .with_graceful_shutdown(shutdown(shutting_down))
         .await;
     revoke_all_dynamic_leases(&state).await;
     result?;
@@ -2250,7 +2256,8 @@ pub async fn run(config: Config) -> Result<()> {
 }
 
 async fn revoke_all_dynamic_leases(state: &AppState) {
-    for active in state.dynamic_leases.drain().await {
+    let active = state.dynamic_leases.drain().await;
+    let cleanup = stream::iter(active).for_each_concurrent(16, |active| async move {
         if let Err(error) = revoke_dynamic_lease(state, &active).await {
             tracing::error!(
                 profile = %active.profile,
@@ -2259,6 +2266,12 @@ async fn revoke_all_dynamic_leases(state: &AppState) {
                 "dynamic lease revocation failed during shutdown"
             );
         }
+    });
+    if tokio::time::timeout(Duration::from_secs(20), cleanup)
+        .await
+        .is_err()
+    {
+        tracing::error!("dynamic lease shutdown cleanup exceeded its deadline");
     }
 }
 
@@ -2310,6 +2323,23 @@ fn content_security_policy(config: &Config) -> Result<HeaderValue> {
 
 async fn health() -> impl IntoResponse {
     (StatusCode::OK, "ok\n")
+}
+
+async fn readiness(State(state): State<AppState>) -> Response {
+    if state.shutting_down.load(Ordering::Acquire) {
+        return (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response();
+    }
+    if let Some(store) = &state.store {
+        let ready = matches!(
+            tokio::time::timeout(Duration::from_secs(2), store.health_check()).await,
+            Ok(Ok(()))
+        );
+        if !ready {
+            tracing::warn!("managed control-plane readiness check failed");
+            return (StatusCode::SERVICE_UNAVAILABLE, "not ready\n").into_response();
+        }
+    }
+    (StatusCode::OK, "ok\n").into_response()
 }
 
 async fn ui_index() -> Response {
@@ -5121,7 +5151,7 @@ fn no_store(mut response: Response) -> Response {
     response
 }
 
-async fn shutdown() {
+async fn shutdown(shutting_down: Arc<AtomicBool>) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -5140,6 +5170,7 @@ async fn shutdown() {
         () = ctrl_c => {},
         () = terminate => {},
     }
+    shutting_down.store(true, Ordering::Release);
 }
 
 #[cfg(test)]
@@ -5414,6 +5445,7 @@ mod tests {
             github_browser_auth: None,
             transparent_proxy: None,
             dynamic_leases: DynamicLeaseRegistry::default(),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         };
         let runtime = Arc::new(TransparentProxyRuntime {
             listen: "127.0.0.1:0".into(),
@@ -6767,6 +6799,31 @@ mod tests {
         let requests = endpoint.await.unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].starts_with(b"POST /v1/sys/leases/revoke HTTP/1.1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn readiness_is_dependency_aware_and_fails_during_shutdown() {
+        let (state, _runtime, store, _token, _ca_der) = transparent_test_context().await;
+        assert_eq!(
+            readiness(State(state.clone())).await.status(),
+            StatusCode::OK
+        );
+        let Store::Sqlite(database) = &store else {
+            panic!("transparent test context should use SQLite");
+        };
+        database.close().await;
+        assert_eq!(
+            readiness(State(state.clone())).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(health().await.into_response().status(), StatusCode::OK);
+
+        let (state, _runtime, _store, _token, _ca_der) = transparent_test_context().await;
+        state.shutting_down.store(true, Ordering::Release);
+        assert_eq!(
+            readiness(State(state)).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 
     #[tokio::test]

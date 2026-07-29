@@ -181,6 +181,15 @@ the session capability. The process-local helper remains an HTTP proxy bound
 only to loopback so existing SDKs can use it without learning the remote
 capability. A plaintext network proxy listener is never supported.
 
+Transport TLS certificates are re-read for every new proxy connection.
+Kubernetes may atomically rotate the projected certificate/key pair; an
+incomplete or invalid update keeps the last known-good pair. The interception
+CA is different: it signs configured upstream leaves and is loaded once per AV
+process. Rotate it with a controlled singleton restart, which revokes active
+sessions and leases; then relaunch affected `av run` children so each receives
+the new public CA certificate. Never mount the interception private key into a
+client workload and never reuse the transport certificate as that CA.
+
 ## Connector policy
 
 A transparent service reuses AV's immutable connector policy rather than
@@ -291,6 +300,14 @@ anything from the TLS stream. It is still a network capability, so declarations
 should be narrow and the workload must retain direct-egress denial.
 
 ## Kubernetes deployment and egress enforcement
+
+AV is a protected singleton in the current Helm chart. Dynamic lease handles
+are deliberately process-local, so `replicaCount` other than one fails
+rendering and the Deployment uses `Recreate`. Dependency-aware `/readyz`
+checks the managed control-plane database and becomes unavailable as shutdown
+begins; `/healthz` remains a process-local liveness check. Graceful shutdown
+has a bounded concurrent lease cleanup window, with provider TTLs as the crash
+backstop.
 
 For a workload namespace, configure a default-deny egress policy, then allow
 only:

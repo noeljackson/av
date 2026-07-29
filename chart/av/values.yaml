@@ -1,5 +1,15 @@
 replicaCount: 1
 
+# Dynamic lease handles are process-local in this release. Keep AV a
+# deliberately protected singleton until distributed lease ownership exists.
+deployment:
+  terminationGracePeriodSeconds: 30
+  revisionHistoryLimit: 2
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 0
+
 image:
   repository: ghcr.io/noeljackson/av
   tag: "0.1.0"
@@ -12,7 +22,9 @@ fullnameOverride: ""
 
 serviceAccount:
   create: true
-  automount: true
+  # Enable only when an AV connector itself uses Kubernetes auth. The OpenBao
+  # injector can project its own short-lived token.
+  automount: false
   annotations: {}
   name: ""
 

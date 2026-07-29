@@ -1,3 +1,12 @@
+{{- if ne (int .Values.replicaCount) 1 }}
+{{- fail "replicaCount must be 1 until distributed dynamic lease ownership is implemented" }}
+{{- end }}
+{{- if or (lt (int .Values.deployment.terminationGracePeriodSeconds) 25) (gt (int .Values.deployment.terminationGracePeriodSeconds) 300) }}
+{{- fail "deployment.terminationGracePeriodSeconds must be between 25 and 300" }}
+{{- end }}
+{{- if or (lt (int .Values.deployment.revisionHistoryLimit) 1) (gt (int .Values.deployment.revisionHistoryLimit) 10) }}
+{{- fail "deployment.revisionHistoryLimit must be between 1 and 10" }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +15,9 @@ metadata:
     {{- include "av.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
+  revisionHistoryLimit: {{ .Values.deployment.revisionHistoryLimit }}
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: {{ include "av.name" . }}
@@ -39,6 +51,8 @@ spec:
         {{- toYaml . | nindent 8 }}
         {{- end }}
     spec:
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: {{ .Values.deployment.terminationGracePeriodSeconds }}
       serviceAccountName: {{ include "av.serviceAccountName" . }}
       automountServiceAccountToken: {{ .Values.serviceAccount.automount }}
       securityContext:
@@ -67,6 +81,7 @@ spec:
             httpGet:
               path: /readyz
               port: http
+            failureThreshold: 2
             periodSeconds: 5
             timeoutSeconds: 2
           livenessProbe:
@@ -75,6 +90,13 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 2
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            failureThreshold: 30
+            periodSeconds: 2
             timeoutSeconds: 2
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
@@ -107,7 +129,9 @@ spec:
           configMap:
             name: {{ include "av.fullname" . }}
         - name: tmp
-          emptyDir: {}
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
         {{- if and (eq .Values.controlPlane.mode "managed") (not .Values.controlPlane.openbaoAgent.enabled) }}
         - name: control-plane-database
           secret:

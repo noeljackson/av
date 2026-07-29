@@ -253,6 +253,24 @@ impl Store {
         Ok(store)
     }
 
+    pub async fn health_check(&self) -> Result<()> {
+        match self {
+            Self::Postgres(database) => {
+                sqlx::query("SELECT 1")
+                    .execute(&database.pool())
+                    .await
+                    .context("check PostgreSQL control-plane health")?;
+            }
+            Self::Sqlite(database) => {
+                sqlx::query("SELECT 1")
+                    .execute(database)
+                    .await
+                    .context("check SQLite control-plane health")?;
+            }
+        }
+        Ok(())
+    }
+
     pub async fn is_owner(&self, subject: &str) -> Result<bool> {
         Ok(self.principal_role(subject).await? == PrincipalRole::Owner)
     }

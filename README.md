@@ -18,14 +18,16 @@ AV has two deliberately separate operating modes:
 
 | Tier | `av` behavior | Credential exposure |
 |---|---|---|
-| 1 — dynamic | Reserved for lease-aware OpenBao engines | Not enabled until AV can revoke and renew leases |
+| 1 — dynamic | OpenBao or Infisical mints a short-lived credential owned by one Tier 2 request/WebSocket or Tier 3 child | Exported fields reach only a granted Tier 3 child; Tier 2 callers receive none |
 | 2 — proxy | Fixed HTTPS origin and explicit method/path/query/header/content policy | Credential never enters the caller |
 | 3 — process environment | Authenticated profile lease followed by local child-process execution | Only the `av` process and its child receive values |
 
 An Infisical profile maps directly to an existing project, environment, and
 path; no dedicated `av` project is required. OpenBao profiles currently map to
-non-leased KV API paths such as `secret/data/infra`. Responses carrying a lease
-are rejected until AV implements lease ownership and revocation.
+KV paths such as `secret/data/infra` or explicitly configured dynamic engine
+paths such as `database/creds/example`. Dynamic backend IDs remain inside AV;
+AV renews and revokes them for the exact child, request, stream, or WebSocket
+that owns them.
 Google Secret Manager profiles map each exported local name to an exact secret
 version resource and authenticate with ADC/Workload Identity Federation. See
 [secret backends](docs/secret-backends.md) for the backend and IAM contract.

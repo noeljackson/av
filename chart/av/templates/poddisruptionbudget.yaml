@@ -1,0 +1,17 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- if ne (int .Values.podDisruptionBudget.maxUnavailable) 0 }}
+{{- fail "podDisruptionBudget.maxUnavailable must remain 0 for the singleton deployment" }}
+{{- end }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "av.fullname" . }}
+  labels:
+    {{- include "av.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "av.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
