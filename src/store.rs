@@ -786,7 +786,7 @@ async fn connect_postgres_with_credentials(
     postgres: &ManagedPostgresConfig,
     credentials: &DatabaseCredentials,
 ) -> Result<PgPool> {
-    let options = postgres_connect_options(postgres, &credentials);
+    let options = postgres_connect_options(postgres, credentials);
     let role_statement = format!("SET ROLE {}", postgres.role);
     let pool = PgPoolOptions::new()
         .max_connections(8)
