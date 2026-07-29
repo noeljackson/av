@@ -314,6 +314,27 @@ pub struct ProfileConfig {
     /// path-oriented backends may use `field` to rename an existing key.
     #[serde(default)]
     pub exports: BTreeMap<String, ProfileExportConfig>,
+    /// Optional on-demand backend lease. OpenBao reads the configured
+    /// `secret_path`; Infisical uses the explicit dynamic-secret name and
+    /// project slug. Values are still constrained by `exports`.
+    #[serde(default)]
+    pub dynamic_secret: Option<DynamicSecretConfig>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DynamicSecretConfig {
+    /// Infisical dynamic-secret name. OpenBao must leave this empty because its
+    /// role is already part of `secret_path`.
+    #[serde(default)]
+    pub name: String,
+    /// Infisical project slug. This is deliberately separate from the stable
+    /// project ID used by the static secrets API.
+    #[serde(default)]
+    pub project_slug: String,
+    /// Requested Infisical lease TTL and OpenBao renewal increment.
+    #[serde(default = "default_dynamic_secret_ttl_seconds")]
+    pub ttl_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -674,8 +695,11 @@ impl Config {
             };
             match connector {
                 ConnectorConfig::Infisical(_) => {
-                    if profile.project_id.is_empty() || profile.environment.is_empty() {
-                        bail!("Infisical profile {name} requires project_id and environment");
+                    if profile.environment.is_empty() {
+                        bail!("Infisical profile {name} requires environment");
+                    }
+                    if profile.dynamic_secret.is_none() && profile.project_id.is_empty() {
+                        bail!("static Infisical profile {name} requires project_id");
                     }
                     if !profile.secret_path.starts_with('/') {
                         bail!("Infisical profile {name} secret_path must start with /");
@@ -685,6 +709,11 @@ impl Config {
                     validate_openbao_secret_path(name, &profile.secret_path)?;
                 }
                 ConnectorConfig::GoogleSecretManager(_) => {
+                    if profile.dynamic_secret.is_some() {
+                        bail!(
+                            "Google Secret Manager profile {name} does not support dynamic leases"
+                        );
+                    }
                     if profile.exports.is_empty() {
                         bail!("Google Secret Manager profile {name} requires explicit exports");
                     }
@@ -696,6 +725,38 @@ impl Config {
                         bail!(
                             "Google Secret Manager profile {name} uses exports, not project_id, environment, secret_path, or allowed_keys"
                         );
+                    }
+                }
+            }
+            if let Some(dynamic) = &profile.dynamic_secret {
+                if !(30..=24 * 60 * 60).contains(&dynamic.ttl_seconds) {
+                    bail!("profile {name} dynamic_secret ttl_seconds must be between 30 and 86400");
+                }
+                if profile.exports.is_empty() {
+                    bail!("dynamic profile {name} requires explicit exports");
+                }
+                match connector {
+                    ConnectorConfig::Infisical(_) => {
+                        if dynamic.name.is_empty()
+                            || dynamic.project_slug.is_empty()
+                            || !profile.project_id.is_empty()
+                        {
+                            bail!(
+                                "dynamic Infisical profile {name} requires name and project_slug and may not set project_id"
+                            );
+                        }
+                        validate_name("Infisical dynamic secret", &dynamic.name)?;
+                        validate_name("Infisical project slug", &dynamic.project_slug)?;
+                    }
+                    ConnectorConfig::OpenBao(_) => {
+                        if !dynamic.name.is_empty() || !dynamic.project_slug.is_empty() {
+                            bail!(
+                                "dynamic OpenBao profile {name} uses secret_path and may not set name or project_slug"
+                            );
+                        }
+                    }
+                    ConnectorConfig::GoogleSecretManager(_) => {
+                        unreachable!("Google Secret Manager dynamic leases were rejected above")
                     }
                 }
             }
@@ -1008,6 +1069,10 @@ fn valid_postgres_identifier(value: &str) -> bool {
 
 fn default_postgres_port() -> u16 {
     5432
+}
+
+fn default_dynamic_secret_ttl_seconds() -> u64 {
+    300
 }
 
 fn default_postgres_ssl_mode() -> ManagedPostgresSslMode {
@@ -1646,6 +1711,7 @@ mod tests {
                 secret_path: "/".into(),
                 allowed_keys: vec![],
                 exports: BTreeMap::new(),
+                dynamic_secret: None,
             },
         );
         config.proxy_routes.insert(
@@ -1724,6 +1790,7 @@ mod tests {
                 secret_path: "/".into(),
                 allowed_keys: vec![],
                 exports: BTreeMap::new(),
+                dynamic_secret: None,
             },
         );
         config.proxy_routes.insert(
@@ -1919,6 +1986,7 @@ mod tests {
                         field: String::new(),
                     },
                 )]),
+                dynamic_secret: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -1971,6 +2039,7 @@ mod tests {
                         field: "UPSTREAM_TOKEN".into(),
                     },
                 )]),
+                dynamic_secret: None,
             },
         );
         assert!(
@@ -1980,6 +2049,68 @@ mod tests {
                 .to_string()
                 .contains("allowed_keys or exports")
         );
+        unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
+    }
+
+    #[test]
+    fn dynamic_profiles_require_explicit_bounded_backend_configuration() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AV_ALLOW_INSECURE_AUTH", "1") };
+        let mut config = base_config();
+        config.connectors.insert(
+            "openbao".into(),
+            ConnectorConfig::OpenBao(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "openbao",
+                    "base_url": "https://openbao.example.test",
+                    "auth": {"type": "token", "token_file": "/run/token"}
+                }))
+                .unwrap(),
+            ),
+        );
+        config.profiles.insert(
+            "database".into(),
+            ProfileConfig {
+                connector: "openbao".into(),
+                project_id: String::new(),
+                environment: String::new(),
+                secret_path: "database/creds/application".into(),
+                allowed_keys: vec![],
+                exports: BTreeMap::from([(
+                    "DATABASE_USER".into(),
+                    ProfileExportConfig {
+                        resource: String::new(),
+                        field: "username".into(),
+                    },
+                )]),
+                dynamic_secret: Some(DynamicSecretConfig {
+                    name: String::new(),
+                    project_slug: String::new(),
+                    ttl_seconds: 60,
+                }),
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config
+            .profiles
+            .get_mut("database")
+            .unwrap()
+            .dynamic_secret
+            .as_mut()
+            .unwrap()
+            .ttl_seconds = 86_401;
+        assert!(config.validate().is_err());
+        config
+            .profiles
+            .get_mut("database")
+            .unwrap()
+            .dynamic_secret
+            .as_mut()
+            .unwrap()
+            .ttl_seconds = 60;
+        config.profiles.get_mut("database").unwrap().exports.clear();
+        assert!(config.validate().is_err());
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
     }
 }

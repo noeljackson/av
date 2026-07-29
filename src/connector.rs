@@ -1,6 +1,10 @@
-use std::collections::BTreeMap;
+use std::{
+    collections::BTreeMap,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::{Result, bail};
+use zeroize::Zeroizing;
 
 use crate::{
     config::{ConnectorConfig, ProfileConfig},
@@ -12,7 +16,52 @@ use crate::{
 #[allow(async_fn_in_trait)]
 pub trait SecretBackend {
     fn kind(&self) -> &'static str;
-    async fn secrets(&self, profile: &ProfileConfig) -> Result<BTreeMap<String, String>>;
+    async fn acquire(&self, profile: &ProfileConfig) -> Result<SecretAcquisition>;
+}
+
+pub struct SecretAcquisition {
+    pub values: BTreeMap<String, String>,
+    pub lease: Option<BackendLease>,
+}
+
+pub enum BackendLease {
+    OpenBao(OpenBaoLease),
+    Infisical(InfisicalLease),
+}
+
+pub struct OpenBaoLease {
+    pub(crate) id: Zeroizing<String>,
+    pub(crate) renewable: bool,
+    pub(crate) expires_at: SystemTime,
+    pub(crate) renew_increment: Duration,
+}
+
+pub struct InfisicalLease {
+    pub(crate) id: Zeroizing<String>,
+    pub(crate) project_slug: String,
+    pub(crate) environment: String,
+    pub(crate) path: String,
+    pub(crate) expires_at: SystemTime,
+    pub(crate) renew_increment: Duration,
+}
+
+impl BackendLease {
+    pub fn expires_at(&self) -> SystemTime {
+        match self {
+            Self::OpenBao(lease) => lease.expires_at,
+            Self::Infisical(lease) => lease.expires_at,
+        }
+    }
+
+    pub fn renewable(&self) -> bool {
+        match self {
+            Self::OpenBao(lease) => lease.renewable,
+            // Infisical may reject renewals for provider-specific fixed leases.
+            // AV treats the configured lease as renewable until that explicit
+            // API response says otherwise.
+            Self::Infisical(_) => true,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -39,13 +88,38 @@ impl Connector {
         }
     }
 
-    pub async fn secrets(&self, profile: &ProfileConfig) -> Result<BTreeMap<String, String>> {
-        let values = match self {
-            Self::Infisical(connector) => connector.secrets(profile).await,
-            Self::OpenBao(connector) => connector.secrets(profile).await,
-            Self::GoogleSecretManager(connector) => return connector.secrets(profile).await,
+    pub async fn acquire(&self, profile: &ProfileConfig) -> Result<SecretAcquisition> {
+        let mut acquisition = match self {
+            Self::Infisical(connector) => connector.acquire(profile).await,
+            Self::OpenBao(connector) => connector.acquire(profile).await,
+            Self::GoogleSecretManager(connector) => connector.acquire(profile).await,
         }?;
-        apply_exports(values, profile)
+        acquisition.values = apply_exports(acquisition.values, profile)?;
+        Ok(acquisition)
+    }
+
+    pub async fn renew(&self, lease: &mut BackendLease) -> Result<()> {
+        match (self, lease) {
+            (Self::OpenBao(connector), BackendLease::OpenBao(lease)) => {
+                connector.renew(lease).await
+            }
+            (Self::Infisical(connector), BackendLease::Infisical(lease)) => {
+                connector.renew(lease).await
+            }
+            _ => bail!("lease backend does not match its connector"),
+        }
+    }
+
+    pub async fn revoke(&self, lease: &BackendLease) -> Result<()> {
+        match (self, lease) {
+            (Self::OpenBao(connector), BackendLease::OpenBao(lease)) => {
+                connector.revoke(lease).await
+            }
+            (Self::Infisical(connector), BackendLease::Infisical(lease)) => {
+                connector.revoke(lease).await
+            }
+            _ => bail!("lease backend does not match its connector"),
+        }
     }
 }
 
@@ -77,8 +151,8 @@ impl SecretBackend for InfisicalConnector {
         "infisical"
     }
 
-    async fn secrets(&self, profile: &ProfileConfig) -> Result<BTreeMap<String, String>> {
-        InfisicalConnector::secrets(self, profile).await
+    async fn acquire(&self, profile: &ProfileConfig) -> Result<SecretAcquisition> {
+        InfisicalConnector::acquire(self, profile).await
     }
 }
 
@@ -87,8 +161,8 @@ impl SecretBackend for OpenBaoConnector {
         "openbao"
     }
 
-    async fn secrets(&self, profile: &ProfileConfig) -> Result<BTreeMap<String, String>> {
-        OpenBaoConnector::secrets(self, profile).await
+    async fn acquire(&self, profile: &ProfileConfig) -> Result<SecretAcquisition> {
+        OpenBaoConnector::acquire(self, profile).await
     }
 }
 
@@ -105,6 +179,7 @@ mod tests {
             secret_path: "/".into(),
             allowed_keys: vec![],
             exports,
+            dynamic_secret: None,
         }
     }
 

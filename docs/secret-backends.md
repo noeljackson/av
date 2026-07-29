@@ -77,6 +77,59 @@ AV requires the payload checksum, verifies CRC32C before decoding, rejects
 non-UTF-8 values, and limits each value to 64 KiB. Provider values are never
 included in errors, logs, API responses, audit events, or the browser UI.
 
+## Dynamic leases
+
+Dynamic profiles are explicit and export-only. AV will not infer that an
+OpenBao path or an Infisical object is dynamic, because doing so could create a
+credential without assigning an owner that renews and revokes it.
+
+An OpenBao dynamic profile reads the normal engine role path. `ttl_seconds` is
+the requested renewal increment; the engine remains authoritative:
+
+```json
+{
+  "connector": "openbao",
+  "secret_path": "database/creds/example-app",
+  "exports": {
+    "DATABASE_USER": {"field": "username"},
+    "DATABASE_PASSWORD": {"field": "password"}
+  },
+  "dynamic_secret": {
+    "ttl_seconds": 300
+  }
+}
+```
+
+An Infisical dynamic profile names the existing dynamic-secret definition and
+uses the project slug required by its lease API. `project_id` is omitted:
+
+```json
+{
+  "connector": "infisical",
+  "environment": "prod",
+  "secret_path": "/database",
+  "exports": {
+    "DATABASE_USER": {"field": "username"},
+    "DATABASE_PASSWORD": {"field": "password"}
+  },
+  "dynamic_secret": {
+    "name": "example-app-database",
+    "project_slug": "example-app",
+    "ttl_seconds": 300
+  }
+}
+```
+
+AV uses OpenBao's per-lease renew and synchronous revoke APIs. For Infisical it
+uses create, renew, and non-forced delete through the official dynamic-secret
+lease API. Lease IDs and renewal metadata remain only in bounded process
+memory; values remain only in the request or child that owns them. The
+configured TTL must be between 30 seconds and 24 hours. A shorter backend TTL
+is the crash backstop and is always authoritative.
+
+Infisical Dynamic Secrets is a licensed feature. Static Infisical profiles
+continue using the existing raw-secrets API and do not require it.
+
 ## Choosing a backend
 
 - Use OpenBao for dynamic infrastructure credentials and KV values already

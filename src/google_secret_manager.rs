@@ -7,7 +7,7 @@ use google_cloud_secretmanager_v1::{
 
 use crate::{
     config::{GoogleSecretManagerConfig, ProfileConfig},
-    connector::SecretBackend,
+    connector::{SecretAcquisition, SecretBackend},
 };
 
 const MAX_SECRET_BYTES: usize = 64 * 1024;
@@ -86,12 +86,15 @@ impl SecretBackend for GoogleSecretManagerConnector {
         "google_secret_manager"
     }
 
-    async fn secrets(&self, profile: &ProfileConfig) -> Result<BTreeMap<String, String>> {
+    async fn acquire(&self, profile: &ProfileConfig) -> Result<SecretAcquisition> {
         let mut values = BTreeMap::new();
         for (local_name, export) in &profile.exports {
             values.insert(local_name.clone(), self.access(&export.resource).await?);
         }
-        Ok(values)
+        Ok(SecretAcquisition {
+            values,
+            lease: None,
+        })
     }
 }
 
@@ -146,6 +149,7 @@ mod tests {
                     field: String::new(),
                 },
             )]),
+            dynamic_secret: None,
         }
     }
 
@@ -166,13 +170,17 @@ mod tests {
     async fn resolves_an_explicit_resource_after_checksum_verification() {
         let data = b"synthetic-google-value";
         let connector = connector(data, Some(i64::from(crc32c(data))));
-        let values = connector
-            .secrets(&profile(
+        let acquisition = connector
+            .acquire(&profile(
                 "projects/example/secrets/api-token/versions/latest",
             ))
             .await
             .unwrap();
-        assert_eq!(values.get("API_TOKEN").unwrap(), "synthetic-google-value");
+        assert!(acquisition.lease.is_none());
+        assert_eq!(
+            acquisition.values.get("API_TOKEN").unwrap(),
+            "synthetic-google-value"
+        );
     }
 
     #[tokio::test]
@@ -180,20 +188,20 @@ mod tests {
         let resource = "projects/example/secrets/api-token/versions/latest";
         assert!(
             connector(b"value", None)
-                .secrets(&profile(resource))
+                .acquire(&profile(resource))
                 .await
                 .is_err()
         );
         assert!(
             connector(b"value", Some(1))
-                .secrets(&profile(resource))
+                .acquire(&profile(resource))
                 .await
                 .is_err()
         );
         let binary = [0xff, 0xfe];
         assert!(
             connector(&binary, Some(i64::from(crc32c(&binary))))
-                .secrets(&profile(resource))
+                .acquire(&profile(resource))
                 .await
                 .is_err()
         );

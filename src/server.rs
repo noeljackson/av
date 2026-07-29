@@ -4174,12 +4174,22 @@ async fn fetch_secrets(
         .await
         .context("connector concurrency queue timed out")?
         .context("connector concurrency limiter is closed")?;
-    state
+    let connector = state
         .connectors
         .get(&profile.connector)
-        .context("profile connector disappeared")?
-        .secrets(profile)
-        .await
+        .context("profile connector disappeared")?;
+    let mut acquisition = connector.acquire(profile).await?;
+    if let Some(lease) = acquisition.lease.take() {
+        if let Err(error) = connector.revoke(&lease).await {
+            tracing::error!(
+                profile_connector = %profile.connector,
+                %error,
+                "revoke unsupported dynamic lease handoff"
+            );
+        }
+        bail!("dynamic lease delivery is not available through this path yet");
+    }
+    Ok(acquisition.values)
 }
 
 fn enforce_proxy_content_type(
@@ -4569,6 +4579,7 @@ mod tests {
                 secret_path: "/".into(),
                 allowed_keys: vec![],
                 exports: BTreeMap::new(),
+                dynamic_secret: None,
             },
         );
         let route = proxy_route(&["GET"], &["/v1/"]);
