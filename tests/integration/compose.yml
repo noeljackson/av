@@ -217,15 +217,18 @@ services:
         INSERT INTO av_basic_users (username, password_hash, enabled)
         VALUES ('operator', :'password_hash', TRUE)
         ON CONFLICT (username) DO UPDATE SET password_hash = EXCLUDED.password_hash, enabled = TRUE;
-        INSERT INTO av_profile_grants (subject, profile)
+        INSERT INTO av_capability_grants (subject, profile, mode, expires_unix_seconds)
         VALUES
-          ('basic:operator', 'infisical-integration'),
-          ('basic:operator', 'openbao-integration')
-        ON CONFLICT (subject, profile) DO NOTHING;
+          ('basic:operator', 'infisical-integration', 'both', NULL),
+          ('basic:operator', 'openbao-integration', 'both', NULL)
+        ON CONFLICT (subject, profile) DO UPDATE SET mode = EXCLUDED.mode, expires_unix_seconds = NULL;
         -- Test-only owner fixture: production bootstraps an OIDC subject.
         INSERT INTO av_owners (subject)
         VALUES ('basic:operator')
         ON CONFLICT (subject) DO NOTHING;
+        INSERT INTO av_principal_roles (subject, role)
+        VALUES ('basic:operator', 'owner')
+        ON CONFLICT (subject) DO UPDATE SET role = EXCLUDED.role;
         SQL
     read_only: true
     volumes:

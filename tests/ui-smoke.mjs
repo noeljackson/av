@@ -62,6 +62,7 @@ try {
   if (expectManaged) {
     await ownerPanel.waitFor();
     await ownerPanel.getByRole("heading", { name: "basic accounts" }).waitFor();
+    await ownerPanel.getByRole("heading", { name: "agents", exact: true }).waitFor();
     await ownerPanel.getByRole("heading", { name: "people and agent access" }).waitFor();
     const basicUserForm = ownerPanel.locator("form.owner-form").first();
     await basicUserForm.locator('input[name="username"]').fill("browser-ui");
@@ -70,8 +71,29 @@ try {
     const principal = ownerPanel.locator(".principal").filter({ hasText: "browser-ui" });
     await principal.waitFor();
     await principal.locator(".inline-grant select[name=profile]").selectOption("ungranted-integration");
-    await principal.locator(".inline-grant button").click();
+    await principal.getByRole("button", { name: "grant", exact: true }).click();
     await principal.locator(".capability-list code").filter({ hasText: "ungranted-integration" }).waitFor();
+    await principal.locator('select[name="role"]').selectOption("operator");
+    await principal.getByRole("button", { name: "set role" }).click();
+    await principal.getByText("Basic account / operator").waitFor();
+
+    const agentSection = ownerPanel.locator("section.owner-section").filter({
+      has: page.getByRole("heading", { name: "agents", exact: true }),
+    });
+    await agentSection.locator('input[name="name"]').fill("browser-agent");
+    await agentSection.getByRole("button", { name: "create agent" }).click();
+    const issuedToken = ownerPanel.locator(".issued-credential code");
+    await issuedToken.waitFor();
+    if (!/^av_agent_[A-Za-z0-9_-]{43}$/.test((await issuedToken.textContent()) ?? "")) {
+      throw new Error("agent create did not return one well-formed one-time token");
+    }
+    const agentPrincipal = ownerPanel.locator(".principal").filter({ hasText: "browser-agent" });
+    await agentPrincipal.locator('select[name="profile"]').selectOption("ungranted-integration");
+    await agentPrincipal.locator('select[name="mode"]').selectOption("proxy");
+    await agentPrincipal.getByRole("button", { name: "grant", exact: true }).click();
+    await agentPrincipal.locator(".capability-list code").filter({
+      hasText: "ungranted-integration / proxy",
+    }).waitFor();
     if (await ownerPanel.getByText("basic:browser-ui", { exact: true }).count()) {
       throw new Error("access UI exposed a raw Basic subject");
     }
@@ -89,6 +111,20 @@ try {
   }
   if (await page.getByRole("heading", { name: expectedProfile }).isVisible()) {
     throw new Error("logout left an authorized profile visible");
+  }
+  if (expectManaged) {
+    await page.locator("#username").fill("browser-ui");
+    await page.locator("#password").fill("browser-ui-password");
+    await page.getByRole("button", { name: "sign in" }).click();
+    await dashboard.waitFor();
+    const operatorPanel = page.getByRole("region", { name: "Access management" });
+    await operatorPanel.waitFor();
+    if (await operatorPanel.locator('form[hx-post="/ui/owner/roles"]').count()) {
+      throw new Error("operator UI rendered owner-only role controls");
+    }
+    await operatorPanel.getByRole("heading", { name: "agents", exact: true }).waitFor();
+    await page.getByRole("button", { name: "disconnect" }).click();
+    await lockedScreen.waitFor();
   }
   if (browserErrors.length) throw new Error(browserErrors.join("; "));
   console.log("ui_browser_smoke=ok");

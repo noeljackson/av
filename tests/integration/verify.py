@@ -16,7 +16,7 @@ CREDENTIAL_FILE = pathlib.Path("/credentials/database-credentials.json")
 
 def request(path, method="GET", auth=True, origin=None, body=None, headers=None, accepted=(200,)):
     headers = dict(headers or {})
-    if auth:
+    if auth and "Authorization" not in headers:
         headers["Authorization"] = AUTH
     if origin:
         headers["Origin"] = origin
@@ -36,6 +36,21 @@ def request(path, method="GET", auth=True, origin=None, body=None, headers=None,
     content_type = normalized_headers.get("content-type", "").split(";", 1)[0]
     content = json.loads(raw) if raw and content_type == "application/json" else raw
     return status, content, normalized_headers
+
+
+def connect(service, method, message, authorization=AUTH, accepted=(200,)):
+    return request(
+        f"/av.v1.{service}/{method}",
+        method="POST",
+        auth=False,
+        body=json.dumps(message).encode(),
+        headers={
+            "Authorization": authorization,
+            "Content-Type": "application/json",
+            "Connect-Protocol-Version": "1",
+        },
+        accepted=accepted,
+    )
 
 
 def wait_for_av():
@@ -135,6 +150,67 @@ def main():
         headers=form_headers,
     )
     request("/v1/profiles/ungranted-integration/secrets", accepted=(403,))
+
+    # Named agents receive one-time credentials and independently scoped
+    # capabilities. A proxy-only grant must never become an environment lease,
+    # and disabling an agent must take effect on its very next request.
+    _, agent, _ = connect(
+        "ControlService",
+        "CreateAgent",
+        {"name": "integration-agent"},
+    )
+    assert agent["name"] == "integration-agent"
+    assert agent["enabled"] is True
+    assert agent["token"].startswith("av_agent_")
+    agent_auth = "Agent " + agent["token"]
+    connect(
+        "ControlService",
+        "GrantProfile",
+        {
+            "profile": "openbao-integration",
+            "subject": "agent:integration-agent",
+            "mode": "proxy",
+        },
+    )
+    request(
+        "/v1/profiles/openbao-integration/secrets",
+        auth=False,
+        headers={"Authorization": agent_auth},
+        accepted=(403,),
+    )
+    _, agent_proxy, _ = request(
+        "/v1/proxy/openbao-upstream/verify?source=integration",
+        auth=False,
+        headers={"Authorization": agent_auth},
+    )
+    assert agent_proxy == {"injection": "accepted"}
+    connect(
+        "ControlService",
+        "SetAgentEnabled",
+        {"name": "integration-agent", "enabled": False},
+    )
+    request(
+        "/v1/proxy/openbao-upstream/verify?source=integration",
+        auth=False,
+        headers={"Authorization": agent_auth},
+        accepted=(401,),
+    )
+
+    # Role changes are owner-only and the final owner is protected even when
+    # a caller tries to demote itself.
+    connect(
+        "ControlService",
+        "SetPrincipalRole",
+        {"subject": "oidc:integration-owner", "role": "user"},
+    )
+    connect(
+        "ControlService",
+        "SetPrincipalRole",
+        {"subject": "basic:operator", "role": "user"},
+        accepted=(400,),
+    )
+    _, roles, _ = connect("ControlService", "ListPrincipalRoles", {})
+    assert {"subject": "basic:operator", "role": "owner"} in roles["roles"]
 
     _, proxy, proxy_headers = request(
         "/v1/proxy/openbao-upstream/verify?source=integration",

@@ -84,9 +84,87 @@ pub struct BasicUser {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Agent {
+    pub name: String,
+    pub enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PrincipalRole {
+    Owner,
+    Operator,
+    Auditor,
+    #[default]
+    User,
+}
+
+impl PrincipalRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Operator => "operator",
+            Self::Auditor => "auditor",
+            Self::User => "user",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "owner" => Ok(Self::Owner),
+            "operator" => Ok(Self::Operator),
+            "auditor" => Ok(Self::Auditor),
+            "user" => Ok(Self::User),
+            _ => bail!("invalid principal role"),
+        }
+    }
+
+    pub fn can_operate(self) -> bool {
+        matches!(self, Self::Owner | Self::Operator)
+    }
+
+    pub fn can_audit(self) -> bool {
+        matches!(self, Self::Owner | Self::Auditor)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrincipalRoleBinding {
+    pub subject: String,
+    pub role: PrincipalRole,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileGrant {
     pub profile: String,
     pub subject: String,
+    pub mode: GrantMode,
+    pub expires_unix_seconds: Option<i64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrantMode {
+    Both,
+    Proxy,
+    Environment,
+}
+
+impl GrantMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::Proxy => "proxy",
+            Self::Environment => "environment",
+        }
+    }
+
+    fn from_database(value: &str) -> Result<Self> {
+        match value {
+            "both" => Ok(Self::Both),
+            "proxy" => Ok(Self::Proxy),
+            "environment" => Ok(Self::Environment),
+            _ => bail!("managed store contains an invalid grant mode"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,22 +254,144 @@ impl Store {
     }
 
     pub async fn is_owner(&self, subject: &str) -> Result<bool> {
-        let count: i64 = match self {
+        Ok(self.principal_role(subject).await? == PrincipalRole::Owner)
+    }
+
+    pub async fn principal_role(&self, subject: &str) -> Result<PrincipalRole> {
+        let role: Option<String> = match self {
             Self::Postgres(database) => {
                 let pool = database.pool();
-                sqlx::query_scalar("SELECT COUNT(*) FROM av_owners WHERE subject = $1")
+                sqlx::query_scalar("SELECT role FROM av_principal_roles WHERE subject = $1")
                     .bind(subject)
-                    .fetch_one(&pool)
+                    .fetch_optional(&pool)
                     .await?
             }
             Self::Sqlite(pool) => {
-                sqlx::query_scalar("SELECT COUNT(*) FROM av_owners WHERE subject = ?")
+                sqlx::query_scalar("SELECT role FROM av_principal_roles WHERE subject = ?")
                     .bind(subject)
-                    .fetch_one(pool)
+                    .fetch_optional(pool)
                     .await?
             }
         };
-        Ok(count > 0)
+        role.map(|role| PrincipalRole::parse(&role))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    pub async fn list_principal_roles(&self) -> Result<Vec<PrincipalRoleBinding>> {
+        let rows: Vec<(String, String)> = match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                sqlx::query_as("SELECT subject, role FROM av_principal_roles ORDER BY subject")
+                    .fetch_all(&pool)
+                    .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as("SELECT subject, role FROM av_principal_roles ORDER BY subject")
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        rows.into_iter()
+            .map(|(subject, role)| {
+                Ok(PrincipalRoleBinding {
+                    subject,
+                    role: PrincipalRole::parse(&role)?,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn set_principal_role(&self, subject: &str, role: PrincipalRole) -> Result<()> {
+        if subject.is_empty() || subject.len() > 1024 || subject.chars().any(char::is_control) {
+            bail!("principal subject is invalid");
+        }
+        match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                let mut transaction = pool.begin().await?;
+                let current: Option<String> =
+                    sqlx::query_scalar("SELECT role FROM av_principal_roles WHERE subject = $1")
+                        .bind(subject)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if current.as_deref() == Some("owner") && role != PrincipalRole::Owner {
+                    let owners: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM av_principal_roles WHERE role = 'owner'",
+                    )
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                    if owners <= 1 {
+                        bail!("cannot remove the last owner");
+                    }
+                }
+                sqlx::query(
+                    "INSERT INTO av_principal_roles (subject, role) VALUES ($1, $2) \
+                     ON CONFLICT (subject) DO UPDATE SET role = EXCLUDED.role",
+                )
+                .bind(subject)
+                .bind(role.as_str())
+                .execute(&mut *transaction)
+                .await?;
+                if role == PrincipalRole::Owner {
+                    sqlx::query(
+                        "INSERT INTO av_owners (subject) VALUES ($1) \
+                         ON CONFLICT (subject) DO NOTHING",
+                    )
+                    .bind(subject)
+                    .execute(&mut *transaction)
+                    .await?;
+                } else {
+                    sqlx::query("DELETE FROM av_owners WHERE subject = $1")
+                        .bind(subject)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                transaction.commit().await?;
+            }
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let current: Option<String> =
+                    sqlx::query_scalar("SELECT role FROM av_principal_roles WHERE subject = ?")
+                        .bind(subject)
+                        .fetch_optional(&mut *transaction)
+                        .await?;
+                if current.as_deref() == Some("owner") && role != PrincipalRole::Owner {
+                    let owners: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(*) FROM av_principal_roles WHERE role = 'owner'",
+                    )
+                    .fetch_one(&mut *transaction)
+                    .await?;
+                    if owners <= 1 {
+                        bail!("cannot remove the last owner");
+                    }
+                }
+                sqlx::query(
+                    "INSERT INTO av_principal_roles (subject, role) VALUES (?, ?) \
+                     ON CONFLICT (subject) DO UPDATE SET role = excluded.role",
+                )
+                .bind(subject)
+                .bind(role.as_str())
+                .execute(&mut *transaction)
+                .await?;
+                if role == PrincipalRole::Owner {
+                    sqlx::query(
+                        "INSERT INTO av_owners (subject) VALUES (?) \
+                         ON CONFLICT (subject) DO NOTHING",
+                    )
+                    .bind(subject)
+                    .execute(&mut *transaction)
+                    .await?;
+                } else {
+                    sqlx::query("DELETE FROM av_owners WHERE subject = ?")
+                        .bind(subject)
+                        .execute(&mut *transaction)
+                        .await?;
+                }
+                transaction.commit().await?;
+            }
+        }
+        Ok(())
     }
 
     pub async fn basic_password_hash(&self, username: &str) -> Result<Option<String>> {
@@ -286,24 +486,290 @@ impl Store {
         Ok(affected == 1)
     }
 
+    pub async fn list_agents(&self) -> Result<Vec<Agent>> {
+        let rows: Vec<(String, bool)> = match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                sqlx::query_as("SELECT name, enabled FROM av_agents ORDER BY name")
+                    .fetch_all(&pool)
+                    .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as("SELECT name, enabled FROM av_agents ORDER BY name")
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
+        Ok(rows
+            .into_iter()
+            .map(|(name, enabled)| Agent { name, enabled })
+            .collect())
+    }
+
+    pub async fn create_agent(&self, name: &str, token_hash: &[u8]) -> Result<()> {
+        validate_agent_token(name, token_hash)?;
+        match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                sqlx::query(
+                    "INSERT INTO av_agents (name, token_hash, enabled) VALUES ($1, $2, TRUE)",
+                )
+                .bind(name)
+                .bind(token_hash)
+                .execute(&pool)
+                .await?;
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query(
+                    "INSERT INTO av_agents (name, token_hash, enabled) VALUES (?, ?, TRUE)",
+                )
+                .bind(name)
+                .bind(token_hash)
+                .execute(pool)
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn rotate_agent_token(&self, name: &str, token_hash: &[u8]) -> Result<bool> {
+        validate_agent_token(name, token_hash)?;
+        let subject = format!("agent:{name}");
+        let affected = match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                let mut transaction = pool.begin().await?;
+                let affected = sqlx::query(
+                    "UPDATE av_agents SET token_hash = $1, enabled = TRUE WHERE name = $2",
+                )
+                .bind(token_hash)
+                .bind(name)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                sqlx::query(
+                    "UPDATE av_proxy_sessions SET revoked = TRUE \
+                     WHERE subject = $1 AND revoked = FALSE",
+                )
+                .bind(&subject)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                affected
+            }
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let affected = sqlx::query(
+                    "UPDATE av_agents SET token_hash = ?, enabled = TRUE WHERE name = ?",
+                )
+                .bind(token_hash)
+                .bind(name)
+                .execute(&mut *transaction)
+                .await?
+                .rows_affected();
+                sqlx::query(
+                    "UPDATE av_proxy_sessions SET revoked = TRUE \
+                     WHERE subject = ? AND revoked = FALSE",
+                )
+                .bind(&subject)
+                .execute(&mut *transaction)
+                .await?;
+                transaction.commit().await?;
+                affected
+            }
+        };
+        Ok(affected == 1)
+    }
+
+    pub async fn set_agent_enabled(&self, name: &str, enabled: bool) -> Result<bool> {
+        let subject = format!("agent:{name}");
+        let affected = match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                let mut transaction = pool.begin().await?;
+                let affected = sqlx::query("UPDATE av_agents SET enabled = $1 WHERE name = $2")
+                    .bind(enabled)
+                    .bind(name)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if !enabled {
+                    sqlx::query(
+                        "UPDATE av_proxy_sessions SET revoked = TRUE \
+                         WHERE subject = $1 AND revoked = FALSE",
+                    )
+                    .bind(&subject)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                transaction.commit().await?;
+                affected
+            }
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                let affected = sqlx::query("UPDATE av_agents SET enabled = ? WHERE name = ?")
+                    .bind(enabled)
+                    .bind(name)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                if !enabled {
+                    sqlx::query(
+                        "UPDATE av_proxy_sessions SET revoked = TRUE \
+                         WHERE subject = ? AND revoked = FALSE",
+                    )
+                    .bind(&subject)
+                    .execute(&mut *transaction)
+                    .await?;
+                }
+                transaction.commit().await?;
+                affected
+            }
+        };
+        Ok(affected == 1)
+    }
+
+    pub async fn delete_agent(&self, name: &str) -> Result<bool> {
+        let subject = format!("agent:{name}");
+        let affected = match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                let mut transaction = pool.begin().await?;
+                sqlx::query("DELETE FROM av_capability_grants WHERE subject = $1")
+                    .bind(&subject)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(
+                    "UPDATE av_proxy_sessions SET revoked = TRUE \
+                     WHERE subject = $1 AND revoked = FALSE",
+                )
+                .bind(&subject)
+                .execute(&mut *transaction)
+                .await?;
+                let affected = sqlx::query("DELETE FROM av_agents WHERE name = $1")
+                    .bind(name)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                transaction.commit().await?;
+                affected
+            }
+            Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
+                sqlx::query("DELETE FROM av_capability_grants WHERE subject = ?")
+                    .bind(&subject)
+                    .execute(&mut *transaction)
+                    .await?;
+                sqlx::query(
+                    "UPDATE av_proxy_sessions SET revoked = TRUE \
+                     WHERE subject = ? AND revoked = FALSE",
+                )
+                .bind(&subject)
+                .execute(&mut *transaction)
+                .await?;
+                let affected = sqlx::query("DELETE FROM av_agents WHERE name = ?")
+                    .bind(name)
+                    .execute(&mut *transaction)
+                    .await?
+                    .rows_affected();
+                transaction.commit().await?;
+                affected
+            }
+        };
+        Ok(affected == 1)
+    }
+
+    pub async fn agent_for_token_hash(&self, token_hash: &[u8]) -> Result<Option<String>> {
+        if token_hash.len() != 32 {
+            return Ok(None);
+        }
+        match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                sqlx::query_scalar(
+                    "SELECT name FROM av_agents WHERE token_hash = $1 AND enabled = TRUE",
+                )
+                .bind(token_hash)
+                .fetch_optional(&pool)
+                .await
+                .context("authenticate managed agent")
+            }
+            Self::Sqlite(pool) => sqlx::query_scalar(
+                "SELECT name FROM av_agents WHERE token_hash = ? AND enabled = TRUE",
+            )
+            .bind(token_hash)
+            .fetch_optional(pool)
+            .await
+            .context("authenticate managed agent"),
+        }
+    }
+
     pub async fn profile_allowed(&self, subject: &str, profile: &str) -> Result<bool> {
+        let now = now_unix_seconds()?;
         let count: i64 = match self {
             Self::Postgres(database) => {
                 let pool = database.pool();
                 sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM av_profile_grants WHERE subject = $1 AND profile = $2",
+                    "SELECT COUNT(*) FROM av_capability_grants \
+                     WHERE subject = $1 AND profile = $2 \
+                     AND (expires_unix_seconds IS NULL OR expires_unix_seconds > $3)",
                 )
                 .bind(subject)
                 .bind(profile)
+                .bind(now)
                 .fetch_one(&pool)
                 .await?
             }
             Self::Sqlite(pool) => {
                 sqlx::query_scalar(
-                    "SELECT COUNT(*) FROM av_profile_grants WHERE subject = ? AND profile = ?",
+                    "SELECT COUNT(*) FROM av_capability_grants \
+                     WHERE subject = ? AND profile = ? \
+                     AND (expires_unix_seconds IS NULL OR expires_unix_seconds > ?)",
                 )
                 .bind(subject)
                 .bind(profile)
+                .bind(now)
+                .fetch_one(pool)
+                .await?
+            }
+        };
+        Ok(count > 0)
+    }
+
+    pub async fn profile_allowed_for(
+        &self,
+        subject: &str,
+        profile: &str,
+        mode: GrantMode,
+    ) -> Result<bool> {
+        let now = now_unix_seconds()?;
+        let count: i64 = match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM av_capability_grants \
+                     WHERE subject = $1 AND profile = $2 \
+                     AND (expires_unix_seconds IS NULL OR expires_unix_seconds > $3) \
+                     AND (mode = 'both' OR mode = $4)",
+                )
+                .bind(subject)
+                .bind(profile)
+                .bind(now)
+                .bind(mode.as_str())
+                .fetch_one(&pool)
+                .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_scalar(
+                    "SELECT COUNT(*) FROM av_capability_grants \
+                     WHERE subject = ? AND profile = ? \
+                     AND (expires_unix_seconds IS NULL OR expires_unix_seconds > ?) \
+                     AND (mode = 'both' OR mode = ?)",
+                )
+                .bind(subject)
+                .bind(profile)
+                .bind(now)
+                .bind(mode.as_str())
                 .fetch_one(pool)
                 .await?
             }
@@ -312,21 +778,67 @@ impl Store {
     }
 
     pub async fn list_allowed_profiles(&self, subject: &str) -> Result<Vec<String>> {
+        let now = now_unix_seconds()?;
         match self {
             Self::Postgres(database) => {
                 let pool = database.pool();
                 sqlx::query_scalar(
-                    "SELECT profile FROM av_profile_grants WHERE subject = $1 ORDER BY profile",
+                    "SELECT profile FROM av_capability_grants \
+                     WHERE subject = $1 \
+                     AND (expires_unix_seconds IS NULL OR expires_unix_seconds > $2) \
+                     ORDER BY profile",
                 )
                 .bind(subject)
+                .bind(now)
                 .fetch_all(&pool)
                 .await
                 .context("list managed profile grants")
             }
             Self::Sqlite(pool) => sqlx::query_scalar(
-                "SELECT profile FROM av_profile_grants WHERE subject = ? ORDER BY profile",
+                "SELECT profile FROM av_capability_grants \
+                 WHERE subject = ? \
+                 AND (expires_unix_seconds IS NULL OR expires_unix_seconds > ?) \
+                 ORDER BY profile",
             )
             .bind(subject)
+            .bind(now)
+            .fetch_all(pool)
+            .await
+            .context("list managed profile grants"),
+        }
+    }
+
+    pub async fn list_allowed_profiles_for(
+        &self,
+        subject: &str,
+        mode: GrantMode,
+    ) -> Result<Vec<String>> {
+        let now = now_unix_seconds()?;
+        match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                sqlx::query_scalar(
+                    "SELECT profile FROM av_capability_grants \
+                     WHERE subject = $1 \
+                     AND (expires_unix_seconds IS NULL OR expires_unix_seconds > $2) \
+                     AND (mode = 'both' OR mode = $3) ORDER BY profile",
+                )
+                .bind(subject)
+                .bind(now)
+                .bind(mode.as_str())
+                .fetch_all(&pool)
+                .await
+                .context("list managed profile grants")
+            }
+            Self::Sqlite(pool) => sqlx::query_scalar(
+                "SELECT profile FROM av_capability_grants \
+                 WHERE subject = ? \
+                 AND (expires_unix_seconds IS NULL OR expires_unix_seconds > ?) \
+                 AND (mode = 'both' OR mode = ?) ORDER BY profile",
+            )
+            .bind(subject)
+            .bind(now)
+            .bind(mode.as_str())
             .fetch_all(pool)
             .await
             .context("list managed profile grants"),
@@ -334,54 +846,117 @@ impl Store {
     }
 
     pub async fn list_profile_grants(&self, profile: &str) -> Result<Vec<ProfileGrant>> {
-        let subjects: Vec<String> = match self {
+        let rows: Vec<(String, String, Option<i64>)> = match self {
             Self::Postgres(database) => {
                 let pool = database.pool();
-                sqlx::query_scalar(
-                    "SELECT subject FROM av_profile_grants WHERE profile = $1 ORDER BY subject",
+                sqlx::query_as(
+                    "SELECT subject, mode, expires_unix_seconds FROM av_capability_grants \
+                     WHERE profile = $1 ORDER BY subject",
                 )
                 .bind(profile)
                 .fetch_all(&pool)
                 .await?
             }
             Self::Sqlite(pool) => {
-                sqlx::query_scalar(
-                    "SELECT subject FROM av_profile_grants WHERE profile = ? ORDER BY subject",
+                sqlx::query_as(
+                    "SELECT subject, mode, expires_unix_seconds FROM av_capability_grants \
+                     WHERE profile = ? ORDER BY subject",
                 )
                 .bind(profile)
                 .fetch_all(pool)
                 .await?
             }
         };
-        Ok(subjects
-            .into_iter()
-            .map(|subject| ProfileGrant {
-                profile: profile.into(),
-                subject,
+        rows.into_iter()
+            .map(|(subject, mode, expires_unix_seconds)| {
+                Ok(ProfileGrant {
+                    profile: profile.into(),
+                    subject,
+                    mode: GrantMode::from_database(&mode)?,
+                    expires_unix_seconds,
+                })
             })
-            .collect())
+            .collect()
+    }
+
+    pub async fn list_subject_grants(&self, subject: &str) -> Result<Vec<ProfileGrant>> {
+        let rows: Vec<(String, String, Option<i64>)> = match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                sqlx::query_as(
+                    "SELECT profile, mode, expires_unix_seconds FROM av_capability_grants \
+                     WHERE subject = $1 ORDER BY profile",
+                )
+                .bind(subject)
+                .fetch_all(&pool)
+                .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as(
+                    "SELECT profile, mode, expires_unix_seconds FROM av_capability_grants \
+                     WHERE subject = ? ORDER BY profile",
+                )
+                .bind(subject)
+                .fetch_all(pool)
+                .await?
+            }
+        };
+        rows.into_iter()
+            .map(|(profile, mode, expires_unix_seconds)| {
+                Ok(ProfileGrant {
+                    profile,
+                    subject: subject.into(),
+                    mode: GrantMode::from_database(&mode)?,
+                    expires_unix_seconds,
+                })
+            })
+            .collect()
     }
 
     pub async fn grant_profile(&self, subject: &str, profile: &str) -> Result<()> {
+        self.grant_profile_mode(subject, profile, GrantMode::Both, None)
+            .await
+    }
+
+    pub async fn grant_profile_mode(
+        &self,
+        subject: &str,
+        profile: &str,
+        mode: GrantMode,
+        expires_unix_seconds: Option<i64>,
+    ) -> Result<()> {
+        if let Some(expires) = expires_unix_seconds
+            && expires <= now_unix_seconds()?
+        {
+            bail!("profile grant expiry must be in the future");
+        }
         match self {
             Self::Postgres(database) => {
                 let pool = database.pool();
                 sqlx::query(
-                    "INSERT INTO av_profile_grants (subject, profile) VALUES ($1, $2) \
-                     ON CONFLICT (subject, profile) DO NOTHING",
+                    "INSERT INTO av_capability_grants \
+                     (subject, profile, mode, expires_unix_seconds) VALUES ($1, $2, $3, $4) \
+                     ON CONFLICT (subject, profile) DO UPDATE SET \
+                     mode = EXCLUDED.mode, expires_unix_seconds = EXCLUDED.expires_unix_seconds",
                 )
                 .bind(subject)
                 .bind(profile)
+                .bind(mode.as_str())
+                .bind(expires_unix_seconds)
                 .execute(&pool)
                 .await?;
             }
             Self::Sqlite(pool) => {
                 sqlx::query(
-                    "INSERT INTO av_profile_grants (subject, profile) VALUES (?, ?) \
-                     ON CONFLICT (subject, profile) DO NOTHING",
+                    "INSERT INTO av_capability_grants \
+                     (subject, profile, mode, expires_unix_seconds) VALUES (?, ?, ?, ?) \
+                     ON CONFLICT (subject, profile) DO UPDATE SET \
+                     mode = excluded.mode, expires_unix_seconds = excluded.expires_unix_seconds",
                 )
                 .bind(subject)
                 .bind(profile)
+                .bind(mode.as_str())
+                .bind(expires_unix_seconds)
                 .execute(pool)
                 .await?;
             }
@@ -393,7 +968,7 @@ impl Store {
         let affected = match self {
             Self::Postgres(database) => {
                 let pool = database.pool();
-                sqlx::query("DELETE FROM av_profile_grants WHERE subject = $1 AND profile = $2")
+                sqlx::query("DELETE FROM av_capability_grants WHERE subject = $1 AND profile = $2")
                     .bind(subject)
                     .bind(profile)
                     .execute(&pool)
@@ -401,7 +976,7 @@ impl Store {
                     .rows_affected()
             }
             Self::Sqlite(pool) => {
-                sqlx::query("DELETE FROM av_profile_grants WHERE subject = ? AND profile = ?")
+                sqlx::query("DELETE FROM av_capability_grants WHERE subject = ? AND profile = ?")
                     .bind(subject)
                     .bind(profile)
                     .execute(pool)
@@ -663,9 +1238,26 @@ impl Store {
             singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),\
             subject TEXT NOT NULL UNIQUE\
         )";
+        const CREATE_PRINCIPAL_ROLES: &str = "CREATE TABLE IF NOT EXISTS av_principal_roles (\
+            subject TEXT PRIMARY KEY,\
+            role TEXT NOT NULL CHECK (role IN ('owner', 'operator', 'auditor', 'user'))\
+        )";
+        const MIGRATE_OWNERS: &str = "INSERT INTO av_principal_roles (subject, role) \
+             SELECT subject, 'owner' FROM av_owners WHERE TRUE \
+             ON CONFLICT (subject) DO UPDATE SET role = 'owner'";
         const CREATE_BASIC_USERS: &str = "CREATE TABLE IF NOT EXISTS av_basic_users (\
             username TEXT PRIMARY KEY,\
             password_hash TEXT NOT NULL,\
+            enabled BOOLEAN NOT NULL\
+        )";
+        const CREATE_AGENTS_POSTGRES: &str = "CREATE TABLE IF NOT EXISTS av_agents (\
+            name TEXT PRIMARY KEY,\
+            token_hash BYTEA NOT NULL UNIQUE,\
+            enabled BOOLEAN NOT NULL\
+        )";
+        const CREATE_AGENTS_SQLITE: &str = "CREATE TABLE IF NOT EXISTS av_agents (\
+            name TEXT PRIMARY KEY,\
+            token_hash BLOB NOT NULL UNIQUE,\
             enabled BOOLEAN NOT NULL\
         )";
         const CREATE_PROFILE_GRANTS: &str = "CREATE TABLE IF NOT EXISTS av_profile_grants (\
@@ -673,6 +1265,17 @@ impl Store {
             profile TEXT NOT NULL,\
             PRIMARY KEY (subject, profile)\
         )";
+        const CREATE_CAPABILITY_GRANTS: &str = "CREATE TABLE IF NOT EXISTS av_capability_grants (\
+                subject TEXT NOT NULL,\
+                profile TEXT NOT NULL,\
+                mode TEXT NOT NULL CHECK (mode IN ('both', 'proxy', 'environment')),\
+                expires_unix_seconds BIGINT NULL,\
+                PRIMARY KEY (subject, profile)\
+            )";
+        const MIGRATE_PROFILE_GRANTS: &str = "INSERT INTO av_capability_grants \
+             (subject, profile, mode, expires_unix_seconds) \
+             SELECT subject, profile, 'both', NULL FROM av_profile_grants WHERE TRUE \
+             ON CONFLICT (subject, profile) DO NOTHING";
         const CREATE_AUDIT_EVENTS: &str = "CREATE TABLE IF NOT EXISTS av_audit_events (\
             created_unix_seconds BIGINT NOT NULL,\
             actor TEXT NOT NULL,\
@@ -706,8 +1309,13 @@ impl Store {
                 let pool = database.pool();
                 sqlx::query(CREATE_OWNERS).execute(&pool).await?;
                 sqlx::query(CREATE_OWNER_BOOTSTRAP).execute(&pool).await?;
+                sqlx::query(CREATE_PRINCIPAL_ROLES).execute(&pool).await?;
+                sqlx::query(MIGRATE_OWNERS).execute(&pool).await?;
                 sqlx::query(CREATE_BASIC_USERS).execute(&pool).await?;
+                sqlx::query(CREATE_AGENTS_POSTGRES).execute(&pool).await?;
                 sqlx::query(CREATE_PROFILE_GRANTS).execute(&pool).await?;
+                sqlx::query(CREATE_CAPABILITY_GRANTS).execute(&pool).await?;
+                sqlx::query(MIGRATE_PROFILE_GRANTS).execute(&pool).await?;
                 sqlx::query(CREATE_AUDIT_EVENTS).execute(&pool).await?;
                 sqlx::query(CREATE_AUDIT_INDEX).execute(&pool).await?;
                 sqlx::query(CREATE_PROXY_SESSIONS_POSTGRES)
@@ -720,8 +1328,13 @@ impl Store {
             Self::Sqlite(pool) => {
                 sqlx::query(CREATE_OWNERS).execute(pool).await?;
                 sqlx::query(CREATE_OWNER_BOOTSTRAP).execute(pool).await?;
+                sqlx::query(CREATE_PRINCIPAL_ROLES).execute(pool).await?;
+                sqlx::query(MIGRATE_OWNERS).execute(pool).await?;
                 sqlx::query(CREATE_BASIC_USERS).execute(pool).await?;
+                sqlx::query(CREATE_AGENTS_SQLITE).execute(pool).await?;
                 sqlx::query(CREATE_PROFILE_GRANTS).execute(pool).await?;
+                sqlx::query(CREATE_CAPABILITY_GRANTS).execute(pool).await?;
+                sqlx::query(MIGRATE_PROFILE_GRANTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_EVENTS).execute(pool).await?;
                 sqlx::query(CREATE_AUDIT_INDEX).execute(pool).await?;
                 sqlx::query(CREATE_PROXY_SESSIONS_SQLITE)
@@ -750,6 +1363,14 @@ impl Store {
                 .bind(subject)
                 .execute(&pool)
                 .await?;
+                sqlx::query(
+                    "INSERT INTO av_principal_roles (subject, role) \
+                     SELECT subject, 'owner' FROM av_owners WHERE subject = $1 \
+                     ON CONFLICT (subject) DO UPDATE SET role = 'owner'",
+                )
+                .bind(subject)
+                .execute(&pool)
+                .await?;
             }
             Self::Sqlite(pool) => {
                 let inserted = sqlx::query(
@@ -766,6 +1387,14 @@ impl Store {
                         .execute(pool)
                         .await?;
                 }
+                sqlx::query(
+                    "INSERT INTO av_principal_roles (subject, role) \
+                     SELECT subject, 'owner' FROM av_owners WHERE subject = ? \
+                     ON CONFLICT (subject) DO UPDATE SET role = 'owner'",
+                )
+                .bind(subject)
+                .execute(pool)
+                .await?;
             }
         }
         Ok(())
@@ -931,6 +1560,21 @@ fn validate_proxy_session(
     Ok(())
 }
 
+fn validate_agent_token(name: &str, token_hash: &[u8]) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 128
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("agent name must be 1-128 ASCII letters, digits, hyphens, or underscores");
+    }
+    if token_hash.len() != 32 {
+        bail!("agent token hash must be exactly 32 bytes");
+    }
+    Ok(())
+}
+
 fn read_database_url(path: &str) -> Result<String> {
     let path = Path::new(path);
     let value = std::fs::read_to_string(path)
@@ -1006,6 +1650,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn principal_roles_protect_the_last_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = sqlite_store(&directory, "oidc:first-owner").await;
+        assert_eq!(
+            store.principal_role("oidc:first-owner").await.unwrap(),
+            PrincipalRole::Owner
+        );
+        assert_eq!(
+            store.principal_role("oidc:unknown").await.unwrap(),
+            PrincipalRole::User
+        );
+        assert!(
+            store
+                .set_principal_role("oidc:first-owner", PrincipalRole::Operator)
+                .await
+                .is_err()
+        );
+
+        store
+            .set_principal_role("oidc:second-owner", PrincipalRole::Owner)
+            .await
+            .unwrap();
+        store
+            .set_principal_role("oidc:first-owner", PrincipalRole::Auditor)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.principal_role("oidc:first-owner").await.unwrap(),
+            PrincipalRole::Auditor
+        );
+        assert_eq!(
+            store.list_principal_roles().await.unwrap(),
+            vec![
+                PrincipalRoleBinding {
+                    subject: "oidc:first-owner".into(),
+                    role: PrincipalRole::Auditor,
+                },
+                PrincipalRoleBinding {
+                    subject: "oidc:second-owner".into(),
+                    role: PrincipalRole::Owner,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn basic_users_can_be_disabled_without_returning_password_hashes() {
         let directory = tempfile::tempdir().unwrap();
         let store = sqlite_store(&directory, "").await;
@@ -1043,6 +1733,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agents_store_only_token_hashes_and_revoke_sessions_when_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = sqlite_store(&directory, "").await;
+        let raw_token = b"synthetic-agent-token-that-must-not-be-stored";
+        let token_hash: [u8; 32] = Sha256::digest(raw_token).into();
+        store.create_agent("builder", &token_hash).await.unwrap();
+        assert_eq!(
+            store.list_agents().await.unwrap(),
+            vec![Agent {
+                name: "builder".into(),
+                enabled: true,
+            }]
+        );
+        assert_eq!(
+            store.agent_for_token_hash(&token_hash).await.unwrap(),
+            Some("builder".into())
+        );
+
+        let expiry = now_unix_seconds().unwrap() + 60;
+        store
+            .create_proxy_session(
+                "agent-session",
+                &[9_u8; 32],
+                "agent:builder",
+                "example",
+                expiry,
+            )
+            .await
+            .unwrap();
+        assert!(store.set_agent_enabled("builder", false).await.unwrap());
+        assert_eq!(store.agent_for_token_hash(&token_hash).await.unwrap(), None);
+        assert!(
+            store
+                .active_proxy_session(&[9_u8; 32])
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let Store::Sqlite(pool) = &store else {
+            panic!("expected SQLite store");
+        };
+        let stored: Vec<u8> =
+            sqlx::query_scalar("SELECT token_hash FROM av_agents WHERE name = 'builder'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        assert_eq!(stored, token_hash);
+        assert_ne!(stored, raw_token);
+    }
+
+    #[tokio::test]
     async fn profile_grants_are_exact_and_revocable() {
         let directory = tempfile::tempdir().unwrap();
         let store = sqlite_store(&directory, "").await;
@@ -1071,6 +1813,8 @@ mod tests {
             vec![ProfileGrant {
                 profile: "infra-dev".into(),
                 subject: "oidc:developer".into(),
+                mode: GrantMode::Both,
+                expires_unix_seconds: None,
             }]
         );
         assert!(
@@ -1084,6 +1828,61 @@ mod tests {
                 .profile_allowed("oidc:developer", "infra-dev")
                 .await
                 .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_grants_enforce_delivery_mode_and_expiry() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = sqlite_store(&directory, "").await;
+        store
+            .grant_profile_mode("agent:builder", "example-prod", GrantMode::Proxy, None)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .profile_allowed_for("agent:builder", "example-prod", GrantMode::Proxy)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .profile_allowed_for("agent:builder", "example-prod", GrantMode::Environment)
+                .await
+                .unwrap()
+        );
+
+        store
+            .grant_profile_mode(
+                "agent:builder",
+                "example-prod",
+                GrantMode::Environment,
+                Some(now_unix_seconds().unwrap() + 60),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .profile_allowed_for("agent:builder", "example-prod", GrantMode::Proxy)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .profile_allowed_for("agent:builder", "example-prod", GrantMode::Environment)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .grant_profile_mode(
+                    "agent:builder",
+                    "expired",
+                    GrantMode::Both,
+                    Some(now_unix_seconds().unwrap() - 1),
+                )
+                .await
+                .is_err()
         );
     }
 

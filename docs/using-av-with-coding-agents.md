@@ -74,7 +74,8 @@ request:
 1. Authenticates the caller with its AV identity.
 2. Checks that identity has the route's profile capability.
 3. Rejects undeclared paths, methods, query fields, and headers.
-4. Fetches the configured credential from Infisical or OpenBao.
+4. Fetches the configured credential from Infisical, OpenBao, or Google Secret
+   Manager.
 5. Removes any caller-provided injection header and inserts AV's credential.
 6. Sends the request only to the fixed upstream origin.
 7. Returns only allowlisted response headers and redacts the injected secret if
@@ -131,6 +132,20 @@ Codex / Claude
 This is the preferred design for agent actions because prompt injection cannot
 turn a capability to create a development widget into arbitrary access to the
 provider account.
+
+For a named non-human agent, create a private token file and grant proxy
+delivery only:
+
+```bash
+av agents create orchard-coder --out "${XDG_RUNTIME_DIR}/orchard-coder.token"
+av agents grant orchard-coder orchard-dev --mode proxy
+AV_AGENT_TOKEN_FILE="${XDG_RUNTIME_DIR}/orchard-coder.token" \
+  av run orchard-dev -- codex
+```
+
+The remote agent token authorizes the wrapper, but the wrapper removes the
+token-file variable and token from the Codex process. Codex receives the
+loopback proxy variables and CA paths, including `CODEX_CA_CERTIFICATE`.
 
 Read [the transparent proxy design](transparent-proxy-design.md) before
 enabling it. Certificate-pinned SDKs cannot use this mode; use an explicit

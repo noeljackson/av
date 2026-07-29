@@ -48,7 +48,9 @@ av logout
 returned keys only to the child process. It never writes application secrets to
 disk or to the kernel keyring. The keyring contains only the short-lived OIDC
 access token. `AV_TOKEN` is available for CI; optional Basic credentials use
-`AV_BASIC_USER` and `AV_BASIC_PASSWORD`.
+`AV_BASIC_USER` and `AV_BASIC_PASSWORD`. Managed automation should use a named
+agent token from a private `AV_AGENT_TOKEN_FILE`; see
+[access control](docs/access-control.md).
 
 See [using AV with coding agents](docs/using-av-with-coding-agents.md) for a
 generic application example with Codex and Claude, and for the boundary between
@@ -58,6 +60,8 @@ deployment CA, a private listener, and workload egress enforcement. Use
 `av run <profile> -- codex` or `av run <profile> -- claude`; never set a remote
 AV listener directly as a child's `HTTPS_PROXY`. The complete deployment and
 security contract is in [transparent proxy design](docs/transparent-proxy-design.md).
+The stable product boundaries and active implementation sequence are tracked in
+the [roadmap](docs/roadmap.md).
 
 For Tier 2, callers use a named route:
 
@@ -156,13 +160,13 @@ the database explicitly if you intend to discard that local control plane.
 
 Static mode preserves the simple model: every identity that passes the OIDC
 role check can use every configured profile and Tier 2 route. Managed mode is
-stricter: profiles and routes are unavailable until an owner grants the exact
-OIDC subject (or a `basic:<username>` subject) the named profile through the
-owner-only Connect control API. The embedded web UI exposes the same owner-only
-Basic-user and profile-grant operations after browser PKCE; it is unavailable
-to non-owners and static deployments. The same grant governs profile listing,
-Tier 3 environment leases, and any Tier 2 route backed by that profile.
-Revoking the grant takes effect on the next request.
+stricter: profiles and routes are unavailable until an owner or operator grants
+the exact OIDC, GitHub, Basic, or named-agent subject a predefined profile.
+Each grant independently permits `proxy`, `environment`, or `both` delivery and
+may expire. Owners manage instance roles; operators manage accounts, agents,
+and grants; auditors read redacted audit events. Revocation and expiry take
+effect on the next request, and AV protects the last owner. The Connect API,
+CLI, and authenticated browser interface enforce the same rules.
 
 Connector definitions and their credential-file references remain immutable
 bootstrap configuration; the control plane deliberately cannot add, edit, or

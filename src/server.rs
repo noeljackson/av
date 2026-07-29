@@ -47,20 +47,24 @@ use zeroize::Zeroizing;
 use crate::{
     auth::Authenticator,
     av::v1::{
-        AuditEvent as RpcAuditEvent, AuthConfig as RpcAuthConfig, BasicUser as RpcBasicUser,
-        Connector as RpcConnector, ControlService, ControlServiceExt, CreateProxySessionRequest,
-        EnvironmentValue, GetAuthConfigRequest, GetProfileEnvironmentRequest, GetStatusRequest,
-        GrantProfileRequest, ListAuditEventsRequest, ListAuditEventsResponse,
-        ListBasicUsersRequest, ListBasicUsersResponse, ListProfileGrantsRequest,
-        ListProfileGrantsResponse, ListProfilesRequest, ListProfilesResponse,
-        Profile as RpcProfile, ProfileEnvironment, ProfileGrant as RpcProfileGrant,
-        ProxySessionLease, RevokeProfileRequest, RevokeProxySessionRequest, SessionService,
-        SessionServiceExt, SetBasicUserEnabledRequest, Status as RpcStatus, UpsertBasicUserRequest,
+        Agent as RpcAgent, AgentCredential, AuditEvent as RpcAuditEvent,
+        AuthConfig as RpcAuthConfig, BasicUser as RpcBasicUser, Connector as RpcConnector,
+        ControlService, ControlServiceExt, CreateAgentRequest, CreateProxySessionRequest,
+        DeleteAgentRequest, EnvironmentValue, GetAuthConfigRequest, GetProfileEnvironmentRequest,
+        GetStatusRequest, GrantProfileRequest, ListAgentsRequest, ListAgentsResponse,
+        ListAuditEventsRequest, ListAuditEventsResponse, ListBasicUsersRequest,
+        ListBasicUsersResponse, ListPrincipalRolesRequest, ListPrincipalRolesResponse,
+        ListProfileGrantsRequest, ListProfileGrantsResponse, ListProfilesRequest,
+        ListProfilesResponse, PrincipalRole as RpcPrincipalRole, Profile as RpcProfile,
+        ProfileEnvironment, ProfileGrant as RpcProfileGrant, ProxySessionLease,
+        RevokeProfileRequest, RevokeProxySessionRequest, RotateAgentRequest, SessionService,
+        SessionServiceExt, SetAgentEnabledRequest, SetBasicUserEnabledRequest,
+        SetPrincipalRoleRequest, Status as RpcStatus, UpsertBasicUserRequest,
     },
     config::{AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyRouteConfig},
     connector::Connector,
     proxy_ca::ProxyCertificateAuthority,
-    store::Store,
+    store::{GrantMode, PrincipalRole, Store},
     transparent_proxy::{
         TransparentRouteCatalog, authorize_connect_request, mint_proxy_session_credential,
     },
@@ -362,7 +366,7 @@ impl ControlService for ConnectControlService {
         ctx: connectrpc::RequestContext,
         _request: connectrpc::ServiceRequest<'_, ListBasicUsersRequest>,
     ) -> connectrpc::ServiceResult<ListBasicUsersResponse> {
-        require_owner(&self.state, ctx.headers()).await?;
+        require_operator(&self.state, ctx.headers()).await?;
         let store = managed_store(&self.state)?;
         let users = store
             .list_basic_users()
@@ -386,7 +390,7 @@ impl ControlService for ConnectControlService {
         ctx: connectrpc::RequestContext,
         request: connectrpc::ServiceRequest<'_, UpsertBasicUserRequest>,
     ) -> connectrpc::ServiceResult<RpcBasicUser> {
-        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let identity = require_operator(&self.state, ctx.headers()).await?;
         let username = request.username;
         if !valid_basic_username(username) {
             return Err(connectrpc::ConnectError::invalid_argument(
@@ -430,7 +434,7 @@ impl ControlService for ConnectControlService {
         ctx: connectrpc::RequestContext,
         request: connectrpc::ServiceRequest<'_, SetBasicUserEnabledRequest>,
     ) -> connectrpc::ServiceResult<RpcBasicUser> {
-        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let identity = require_operator(&self.state, ctx.headers()).await?;
         let username = request.username;
         if !valid_basic_username(username) {
             return Err(connectrpc::ConnectError::invalid_argument(
@@ -467,12 +471,262 @@ impl ControlService for ConnectControlService {
         })
     }
 
+    async fn list_agents(
+        &self,
+        ctx: connectrpc::RequestContext,
+        _request: connectrpc::ServiceRequest<'_, ListAgentsRequest>,
+    ) -> connectrpc::ServiceResult<ListAgentsResponse> {
+        require_operator(&self.state, ctx.headers()).await?;
+        let agents = managed_store(&self.state)?
+            .list_agents()
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+        connectrpc::Response::ok(ListAgentsResponse {
+            agents: agents
+                .into_iter()
+                .map(|agent| RpcAgent {
+                    name: agent.name,
+                    enabled: agent.enabled,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn create_agent(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, CreateAgentRequest>,
+    ) -> connectrpc::ServiceResult<AgentCredential> {
+        let identity = require_operator(&self.state, ctx.headers()).await?;
+        let name = request.name;
+        if !valid_agent_name(name) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid agent name",
+            ));
+        }
+        let (token, token_hash) = mint_agent_token();
+        managed_store(&self.state)?
+            .create_agent(name, &token_hash)
+            .await
+            .map_err(|error| {
+                if error
+                    .downcast_ref::<sqlx::Error>()
+                    .and_then(sqlx::Error::as_database_error)
+                    .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+                {
+                    connectrpc::ConnectError::already_exists("agent already exists")
+                } else {
+                    connectrpc::ConnectError::internal("managed store unavailable")
+                }
+            })?;
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "agent_created",
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(AgentCredential {
+            name: name.to_owned(),
+            token: token.to_string(),
+            enabled: true,
+            ..Default::default()
+        })
+    }
+
+    async fn rotate_agent(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, RotateAgentRequest>,
+    ) -> connectrpc::ServiceResult<AgentCredential> {
+        let identity = require_operator(&self.state, ctx.headers()).await?;
+        let name = request.name;
+        if !valid_agent_name(name) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid agent name",
+            ));
+        }
+        let (token, token_hash) = mint_agent_token();
+        if !managed_store(&self.state)?
+            .rotate_agent_token(name, &token_hash)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        {
+            return Err(connectrpc::ConnectError::not_found("agent not found"));
+        }
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "agent_token_rotated",
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(AgentCredential {
+            name: name.to_owned(),
+            token: token.to_string(),
+            enabled: true,
+            ..Default::default()
+        })
+    }
+
+    async fn set_agent_enabled(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, SetAgentEnabledRequest>,
+    ) -> connectrpc::ServiceResult<RpcAgent> {
+        let identity = require_operator(&self.state, ctx.headers()).await?;
+        let name = request.name;
+        if !valid_agent_name(name) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid agent name",
+            ));
+        }
+        let enabled = request.enabled;
+        if !managed_store(&self.state)?
+            .set_agent_enabled(name, enabled)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        {
+            return Err(connectrpc::ConnectError::not_found("agent not found"));
+        }
+        audit_event(
+            &self.state,
+            &identity.subject,
+            if enabled {
+                "agent_enabled"
+            } else {
+                "agent_disabled"
+            },
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(RpcAgent {
+            name: name.to_owned(),
+            enabled,
+            ..Default::default()
+        })
+    }
+
+    async fn delete_agent(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, DeleteAgentRequest>,
+    ) -> connectrpc::ServiceResult<RpcAgent> {
+        let identity = require_operator(&self.state, ctx.headers()).await?;
+        let name = request.name;
+        if !valid_agent_name(name) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid agent name",
+            ));
+        }
+        if !managed_store(&self.state)?
+            .delete_agent(name)
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        {
+            return Err(connectrpc::ConnectError::not_found("agent not found"));
+        }
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "agent_deleted",
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(RpcAgent {
+            name: name.to_owned(),
+            enabled: false,
+            ..Default::default()
+        })
+    }
+
+    async fn list_principal_roles(
+        &self,
+        ctx: connectrpc::RequestContext,
+        _request: connectrpc::ServiceRequest<'_, ListPrincipalRolesRequest>,
+    ) -> connectrpc::ServiceResult<ListPrincipalRolesResponse> {
+        require_owner(&self.state, ctx.headers()).await?;
+        let roles = managed_store(&self.state)?
+            .list_principal_roles()
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+        connectrpc::Response::ok(ListPrincipalRolesResponse {
+            roles: roles
+                .into_iter()
+                .map(|binding| RpcPrincipalRole {
+                    subject: binding.subject,
+                    role: binding.role.as_str().into(),
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    async fn set_principal_role(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, SetPrincipalRoleRequest>,
+    ) -> connectrpc::ServiceResult<RpcPrincipalRole> {
+        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let subject = request.subject;
+        if !valid_policy_subject(subject) {
+            return Err(connectrpc::ConnectError::invalid_argument(
+                "invalid policy subject",
+            ));
+        }
+        let role = PrincipalRole::parse(request.role).map_err(|_| {
+            connectrpc::ConnectError::invalid_argument(
+                "principal role must be owner, operator, auditor, or user",
+            )
+        })?;
+        managed_store(&self.state)?
+            .set_principal_role(subject, role)
+            .await
+            .map_err(|error| {
+                if error.to_string().contains("last owner") {
+                    connectrpc::ConnectError::failed_precondition("cannot remove the last owner")
+                } else {
+                    connectrpc::ConnectError::internal("managed store unavailable")
+                }
+            })?;
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "principal_role_changed",
+            None,
+            None,
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(RpcPrincipalRole {
+            subject: subject.to_owned(),
+            role: role.as_str().into(),
+            ..Default::default()
+        })
+    }
+
     async fn list_audit_events(
         &self,
         ctx: connectrpc::RequestContext,
         request: connectrpc::ServiceRequest<'_, ListAuditEventsRequest>,
     ) -> connectrpc::ServiceResult<ListAuditEventsResponse> {
-        require_owner(&self.state, ctx.headers()).await?;
+        require_auditor(&self.state, ctx.headers()).await?;
         let store = managed_store(&self.state)?;
         let limit = if request.limit == 0 {
             100
@@ -505,7 +759,7 @@ impl ControlService for ConnectControlService {
         ctx: connectrpc::RequestContext,
         request: connectrpc::ServiceRequest<'_, ListProfileGrantsRequest>,
     ) -> connectrpc::ServiceResult<ListProfileGrantsResponse> {
-        require_owner(&self.state, ctx.headers()).await?;
+        require_operator(&self.state, ctx.headers()).await?;
         let profile = request.profile;
         require_known_profile(&self.state, profile)?;
         let grants = managed_store(&self.state)?
@@ -518,6 +772,8 @@ impl ControlService for ConnectControlService {
                 .map(|grant| RpcProfileGrant {
                     profile: grant.profile,
                     subject: grant.subject,
+                    mode: grant.mode.as_str().into(),
+                    expires_unix_seconds: grant.expires_unix_seconds.unwrap_or_default(),
                     ..Default::default()
                 })
                 .collect(),
@@ -530,7 +786,7 @@ impl ControlService for ConnectControlService {
         ctx: connectrpc::RequestContext,
         request: connectrpc::ServiceRequest<'_, GrantProfileRequest>,
     ) -> connectrpc::ServiceResult<RpcProfileGrant> {
-        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let identity = require_operator(&self.state, ctx.headers()).await?;
         let profile = request.profile;
         let subject = request.subject;
         require_known_profile(&self.state, profile)?;
@@ -539,10 +795,21 @@ impl ControlService for ConnectControlService {
                 "invalid policy subject",
             ));
         }
+        let mode = parse_grant_mode(request.mode)?;
+        let expires_unix_seconds =
+            (request.expires_unix_seconds != 0).then_some(request.expires_unix_seconds);
         managed_store(&self.state)?
-            .grant_profile(subject, profile)
+            .grant_profile_mode(subject, profile, mode, expires_unix_seconds)
             .await
-            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+            .map_err(|error| {
+                if error.to_string().contains("expiry must be in the future") {
+                    connectrpc::ConnectError::invalid_argument(
+                        "profile grant expiry must be in the future",
+                    )
+                } else {
+                    connectrpc::ConnectError::internal("managed store unavailable")
+                }
+            })?;
         audit_event(
             &self.state,
             &identity.subject,
@@ -556,6 +823,8 @@ impl ControlService for ConnectControlService {
         connectrpc::Response::ok(RpcProfileGrant {
             profile: profile.to_owned(),
             subject: subject.to_owned(),
+            mode: mode.as_str().into(),
+            expires_unix_seconds: expires_unix_seconds.unwrap_or_default(),
             ..Default::default()
         })
     }
@@ -565,7 +834,7 @@ impl ControlService for ConnectControlService {
         ctx: connectrpc::RequestContext,
         request: connectrpc::ServiceRequest<'_, RevokeProfileRequest>,
     ) -> connectrpc::ServiceResult<RpcProfileGrant> {
-        let identity = require_owner(&self.state, ctx.headers()).await?;
+        let identity = require_operator(&self.state, ctx.headers()).await?;
         let profile = request.profile;
         let subject = request.subject;
         require_known_profile(&self.state, profile)?;
@@ -625,6 +894,40 @@ async fn require_owner(
     Ok(identity)
 }
 
+async fn require_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<crate::auth::Identity, connectrpc::ConnectError> {
+    let identity = authorize_connect(state, headers).await?;
+    let role = managed_store(state)?
+        .principal_role(&identity.subject)
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+    if !role.can_operate() {
+        return Err(connectrpc::ConnectError::permission_denied(
+            "operator access required",
+        ));
+    }
+    Ok(identity)
+}
+
+async fn require_auditor(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<crate::auth::Identity, connectrpc::ConnectError> {
+    let identity = authorize_connect(state, headers).await?;
+    let role = managed_store(state)?
+        .principal_role(&identity.subject)
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?;
+    if !role.can_audit() {
+        return Err(connectrpc::ConnectError::permission_denied(
+            "auditor access required",
+        ));
+    }
+    Ok(identity)
+}
+
 fn valid_basic_username(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 128
@@ -632,8 +935,36 @@ fn valid_basic_username(value: &str) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn valid_agent_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn mint_agent_token() -> (Zeroizing<String>, [u8; 32]) {
+    let mut bytes = [0_u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    let token = Zeroizing::new(format!("av_agent_{}", URL_SAFE_NO_PAD.encode(bytes)));
+    let token_hash = sha2::Sha256::digest(token.as_bytes()).into();
+    bytes.fill(0);
+    (token, token_hash)
+}
+
 fn valid_policy_subject(value: &str) -> bool {
     !value.trim().is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
+}
+
+fn parse_grant_mode(value: &str) -> std::result::Result<GrantMode, connectrpc::ConnectError> {
+    match value {
+        "" | "both" => Ok(GrantMode::Both),
+        "proxy" => Ok(GrantMode::Proxy),
+        "environment" => Ok(GrantMode::Environment),
+        _ => Err(connectrpc::ConnectError::invalid_argument(
+            "profile grant mode must be both, proxy, or environment",
+        )),
+    }
 }
 
 fn external_identity_subject(kind: &str, identity: &str) -> Result<String> {
@@ -771,9 +1102,14 @@ impl SessionService for ConnectSessionService {
         let Some(profile) = self.state.config.profiles.get(profile_name) else {
             return Err(connectrpc::ConnectError::not_found("profile not found"));
         };
-        if !profile_permitted(&self.state, &identity.subject, profile_name)
-            .await
-            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+        if !profile_permitted(
+            &self.state,
+            &identity.subject,
+            profile_name,
+            GrantMode::Environment,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
         {
             return Err(connectrpc::ConnectError::permission_denied(
                 "profile access is not granted",
@@ -847,7 +1183,7 @@ impl SessionService for ConnectSessionService {
         if !self.state.config.profiles.contains_key(profile) {
             return Err(connectrpc::ConnectError::not_found("profile not found"));
         }
-        if !profile_permitted(&self.state, &identity.subject, profile)
+        if !profile_permitted(&self.state, &identity.subject, profile, GrantMode::Proxy)
             .await
             .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
         {
@@ -975,10 +1311,15 @@ async fn permitted_profile_names(state: &AppState, subject: &str) -> Result<BTre
     }
 }
 
-async fn profile_permitted(state: &AppState, subject: &str, profile: &str) -> Result<bool> {
+async fn profile_permitted(
+    state: &AppState,
+    subject: &str,
+    profile: &str,
+    mode: GrantMode,
+) -> Result<bool> {
     match &state.store {
         None => Ok(true),
-        Some(store) => store.profile_allowed(subject, profile).await,
+        Some(store) => store.profile_allowed_for(subject, profile, mode).await,
     }
 }
 
@@ -1071,8 +1412,11 @@ struct SessionTemplate<'a> {
 #[template(path = "owner.html")]
 struct OwnerTemplate {
     basic_users: Vec<OwnerBasicUser>,
+    agents: Vec<OwnerAgent>,
     profiles: Vec<String>,
     principals: Vec<OwnerPrincipal>,
+    issued_agent_credential: Option<IssuedAgentCredential>,
+    can_manage_roles: bool,
 }
 
 struct OwnerBasicUser {
@@ -1080,11 +1424,28 @@ struct OwnerBasicUser {
     enabled: bool,
 }
 
+struct OwnerAgent {
+    name: String,
+    enabled: bool,
+}
+
+struct IssuedAgentCredential {
+    name: String,
+    token: String,
+}
+
 struct OwnerPrincipal {
     label: String,
     kind: String,
     subject: String,
-    profiles: Vec<String>,
+    role: String,
+    grants: Vec<OwnerGrant>,
+}
+
+struct OwnerGrant {
+    profile: String,
+    mode: String,
+    expires_unix_seconds: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -1100,9 +1461,30 @@ struct BasicUserEnabledForm {
 }
 
 #[derive(Deserialize)]
+struct AgentForm {
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct AgentEnabledForm {
+    name: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct PrincipalRoleForm {
+    subject: String,
+    role: String,
+}
+
+#[derive(Deserialize)]
 struct ProfileGrantForm {
     profile: String,
     subject: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    expires_unix_seconds: String,
 }
 
 #[derive(Deserialize)]
@@ -1110,6 +1492,10 @@ struct ExternalProfileGrantForm {
     profile: String,
     identity_kind: String,
     identity: String,
+    #[serde(default)]
+    mode: String,
+    #[serde(default)]
+    expires_unix_seconds: String,
 }
 
 pub async fn run(config: Config) -> Result<()> {
@@ -1232,6 +1618,11 @@ pub async fn run(config: Config) -> Result<()> {
             "/ui/owner/basic-users/enabled",
             post(ui_set_basic_user_enabled),
         )
+        .route("/ui/owner/agents", post(ui_create_agent))
+        .route("/ui/owner/agents/rotate", post(ui_rotate_agent))
+        .route("/ui/owner/agents/enabled", post(ui_set_agent_enabled))
+        .route("/ui/owner/agents/delete", post(ui_delete_agent))
+        .route("/ui/owner/roles", post(ui_set_principal_role))
         .route("/ui/owner/grants", post(ui_grant_profile))
         .route("/ui/owner/external-grants", post(ui_grant_external_profile))
         .route("/ui/owner/grants/revoke", post(ui_revoke_profile))
@@ -1486,10 +1877,11 @@ async fn ui_session(State(state): State<AppState>, headers: HeaderMap) -> Respon
 }
 
 async fn ui_owner(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(response) = ui_require_owner(&state, &headers).await {
-        return response;
-    }
-    render_owner_panel(&state).await
+    let identity = match ui_require_operator(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    render_owner_panel(&state, &identity.subject, None).await
 }
 
 async fn ui_upsert_basic_user(
@@ -1500,7 +1892,7 @@ async fn ui_upsert_basic_user(
     if !is_trusted_browser_origin(&headers, &state.config.public_url) {
         return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
     }
-    let identity = match ui_require_owner(&state, &headers).await {
+    let identity = match ui_require_operator(&state, &headers).await {
         Ok(identity) => identity,
         Err(response) => return response,
     };
@@ -1537,7 +1929,7 @@ async fn ui_upsert_basic_user(
     {
         return internal_error(error);
     }
-    render_owner_panel(&state).await
+    render_owner_panel(&state, &identity.subject, None).await
 }
 
 async fn ui_set_basic_user_enabled(
@@ -1548,7 +1940,7 @@ async fn ui_set_basic_user_enabled(
     if !is_trusted_browser_origin(&headers, &state.config.public_url) {
         return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
     }
-    let identity = match ui_require_owner(&state, &headers).await {
+    let identity = match ui_require_operator(&state, &headers).await {
         Ok(identity) => identity,
         Err(response) => return response,
     };
@@ -1584,7 +1976,234 @@ async fn ui_set_basic_user_enabled(
     {
         return internal_error(error);
     }
-    render_owner_panel(&state).await
+    render_owner_panel(&state, &identity.subject, None).await
+}
+
+async fn ui_create_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AgentForm>,
+) -> Response {
+    let identity = match ui_authorize_owner_mutation(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !valid_agent_name(&form.name) {
+        return ui_bad_request("invalid agent name");
+    }
+    let (token, token_hash) = mint_agent_token();
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    if let Err(error) = store.create_agent(&form.name, &token_hash).await {
+        if error
+            .downcast_ref::<sqlx::Error>()
+            .and_then(sqlx::Error::as_database_error)
+            .is_some_and(sqlx::error::DatabaseError::is_unique_violation)
+        {
+            return ui_bad_request("agent already exists");
+        }
+        return internal_error(error);
+    }
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        "agent_created",
+        None,
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(
+        &state,
+        &identity.subject,
+        Some(IssuedAgentCredential {
+            name: form.name,
+            token: token.to_string(),
+        }),
+    )
+    .await
+}
+
+async fn ui_rotate_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AgentForm>,
+) -> Response {
+    let identity = match ui_authorize_owner_mutation(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !valid_agent_name(&form.name) {
+        return ui_bad_request("invalid agent name");
+    }
+    let (token, token_hash) = mint_agent_token();
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    match store.rotate_agent_token(&form.name, &token_hash).await {
+        Ok(true) => {}
+        Ok(false) => return ui_bad_request("agent not found"),
+        Err(error) => return internal_error(error),
+    }
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        "agent_token_rotated",
+        None,
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(
+        &state,
+        &identity.subject,
+        Some(IssuedAgentCredential {
+            name: form.name,
+            token: token.to_string(),
+        }),
+    )
+    .await
+}
+
+async fn ui_set_agent_enabled(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AgentEnabledForm>,
+) -> Response {
+    let identity = match ui_authorize_owner_mutation(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !valid_agent_name(&form.name) {
+        return ui_bad_request("invalid agent name");
+    }
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    match store.set_agent_enabled(&form.name, form.enabled).await {
+        Ok(true) => {}
+        Ok(false) => return ui_bad_request("agent not found"),
+        Err(error) => return internal_error(error),
+    }
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        if form.enabled {
+            "agent_enabled"
+        } else {
+            "agent_disabled"
+        },
+        None,
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(&state, &identity.subject, None).await
+}
+
+async fn ui_delete_agent(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<AgentForm>,
+) -> Response {
+    let identity = match ui_authorize_owner_mutation(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !valid_agent_name(&form.name) {
+        return ui_bad_request("invalid agent name");
+    }
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    match store.delete_agent(&form.name).await {
+        Ok(true) => {}
+        Ok(false) => return ui_bad_request("agent not found"),
+        Err(error) => return internal_error(error),
+    }
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        "agent_deleted",
+        None,
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(&state, &identity.subject, None).await
+}
+
+async fn ui_authorize_owner_mutation(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<crate::auth::Identity, Response> {
+    if !is_trusted_browser_origin(headers, &state.config.public_url) {
+        return Err(no_store(
+            (StatusCode::FORBIDDEN, "owner request forbidden\n").into_response(),
+        ));
+    }
+    ui_require_operator(state, headers).await
+}
+
+async fn ui_set_principal_role(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Form(form): Form<PrincipalRoleForm>,
+) -> Response {
+    if !is_trusted_browser_origin(&headers, &state.config.public_url) {
+        return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
+    }
+    let identity = match ui_require_owner(&state, &headers).await {
+        Ok(identity) => identity,
+        Err(response) => return response,
+    };
+    if !valid_policy_subject(&form.subject) {
+        return ui_bad_request("invalid policy subject");
+    }
+    let role = match PrincipalRole::parse(&form.role) {
+        Ok(role) => role,
+        Err(_) => return ui_bad_request("role must be owner, operator, auditor, or user"),
+    };
+    let store = match state.store.as_ref() {
+        Some(store) => store,
+        None => return ui_not_found().await,
+    };
+    if let Err(error) = store.set_principal_role(&form.subject, role).await {
+        if error.to_string().contains("last owner") {
+            return ui_bad_request("cannot remove the last owner");
+        }
+        return internal_error(error);
+    }
+    if let Err(error) = audit_event(
+        &state,
+        &identity.subject,
+        "principal_role_changed",
+        None,
+        None,
+        Some("managed-ui"),
+    )
+    .await
+    {
+        return internal_error(error);
+    }
+    render_owner_panel(&state, &identity.subject, None).await
 }
 
 async fn ui_grant_profile(
@@ -1610,6 +2229,8 @@ async fn ui_grant_external_profile(
         ProfileGrantForm {
             profile: form.profile,
             subject,
+            mode: form.mode,
+            expires_unix_seconds: form.expires_unix_seconds,
         },
     )
     .await
@@ -1623,7 +2244,7 @@ async fn ui_grant_profile_subject(
     if !is_trusted_browser_origin(headers, &state.config.public_url) {
         return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
     }
-    let identity = match ui_require_owner(state, headers).await {
+    let identity = match ui_require_operator(state, headers).await {
         Ok(identity) => identity,
         Err(response) => return response,
     };
@@ -1633,11 +2254,31 @@ async fn ui_grant_profile_subject(
     if !valid_policy_subject(&form.subject) {
         return ui_bad_request("invalid policy subject");
     }
+    let mode = match form.mode.as_str() {
+        "" | "both" => GrantMode::Both,
+        "proxy" => GrantMode::Proxy,
+        "environment" => GrantMode::Environment,
+        _ => return ui_bad_request("grant mode must be both, proxy, or environment"),
+    };
+    let expires_unix_seconds = if form.expires_unix_seconds.trim().is_empty() {
+        None
+    } else {
+        match form.expires_unix_seconds.parse::<i64>() {
+            Ok(value) => Some(value),
+            Err(_) => return ui_bad_request("grant expiry must be a Unix timestamp"),
+        }
+    };
     let store = match state.store.as_ref() {
         Some(store) => store,
         None => return ui_not_found().await,
     };
-    if let Err(error) = store.grant_profile(&form.subject, &form.profile).await {
+    if let Err(error) = store
+        .grant_profile_mode(&form.subject, &form.profile, mode, expires_unix_seconds)
+        .await
+    {
+        if error.to_string().contains("expiry must be in the future") {
+            return ui_bad_request("grant expiry must be in the future");
+        }
         return internal_error(error);
     }
     if let Err(error) = audit_event(
@@ -1652,7 +2293,7 @@ async fn ui_grant_profile_subject(
     {
         return internal_error(error);
     }
-    render_owner_panel(state).await
+    render_owner_panel(state, &identity.subject, None).await
 }
 
 async fn ui_revoke_profile(
@@ -1663,7 +2304,7 @@ async fn ui_revoke_profile(
     if !is_trusted_browser_origin(&headers, &state.config.public_url) {
         return no_store((StatusCode::FORBIDDEN, "owner request forbidden\n").into_response());
     }
-    let identity = match ui_require_owner(&state, &headers).await {
+    let identity = match ui_require_operator(&state, &headers).await {
         Ok(identity) => identity,
         Err(response) => return response,
     };
@@ -1694,7 +2335,7 @@ async fn ui_revoke_profile(
     {
         return internal_error(error);
     }
-    render_owner_panel(&state).await
+    render_owner_panel(&state, &identity.subject, None).await
 }
 
 async fn ui_require_owner(
@@ -1709,6 +2350,23 @@ async fn ui_require_owner(
         Ok(true) => Ok(identity),
         Ok(false) => Err(no_store(
             (StatusCode::FORBIDDEN, "owner access required\n").into_response(),
+        )),
+        Err(error) => Err(internal_error(error)),
+    }
+}
+
+async fn ui_require_operator(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> std::result::Result<crate::auth::Identity, Response> {
+    let identity = ui_identity(state, headers).await.map_err(unauthorized)?;
+    let Some(store) = state.store.as_ref() else {
+        return Err(ui_not_found().await);
+    };
+    match store.principal_role(&identity.subject).await {
+        Ok(role) if role.can_operate() => Ok(identity),
+        Ok(_) => Err(no_store(
+            (StatusCode::FORBIDDEN, "operator access required\n").into_response(),
         )),
         Err(error) => Err(internal_error(error)),
     }
@@ -1780,7 +2438,11 @@ fn github_callback_rejected() -> Response {
     )
 }
 
-async fn render_owner_panel(state: &AppState) -> Response {
+async fn render_owner_panel(
+    state: &AppState,
+    viewer_subject: &str,
+    issued_agent_credential: Option<IssuedAgentCredential>,
+) -> Response {
     let Some(store) = state.store.as_ref() else {
         return ui_not_found().await;
     };
@@ -1788,8 +2450,25 @@ async fn render_owner_panel(state: &AppState) -> Response {
         Ok(users) => users,
         Err(error) => return internal_error(error),
     };
+    let stored_agents = match store.list_agents().await {
+        Ok(agents) => agents,
+        Err(error) => return internal_error(error),
+    };
+    let role_bindings = match store.list_principal_roles().await {
+        Ok(bindings) => bindings,
+        Err(error) => return internal_error(error),
+    };
+    let can_manage_roles = match store.principal_role(viewer_subject).await {
+        Ok(PrincipalRole::Owner) => true,
+        Ok(_) => false,
+        Err(error) => return internal_error(error),
+    };
+    let mut roles_by_subject: BTreeMap<_, _> = role_bindings
+        .into_iter()
+        .map(|binding| (binding.subject, binding.role))
+        .collect();
     let profiles: Vec<_> = state.config.profiles.keys().cloned().collect();
-    let mut grants_by_subject: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut grants_by_subject: BTreeMap<String, Vec<OwnerGrant>> = BTreeMap::new();
     for profile in &profiles {
         let profile_grants = match store.list_profile_grants(profile).await {
             Ok(grants) => grants,
@@ -1799,7 +2478,11 @@ async fn render_owner_panel(state: &AppState) -> Response {
             grants_by_subject
                 .entry(grant.subject)
                 .or_default()
-                .push(grant.profile);
+                .push(OwnerGrant {
+                    profile: grant.profile,
+                    mode: grant.mode.as_str().into(),
+                    expires_unix_seconds: grant.expires_unix_seconds,
+                });
         }
     }
     let basic_users = stored_basic_users
@@ -1812,27 +2495,75 @@ async fn render_owner_panel(state: &AppState) -> Response {
     let mut principals = Vec::new();
     for user in stored_basic_users {
         let subject = format!("basic:{}", user.username);
-        let profiles = grants_by_subject.remove(&subject).unwrap_or_default();
+        let grants = grants_by_subject.remove(&subject).unwrap_or_default();
+        let role = roles_by_subject
+            .remove(&subject)
+            .unwrap_or_default()
+            .as_str()
+            .into();
         principals.push(OwnerPrincipal {
             label: user.username,
             kind: "Basic account".into(),
             subject,
-            profiles,
+            role,
+            grants,
         });
     }
-    principals.extend(grants_by_subject.into_iter().map(|(subject, profiles)| {
+    for agent in &stored_agents {
+        let subject = format!("agent:{}", agent.name);
+        let grants = grants_by_subject.remove(&subject).unwrap_or_default();
+        let role = roles_by_subject
+            .remove(&subject)
+            .unwrap_or_default()
+            .as_str()
+            .into();
+        principals.push(OwnerPrincipal {
+            label: agent.name.clone(),
+            kind: "Agent".into(),
+            subject,
+            role,
+            grants,
+        });
+    }
+    principals.extend(grants_by_subject.into_iter().map(|(subject, grants)| {
+        let (label, kind) = display_principal(&subject);
+        let role = roles_by_subject
+            .remove(&subject)
+            .unwrap_or_default()
+            .as_str()
+            .into();
+        OwnerPrincipal {
+            label,
+            kind,
+            subject,
+            role,
+            grants,
+        }
+    }));
+    principals.extend(roles_by_subject.into_iter().map(|(subject, role)| {
         let (label, kind) = display_principal(&subject);
         OwnerPrincipal {
             label,
             kind,
             subject,
-            profiles,
+            role: role.as_str().into(),
+            grants: Vec::new(),
         }
     }));
+    principals.sort_by(|left, right| left.subject.cmp(&right.subject));
     match (OwnerTemplate {
         basic_users,
+        agents: stored_agents
+            .into_iter()
+            .map(|agent| OwnerAgent {
+                name: agent.name,
+                enabled: agent.enabled,
+            })
+            .collect(),
         profiles,
         principals,
+        issued_agent_credential,
+        can_manage_roles,
     })
     .render()
     {
@@ -1850,6 +2581,9 @@ fn display_principal(subject: &str) -> (String, String) {
     }
     if let Some(account_id) = subject.strip_prefix("github:") {
         return (format!("GitHub account #{account_id}"), "GitHub".into());
+    }
+    if let Some(name) = subject.strip_prefix("agent:") {
+        return (name.to_owned(), "Agent".into());
     }
     ("OIDC identity".into(), "OIDC".into())
 }
@@ -2009,7 +2743,7 @@ async fn transparent_connect_response(
     if session.profile != route.profile {
         return transparent_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
     }
-    match profile_permitted(&state, &session.subject, &session.profile).await {
+    match profile_permitted(&state, &session.subject, &session.profile, GrantMode::Proxy).await {
         Ok(true) => {}
         Ok(false) => {
             return transparent_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
@@ -2135,7 +2869,7 @@ async fn transparent_tunnel_response(
     if session.session_id != session_id || session.profile != route.profile {
         return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
     }
-    match profile_permitted(&state, &session.subject, &session.profile).await {
+    match profile_permitted(&state, &session.subject, &session.profile, GrantMode::Proxy).await {
         Ok(true) => {}
         Ok(false) => {
             return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
@@ -2277,7 +3011,7 @@ async fn profile_secrets(
     let Some(profile_config) = state.config.profiles.get(&profile) else {
         return (StatusCode::NOT_FOUND, "profile not found\n").into_response();
     };
-    match profile_permitted(&state, &identity.subject, &profile).await {
+    match profile_permitted(&state, &identity.subject, &profile, GrantMode::Environment).await {
         Ok(true) => {}
         Ok(false) => {
             return (StatusCode::FORBIDDEN, "profile access is not granted\n").into_response();
@@ -2320,7 +3054,7 @@ async fn proxy(
     let Some(route) = state.config.proxy_routes.get(&route_name) else {
         return (StatusCode::NOT_FOUND, "proxy route not found\n").into_response();
     };
-    match profile_permitted(&state, &identity.subject, &route.profile).await {
+    match profile_permitted(&state, &identity.subject, &route.profile, GrantMode::Proxy).await {
         Ok(true) => {}
         Ok(false) => return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response(),
         Err(error) => return internal_error(error),
@@ -3514,20 +4248,57 @@ mod tests {
                 username: "<script>user</script>".into(),
                 enabled: true,
             }],
+            agents: vec![OwnerAgent {
+                name: "<script>agent</script>".into(),
+                enabled: true,
+            }],
             profiles: vec!["<script>profile</script>".into()],
             principals: vec![OwnerPrincipal {
                 label: "<script>identity</script>".into(),
                 kind: "OIDC".into(),
                 subject: "<script>subject</script>".into(),
-                profiles: vec!["<script>profile</script>".into()],
+                role: "owner".into(),
+                grants: vec![OwnerGrant {
+                    profile: "<script>profile</script>".into(),
+                    mode: "<script>mode</script>".into(),
+                    expires_unix_seconds: None,
+                }],
             }],
+            issued_agent_credential: Some(IssuedAgentCredential {
+                name: "<script>issued</script>".into(),
+                token: "<script>token</script>".into(),
+            }),
+            can_manage_roles: true,
         }
         .render()
         .unwrap();
         assert!(page.contains("&#60;script&#62;user&#60;/script&#62;"));
         assert!(page.contains("&#60;script&#62;identity&#60;/script&#62;"));
         assert!(page.contains("&#60;script&#62;subject&#60;/script&#62;"));
+        assert!(page.contains("&#60;script&#62;token&#60;/script&#62;"));
         assert!(!page.contains("<script>subject</script>"));
+    }
+
+    #[test]
+    fn operator_ui_does_not_render_owner_role_controls() {
+        let page = OwnerTemplate {
+            basic_users: vec![],
+            agents: vec![],
+            profiles: vec!["example".into()],
+            principals: vec![OwnerPrincipal {
+                label: "developer".into(),
+                kind: "OIDC".into(),
+                subject: "oidc:developer".into(),
+                role: "user".into(),
+                grants: vec![],
+            }],
+            issued_agent_credential: None,
+            can_manage_roles: false,
+        }
+        .render()
+        .unwrap();
+        assert!(!page.contains("/ui/owner/roles"));
+        assert!(page.contains("OIDC / user"));
     }
 
     #[test]

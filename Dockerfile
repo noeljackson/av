@@ -6,11 +6,14 @@ COPY proto ./proto
 COPY src ./src
 COPY templates ./templates
 COPY assets ./assets
-RUN cargo build --locked --release
+RUN --mount=type=cache,id=av-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
+    --mount=type=cache,id=av-cargo-target,target=/src/target,sharing=locked \
+    cargo build --locked --release && \
+    cp /src/target/release/av /tmp/av
 
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:f7f8f729987ad0fdf6b05eeeae94b26e6a0f613bdf46feea7fc40f7bd72953e6
 WORKDIR /app
-COPY --from=build /src/target/release/av /usr/local/bin/av
+COPY --from=build /tmp/av /usr/local/bin/av
 USER 65532:65532
 EXPOSE 14322
 ENTRYPOINT ["/usr/local/bin/av"]

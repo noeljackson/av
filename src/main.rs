@@ -13,9 +13,13 @@ use std::{
 use anyhow::{Context, Result, bail};
 use av::{
     av::v1::{
-        AuthConfig as RpcAuthConfig, CreateProxySessionRequest, GetAuthConfigRequest,
-        GetProfileEnvironmentRequest, ListProfilesRequest, ListProfilesResponse,
-        ProfileEnvironment, ProxySessionLease, RevokeProxySessionRequest,
+        AgentCredential, AuthConfig as RpcAuthConfig, CreateAgentRequest,
+        CreateProxySessionRequest, DeleteAgentRequest, GetAuthConfigRequest,
+        GetProfileEnvironmentRequest, GrantProfileRequest, ListAgentsRequest, ListAgentsResponse,
+        ListPrincipalRolesRequest, ListPrincipalRolesResponse, ListProfilesRequest,
+        ListProfilesResponse, ProfileEnvironment, ProxySessionLease, RevokeProfileRequest,
+        RevokeProxySessionRequest, RotateAgentRequest, SetAgentEnabledRequest,
+        SetPrincipalRoleRequest,
     },
     config::{AuthConfig, AuthMode, Config, ConfigMode, ManagedConfig, OidcSigningAlgorithm},
     keyring,
@@ -66,6 +70,16 @@ enum Command {
         #[arg(required = true, last = true)]
         command: Vec<OsString>,
     },
+    /// Manage named agent identities in a local or managed AV control plane.
+    Agents {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
+    /// Manage instance roles. Only an owner may change roles.
+    Roles {
+        #[command(subcommand)]
+        command: RoleCommand,
+    },
     /// Initialize a local managed AV instance under XDG directories.
     Local {
         #[command(subcommand)]
@@ -93,6 +107,48 @@ enum LocalCommand {
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum AgentCommand {
+    List,
+    Create {
+        name: String,
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    Rotate {
+        name: String,
+        #[arg(long, value_name = "PATH")]
+        out: Option<PathBuf>,
+    },
+    Enable {
+        name: String,
+    },
+    Disable {
+        name: String,
+    },
+    Delete {
+        name: String,
+    },
+    Grant {
+        name: String,
+        profile: String,
+        #[arg(long, default_value = "proxy")]
+        mode: String,
+        #[arg(long, default_value_t = 0)]
+        expires_unix_seconds: i64,
+    },
+    Revoke {
+        name: String,
+        profile: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum RoleCommand {
+    List,
+    Set { subject: String, role: String },
 }
 
 #[derive(Deserialize)]
@@ -152,6 +208,14 @@ async fn run() -> Result<u8> {
         Some(Command::Run { profile, command }) => {
             run_transparent_proxy(&cli.api_url, profile, command).await
         }
+        Some(Command::Agents { command }) => {
+            manage_agent(&cli.api_url, command).await?;
+            Ok(0)
+        }
+        Some(Command::Roles { command }) => {
+            manage_role(&cli.api_url, command).await?;
+            Ok(0)
+        }
         Some(Command::Local { command }) => match command {
             LocalCommand::Init {
                 issuer,
@@ -179,6 +243,166 @@ async fn run() -> Result<u8> {
             Ok(2)
         }
     }
+}
+
+async fn manage_role(api_url: &str, command: RoleCommand) -> Result<()> {
+    match command {
+        RoleCommand::List => {
+            let response: ListPrincipalRolesResponse = connect_request(
+                api_url,
+                "av.v1.ControlService/ListPrincipalRoles",
+                &ListPrincipalRolesRequest::default(),
+                true,
+            )
+            .await?;
+            for binding in response.roles {
+                println!("{}\t{}", binding.subject, binding.role);
+            }
+        }
+        RoleCommand::Set { subject, role } => {
+            let _: av::av::v1::PrincipalRole = connect_request(
+                api_url,
+                "av.v1.ControlService/SetPrincipalRole",
+                &SetPrincipalRoleRequest {
+                    subject,
+                    role,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn manage_agent(api_url: &str, command: AgentCommand) -> Result<()> {
+    match command {
+        AgentCommand::List => {
+            let response: ListAgentsResponse = connect_request(
+                api_url,
+                "av.v1.ControlService/ListAgents",
+                &ListAgentsRequest::default(),
+                true,
+            )
+            .await?;
+            for agent in response.agents {
+                println!(
+                    "{}\t{}",
+                    agent.name,
+                    if agent.enabled { "enabled" } else { "disabled" }
+                );
+            }
+        }
+        AgentCommand::Create { name, out } => {
+            let credential: AgentCredential = connect_request(
+                api_url,
+                "av.v1.ControlService/CreateAgent",
+                &CreateAgentRequest {
+                    name,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+            emit_agent_token(&credential.token, out.as_deref())?;
+        }
+        AgentCommand::Rotate { name, out } => {
+            let credential: AgentCredential = connect_request(
+                api_url,
+                "av.v1.ControlService/RotateAgent",
+                &RotateAgentRequest {
+                    name,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+            emit_agent_token(&credential.token, out.as_deref())?;
+        }
+        AgentCommand::Enable { name } => {
+            let _: av::av::v1::Agent = connect_request(
+                api_url,
+                "av.v1.ControlService/SetAgentEnabled",
+                &SetAgentEnabledRequest {
+                    name,
+                    enabled: true,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+        }
+        AgentCommand::Disable { name } => {
+            let _: av::av::v1::Agent = connect_request(
+                api_url,
+                "av.v1.ControlService/SetAgentEnabled",
+                &SetAgentEnabledRequest {
+                    name,
+                    enabled: false,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+        }
+        AgentCommand::Delete { name } => {
+            let _: av::av::v1::Agent = connect_request(
+                api_url,
+                "av.v1.ControlService/DeleteAgent",
+                &DeleteAgentRequest {
+                    name,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+        }
+        AgentCommand::Grant {
+            name,
+            profile,
+            mode,
+            expires_unix_seconds,
+        } => {
+            let _: av::av::v1::ProfileGrant = connect_request(
+                api_url,
+                "av.v1.ControlService/GrantProfile",
+                &GrantProfileRequest {
+                    profile,
+                    subject: format!("agent:{name}"),
+                    mode,
+                    expires_unix_seconds,
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+        }
+        AgentCommand::Revoke { name, profile } => {
+            let _: av::av::v1::ProfileGrant = connect_request(
+                api_url,
+                "av.v1.ControlService/RevokeProfile",
+                &RevokeProfileRequest {
+                    profile,
+                    subject: format!("agent:{name}"),
+                    ..Default::default()
+                },
+                true,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+fn emit_agent_token(token: &str, output: Option<&Path>) -> Result<()> {
+    if let Some(path) = output {
+        write_private_file(path, token.as_bytes())?;
+        println!("agent token written to {}", path.display());
+    } else {
+        println!("{token}");
+    }
+    Ok(())
 }
 
 fn local_init(
@@ -851,6 +1075,9 @@ fn proxy_child_command(
         .env("CURL_CA_BUNDLE", ca_path)
         .env("REQUESTS_CA_BUNDLE", ca_path)
         .env("GIT_SSL_CAINFO", ca_path)
+        .env("CODEX_CA_CERTIFICATE", ca_path)
+        .env_remove("AV_AGENT_TOKEN_FILE")
+        .env_remove("AV_AGENT_TOKEN")
         .env_remove("AV_TOKEN")
         .env_remove("AV_BASIC_USER")
         .env_remove("AV_BASIC_PASSWORD")
@@ -876,6 +1103,8 @@ fn profile_command(
     command
         .args(arguments)
         .envs(secrets)
+        .env_remove("AV_AGENT_TOKEN_FILE")
+        .env_remove("AV_AGENT_TOKEN")
         .env_remove("AV_TOKEN")
         .env_remove("AV_BASIC_USER")
         .env_remove("AV_BASIC_PASSWORD")
@@ -910,6 +1139,13 @@ where
 }
 
 fn authenticate_request(request: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
+    if let Ok(path) = std::env::var("AV_AGENT_TOKEN_FILE") {
+        let token = read_agent_token(Path::new(&path))?;
+        return Ok(request.header(header::AUTHORIZATION, format!("Agent {}", token.as_str())));
+    }
+    if let Ok(token) = std::env::var("AV_AGENT_TOKEN") {
+        return Ok(request.header(header::AUTHORIZATION, format!("Agent {token}")));
+    }
     if let Ok(token) = std::env::var("AV_TOKEN") {
         return Ok(request.bearer_auth(token));
     }
@@ -928,7 +1164,37 @@ fn authenticate_request(request: reqwest::RequestBuilder) -> Result<reqwest::Req
     if let Some(token) = keyring::load()? {
         return Ok(request.bearer_auth(token));
     }
-    bail!("not logged in; run `av login` or set AV_TOKEN")
+    bail!("not logged in; run `av login` or set AV_AGENT_TOKEN/AV_TOKEN")
+}
+
+fn read_agent_token(path: &Path) -> Result<Zeroizing<String>> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("inspect AV agent token file {}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > 256 {
+        bail!("AV agent token file must be a regular file no larger than 256 bytes");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o077 != 0 {
+            bail!("AV agent token file must not be accessible by group or other users");
+        }
+    }
+    let raw = Zeroizing::new(
+        fs::read_to_string(path)
+            .with_context(|| format!("read AV agent token file {}", path.display()))?,
+    );
+    let token = raw.strip_suffix('\n').unwrap_or(raw.as_str());
+    if token.len() != 52
+        || !token.starts_with("av_agent_")
+        || token.contains(['\r', '\n'])
+        || !token[9..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        bail!("AV agent token file contains an invalid token");
+    }
+    Ok(Zeroizing::new(token.to_owned()))
 }
 
 fn client(api_url: &str) -> Result<Client> {
@@ -995,12 +1261,54 @@ mod tests {
     }
 
     #[test]
+    fn management_commands_parse_without_becoming_profile_wrappers() {
+        let cli = Cli::try_parse_from([
+            "av",
+            "agents",
+            "grant",
+            "builder",
+            "example-prod",
+            "--mode",
+            "proxy",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Agents {
+                command: AgentCommand::Grant { .. }
+            })
+        ));
+        let cli = Cli::try_parse_from(["av", "roles", "set", "oidc:operator", "operator"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Roles {
+                command: RoleCommand::Set { .. }
+            })
+        ));
+    }
+
+    #[test]
+    fn agent_token_files_are_private_and_strictly_parsed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("agent-token");
+        let token = format!("av_agent_{}", "A".repeat(43));
+        emit_agent_token(&token, Some(&path)).unwrap();
+        assert_eq!(read_agent_token(&path).unwrap().as_str(), token);
+        std::fs::write(&path, format!("{token}\n\n")).unwrap();
+        assert!(read_agent_token(&path).is_err());
+    }
+
+    #[test]
     fn profile_child_does_not_inherit_wrapper_credentials() {
         let command = profile_command(
             OsString::from("example"),
             vec![OsString::from("--flag")],
             BTreeMap::from([
                 ("PROFILE_SECRET".to_owned(), "value".to_owned()),
+                (
+                    "AV_AGENT_TOKEN".to_owned(),
+                    "must-not-reach-child".to_owned(),
+                ),
                 ("AV_TOKEN".to_owned(), "must-not-reach-child".to_owned()),
                 (
                     "AV_BASIC_USER".to_owned(),
@@ -1017,6 +1325,11 @@ mod tests {
             .map(|(name, value)| (name.to_os_string(), value.map(OsString::from)))
             .collect();
 
+        assert_eq!(envs.get(&OsString::from("AV_AGENT_TOKEN")), Some(&None));
+        assert_eq!(
+            envs.get(&OsString::from("AV_AGENT_TOKEN_FILE")),
+            Some(&None)
+        );
         assert_eq!(envs.get(&OsString::from("AV_TOKEN")), Some(&None));
         assert_eq!(envs.get(&OsString::from("AV_BASIC_USER")), Some(&None));
         assert_eq!(envs.get(&OsString::from("AV_BASIC_PASSWORD")), Some(&None));
@@ -1078,6 +1391,8 @@ mod tests {
             );
         }
         for name in [
+            "AV_AGENT_TOKEN_FILE",
+            "AV_AGENT_TOKEN",
             "AV_TOKEN",
             "AV_BASIC_USER",
             "AV_BASIC_PASSWORD",
@@ -1095,6 +1410,7 @@ mod tests {
             "CURL_CA_BUNDLE",
             "REQUESTS_CA_BUNDLE",
             "GIT_SSL_CAINFO",
+            "CODEX_CA_CERTIFICATE",
         ] {
             assert_eq!(
                 envs.get(&OsString::from(name)),

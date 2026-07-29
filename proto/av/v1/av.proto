@@ -15,6 +15,13 @@ service ControlService {
   rpc ListBasicUsers(ListBasicUsersRequest) returns (ListBasicUsersResponse);
   rpc UpsertBasicUser(UpsertBasicUserRequest) returns (BasicUser);
   rpc SetBasicUserEnabled(SetBasicUserEnabledRequest) returns (BasicUser);
+  rpc ListAgents(ListAgentsRequest) returns (ListAgentsResponse);
+  rpc CreateAgent(CreateAgentRequest) returns (AgentCredential);
+  rpc RotateAgent(RotateAgentRequest) returns (AgentCredential);
+  rpc SetAgentEnabled(SetAgentEnabledRequest) returns (Agent);
+  rpc DeleteAgent(DeleteAgentRequest) returns (Agent);
+  rpc ListPrincipalRoles(ListPrincipalRolesRequest) returns (ListPrincipalRolesResponse);
+  rpc SetPrincipalRole(SetPrincipalRoleRequest) returns (PrincipalRole);
   rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
   rpc ListProfileGrants(ListProfileGrantsRequest) returns (ListProfileGrantsResponse);
   rpc GrantProfile(GrantProfileRequest) returns (ProfileGrant);
@@ -119,6 +126,58 @@ message SetBasicUserEnabledRequest {
   bool enabled = 2;
 }
 
+message ListAgentsRequest {}
+
+message Agent {
+  string name = 1;
+  bool enabled = 2;
+}
+
+message ListAgentsResponse {
+  repeated Agent agents = 1;
+}
+
+message CreateAgentRequest {
+  string name = 1;
+}
+
+message RotateAgentRequest {
+  string name = 1;
+}
+
+message SetAgentEnabledRequest {
+  string name = 1;
+  bool enabled = 2;
+}
+
+message DeleteAgentRequest {
+  string name = 1;
+}
+
+// The raw token is returned only from create and rotate. AV stores only its
+// SHA-256 digest and cannot recover it later.
+message AgentCredential {
+  string name = 1;
+  string token = 2;
+  bool enabled = 3;
+}
+
+message ListPrincipalRolesRequest {}
+
+message PrincipalRole {
+  string subject = 1;
+  string role = 2;
+}
+
+message ListPrincipalRolesResponse {
+  repeated PrincipalRole roles = 1;
+}
+
+message SetPrincipalRoleRequest {
+  string subject = 1;
+  string role = 2;
+}
+
 message ListAuditEventsRequest {
   uint32 limit = 1;
 }
@@ -143,6 +202,10 @@ message ListProfileGrantsRequest {
 message ProfileGrant {
   string profile = 1;
   string subject = 2;
+  // both, proxy, or environment
+  string mode = 3;
+  // Zero means no expiry.
+  int64 expires_unix_seconds = 4;
 }
 
 message ListProfileGrantsResponse {
@@ -152,6 +215,10 @@ message ListProfileGrantsResponse {
 message GrantProfileRequest {
   string profile = 1;
   string subject = 2;
+  // Empty preserves the backwards-compatible both-mode behavior.
+  string mode = 3;
+  // Zero means no expiry.
+  int64 expires_unix_seconds = 4;
 }
 
 message RevokeProfileRequest {

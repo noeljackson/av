@@ -1,5 +1,14 @@
 <section class="owner-panel" aria-label="Access management">
-  <header class="owner-heading"><span>access management</span><span>owner only</span></header>
+  <header class="owner-heading"><span>access management</span><span>owner / operator</span></header>
+  {% match issued_agent_credential %}
+  {% when Some with (credential) %}
+  <section class="owner-section issued-credential" role="status">
+    <h2>{{ credential.name }} token // shown once</h2>
+    <p>Copy this token now. AV stores only its SHA-256 digest and cannot show it again.</p>
+    <code>{{ credential.token }}</code>
+  </section>
+  {% when None %}
+  {% endmatch %}
   <div class="owner-grid">
     <section class="owner-section">
       <h2>basic accounts</h2>
@@ -22,24 +31,62 @@
       </div>
     </section>
     <section class="owner-section">
+      <h2>agents</h2>
+      <p>Agents are named non-human identities. Tokens are shown once; disabling, rotating, or deleting an agent revokes its active proxy sessions.</p>
+      <form class="owner-form" hx-post="/ui/owner/agents" hx-target="#owner-panel" hx-swap="innerHTML">
+        <label><span>name</span><input name="name" pattern="[A-Za-z0-9_\-]{1,128}" autocomplete="off" required></label>
+        <button type="submit">create agent</button>
+      </form>
+      <div class="owner-list">
+        {% for agent in agents %}
+        <article><code>{{ agent.name }}</code><span class="{% if agent.enabled %}enabled{% else %}disabled{% endif %}">{% if agent.enabled %}active{% else %}disabled{% endif %}</span>
+          <form hx-post="/ui/owner/agents/rotate" hx-target="#owner-panel" hx-swap="innerHTML">
+            <input type="hidden" name="name" value="{{ agent.name }}"><button class="quiet" type="submit">rotate</button>
+          </form>
+          <form hx-post="/ui/owner/agents/enabled" hx-target="#owner-panel" hx-swap="innerHTML">
+            <input type="hidden" name="name" value="{{ agent.name }}"><input type="hidden" name="enabled" value="{% if agent.enabled %}false{% else %}true{% endif %}">
+            <button class="quiet" type="submit">{% if agent.enabled %}disable{% else %}enable{% endif %}</button>
+          </form>
+          <form hx-post="/ui/owner/agents/delete" hx-target="#owner-panel" hx-swap="innerHTML">
+            <input type="hidden" name="name" value="{{ agent.name }}"><button class="quiet" type="submit">delete</button>
+          </form>
+        </article>
+        {% else %}<p class="empty">no agents_</p>{% endfor %}
+      </div>
+    </section>
+    <section class="owner-section">
       <h2>people and agent access</h2>
       <p>Profiles are pre-defined capabilities. Grant only the capabilities each identity needs; identities never own the underlying secrets.</p>
       <div class="access-list">
         {% for principal in principals %}
         <article class="principal">
-          <header><strong>{{ principal.label }}</strong><span>{{ principal.kind }}</span></header>
+          <header><strong>{{ principal.label }}</strong><span>{{ principal.kind }} / {{ principal.role }}</span></header>
+          {% if can_manage_roles %}
+          <form class="inline-grant" hx-post="/ui/owner/roles" hx-target="#owner-panel" hx-swap="innerHTML">
+            <input type="hidden" name="subject" value="{{ principal.subject }}">
+            <label><span>instance role</span><select name="role">
+              <option value="user"{% if principal.role == "user" %} selected{% endif %}>user</option>
+              <option value="auditor"{% if principal.role == "auditor" %} selected{% endif %}>auditor</option>
+              <option value="operator"{% if principal.role == "operator" %} selected{% endif %}>operator</option>
+              <option value="owner"{% if principal.role == "owner" %} selected{% endif %}>owner</option>
+            </select></label>
+            <button class="quiet" type="submit">set role</button>
+          </form>
+          {% endif %}
           <div class="capability-list">
-            {% for profile in principal.profiles %}
+            {% for grant in principal.grants %}
             <form hx-post="/ui/owner/grants/revoke" hx-target="#owner-panel" hx-swap="innerHTML">
               <input type="hidden" name="subject" value="{{ principal.subject }}">
-              <input type="hidden" name="profile" value="{{ profile }}">
-              <code>{{ profile }}</code><button class="quiet" type="submit" aria-label="Remove {{ profile }}">remove</button>
+              <input type="hidden" name="profile" value="{{ grant.profile }}">
+              <code>{{ grant.profile }} / {{ grant.mode }}{% match grant.expires_unix_seconds %}{% when Some with (expiry) %} / until {{ expiry }}{% when None %}{% endmatch %}</code><button class="quiet" type="submit" aria-label="Remove {{ grant.profile }}">remove</button>
             </form>
             {% else %}<p class="empty">no capabilities granted_</p>{% endfor %}
           </div>
           <form class="inline-grant" hx-post="/ui/owner/grants" hx-target="#owner-panel" hx-swap="innerHTML">
             <input type="hidden" name="subject" value="{{ principal.subject }}">
             <label><span>add</span><select name="profile" required>{% for profile in profiles %}<option value="{{ profile }}">{{ profile }}</option>{% endfor %}</select></label>
+            <label><span>delivery</span><select name="mode"><option value="proxy">proxy only</option><option value="environment">environment only</option><option value="both">both</option></select></label>
+            <label><span>expires</span><input name="expires_unix_seconds" type="number" min="1" placeholder="never"></label>
             <button type="submit">grant</button>
           </form>
         </article>
@@ -52,6 +99,8 @@
           <label><span>source</span><select name="identity_kind"><option value="github">GitHub account</option><option value="oidc">OIDC identity</option></select></label>
           <label><span>ID</span><input name="identity" autocomplete="off" required></label>
           <label><span>grant</span><select name="profile" required>{% for profile in profiles %}<option value="{{ profile }}">{{ profile }}</option>{% endfor %}</select></label>
+          <label><span>delivery</span><select name="mode"><option value="proxy">proxy only</option><option value="environment">environment only</option><option value="both">both</option></select></label>
+          <label><span>expires</span><input name="expires_unix_seconds" type="number" min="1" placeholder="never"></label>
           <button type="submit">grant capability</button>
         </form>
       </details>

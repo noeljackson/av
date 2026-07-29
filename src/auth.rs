@@ -6,6 +6,7 @@ use axum::http::{HeaderMap, header};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use tokio::{
     sync::{Mutex, RwLock, Semaphore},
     time::Instant,
@@ -154,6 +155,9 @@ impl Authenticator {
             .and_then(|value| value.to_str().ok())
             .context("missing Authorization header")?;
 
+        if let Some(token) = authorization.strip_prefix("Agent ") {
+            return self.authorize_agent(token).await;
+        }
         if let Some(token) = authorization.strip_prefix("Bearer ")
             && matches!(self.config.mode, AuthMode::Oidc | AuthMode::OidcOrBasic)
         {
@@ -168,6 +172,29 @@ impl Authenticator {
             return self.authorize_basic(encoded).await;
         }
         bail!("unsupported authentication scheme")
+    }
+
+    async fn authorize_agent(&self, token: &str) -> Result<Identity> {
+        if token.len() != 52
+            || !token.starts_with("av_agent_")
+            || !token[9..]
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            bail!("invalid agent token");
+        }
+        let store = self
+            .store
+            .as_ref()
+            .context("agent authentication requires managed mode")?;
+        let token_hash = Sha256::digest(token.as_bytes());
+        let name = store
+            .agent_for_token_hash(&token_hash)
+            .await?
+            .context("agent token is unknown or disabled")?;
+        Ok(Identity {
+            subject: format!("agent:{name}"),
+        })
     }
 
     async fn authorize_oidc(&self, token: &str) -> Result<Identity> {
@@ -388,7 +415,7 @@ fn claim_allows_group(claim: Option<&serde_json::Value>, allowed_groups: &[Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::BasicUserConfig;
+    use crate::config::{BasicUserConfig, ManagedConfig};
     use axum::http::HeaderValue;
     use jsonwebtoken::{EncodingKey, Header, encode};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -415,6 +442,43 @@ mod tests {
             basic_slots: Arc::new(Semaphore::new(BASIC_AUTH_MAX_CONCURRENCY)),
             store: None,
         }
+    }
+
+    #[tokio::test]
+    async fn agent_tokens_authenticate_by_digest_and_fail_immediately_when_disabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_url_file = directory.path().join("database-url");
+        std::fs::write(
+            &database_url_file,
+            format!("sqlite:{}", directory.path().join("av.db").display()),
+        )
+        .unwrap();
+        let store = Store::connect(&ManagedConfig {
+            database_url_file: database_url_file.display().to_string(),
+            database_credentials_file: String::new(),
+            postgres: None,
+            database_reload_interval_seconds: 0,
+            initial_owner_oidc_subject: String::new(),
+        })
+        .await
+        .unwrap();
+        let token = format!("av_agent_{}", "A".repeat(43));
+        let token_hash = Sha256::digest(token.as_bytes());
+        store.create_agent("builder", &token_hash).await.unwrap();
+        let mut authenticator = oidc_test_authenticator();
+        authenticator.store = Some(store.clone());
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Agent {token}")).unwrap(),
+        );
+        assert_eq!(
+            authenticator.authorize(&headers).await.unwrap().subject,
+            "agent:builder"
+        );
+        store.set_agent_enabled("builder", false).await.unwrap();
+        assert!(authenticator.authorize(&headers).await.is_err());
     }
 
     #[tokio::test]
