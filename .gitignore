@@ -1,4 +1,5 @@
 /target/
+/.deepsec/
 /config.local.json
 /.env
 *.pem

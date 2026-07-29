@@ -70,6 +70,24 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           provenance: mode=max
           sbom: true
+      - name: Inventory and scan the published image digest
+        id: published-image-scan
+        uses: noeljackson/supplychain@dbf85be2f2efa1b265d96562d7c173b66ea08ec1
+        with:
+          scan-source: "false"
+          image: ghcr.io/noeljackson/av@${{ steps.image.outputs.digest }}
+          fail-on-severity: high
+      - name: Stage exact-image SBOM
+        env:
+          SBOM_PATH: ${{ steps.published-image-scan.outputs.sbom }}
+        run: |
+          sbom="dist/av-${GITHUB_REF_NAME}-image.spdx.json"
+          install -Dm644 "$SBOM_PATH" "$sbom"
+          (cd dist && sha256sum "av-${GITHUB_REF_NAME}-image.spdx.json" > "av-${GITHUB_REF_NAME}-image.spdx.json.sha256")
+      - name: Attest exact-image SBOM asset
+        uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
+        with:
+          subject-path: dist/av-${{ github.ref_name }}-image.spdx.json
       - name: Attest image
         uses: actions/attest-build-provenance@977bb373ede98d70efdf65b84cb5f73e068dcc2a
         with:

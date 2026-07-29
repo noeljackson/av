@@ -371,6 +371,43 @@ mod tests {
     }
 
     #[test]
+    fn connect_authority_parser_rejects_generated_delimiter_control_and_port_variants() {
+        let catalog = catalog(&[("provider", "https://api.example.test")]).unwrap();
+
+        for byte in 0_u8..=0x7f {
+            if byte.is_ascii_control() || byte.is_ascii_whitespace() {
+                let authority = format!(
+                    "api.example{byte_as_char}.test:443",
+                    byte_as_char = byte as char
+                );
+                assert_eq!(
+                    catalog.destination_for_connect_authority(&authority),
+                    None,
+                    "accepted ASCII byte 0x{byte:02x}"
+                );
+            }
+        }
+        for delimiter in ['/', '?', '#', '@'] {
+            for position in 0..="api.example.test:443".len() {
+                let mut authority = "api.example.test:443".to_owned();
+                authority.insert(position, delimiter);
+                assert_eq!(
+                    catalog.destination_for_connect_authority(&authority),
+                    None,
+                    "accepted delimiter {delimiter:?} at byte {position}"
+                );
+            }
+        }
+        for port in [0, 1, 80, 442, 444, 8443, 65_535] {
+            assert_eq!(
+                catalog.destination_for_connect_authority(&format!("api.example.test:{port}")),
+                None,
+                "accepted non-HTTPS port {port}"
+            );
+        }
+    }
+
+    #[test]
     fn proxy_session_credentials_are_opaque_and_store_only_a_digest() {
         let first = mint_proxy_session_credential();
         let second = mint_proxy_session_credential();

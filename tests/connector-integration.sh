@@ -2,6 +2,13 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=integration-tls.sh
+# Resolved from the repository root at runtime.
+# shellcheck disable=SC1091
+source "$root/tests/integration-tls.sh"
+# shellcheck source=sensitive-output.sh
+# shellcheck disable=SC1091
+source "$root/tests/sensitive-output.sh"
 compose=(docker compose --project-name "av-connectors-${UID}-$$" --file "$root/tests/integration/compose.yml")
 workdir=$(mktemp -d "$root/.tmp.connector-cli.XXXXXX")
 export AV_POSTGRES_TLS_DIR="$workdir/postgres-tls"
@@ -14,63 +21,16 @@ cleanup() {
   "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
   rm -rf "$workdir"
 }
+report_failure() {
+  local status=$1
+  local line=$2
+  printf 'connector integration failed at line %d\n' "$line" >&2
+  exit "$status"
+}
 trap cleanup EXIT
+trap 'report_failure "$?" "$LINENO"' ERR
 
-mkdir -p "$AV_POSTGRES_TLS_DIR"
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$AV_POSTGRES_TLS_DIR/server.key" \
-  -out "$AV_POSTGRES_TLS_DIR/server.crt" \
-  -subj "/CN=postgres" \
-  -addext "subjectAltName=DNS:postgres" >/dev/null 2>&1
-chmod 0600 "$AV_POSTGRES_TLS_DIR/server.key"
-openssl req -x509 -newkey ed25519 -nodes -days 1 \
-  -keyout "$AV_POSTGRES_TLS_DIR/proxy-ca.key" \
-  -out "$AV_POSTGRES_TLS_DIR/proxy-ca.crt" \
-  -subj "/CN=av-integration-proxy-ca" >/dev/null 2>&1
-openssl req -x509 -newkey ed25519 -nodes -days 1 \
-  -keyout "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.key" \
-  -out "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt" \
-  -subj "/CN=AV synthetic transport test CA" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
-openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-  -keyout "$AV_POSTGRES_TLS_DIR/proxy-transport.key" \
-  -out "$AV_POSTGRES_TLS_DIR/proxy-transport.csr" \
-  -subj "/CN=localhost" \
-  -addext "subjectAltName=DNS:localhost" >/dev/null 2>&1
-openssl x509 -req -days 1 \
-  -in "$AV_POSTGRES_TLS_DIR/proxy-transport.csr" \
-  -CA "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt" \
-  -CAkey "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.key" \
-  -CAcreateserial \
-  -copy_extensions copy \
-  -out "$AV_POSTGRES_TLS_DIR/proxy-transport.crt" >/dev/null 2>&1
-openssl req -x509 -newkey ed25519 -nodes -days 1 \
-  -keyout "$AV_POSTGRES_TLS_DIR/tunnel-ca.key" \
-  -out "$AV_POSTGRES_TLS_DIR/tunnel-ca.crt" \
-  -subj "/CN=AV synthetic tunnel test CA" \
-  -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
-openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-  -keyout "$AV_POSTGRES_TLS_DIR/tunnel.key" \
-  -out "$AV_POSTGRES_TLS_DIR/tunnel.csr" \
-  -subj "/CN=upstream-tunnel" \
-  -addext "subjectAltName=DNS:upstream-tunnel" >/dev/null 2>&1
-openssl x509 -req -days 1 \
-  -in "$AV_POSTGRES_TLS_DIR/tunnel.csr" \
-  -CA "$AV_POSTGRES_TLS_DIR/tunnel-ca.crt" \
-  -CAkey "$AV_POSTGRES_TLS_DIR/tunnel-ca.key" \
-  -CAcreateserial \
-  -copy_extensions copy \
-  -out "$AV_POSTGRES_TLS_DIR/tunnel.crt" >/dev/null 2>&1
-# Disposable synthetic fixtures are bind-mounted read-only for AV's non-root
-# runtime UID and removed by the harness trap.
-chmod 0444 \
-  "$AV_POSTGRES_TLS_DIR/proxy-ca.key" \
-  "$AV_POSTGRES_TLS_DIR/proxy-ca.crt" \
-  "$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt" \
-  "$AV_POSTGRES_TLS_DIR/proxy-transport.key" \
-  "$AV_POSTGRES_TLS_DIR/proxy-transport.crt" \
-  "$AV_POSTGRES_TLS_DIR/tunnel.crt" \
-  "$AV_POSTGRES_TLS_DIR/tunnel.key"
+generate_integration_tls "$AV_POSTGRES_TLS_DIR"
 
 "${compose[@]}" config --quiet
 if [[ -n ${AV_IMAGE:-} ]]; then
@@ -374,5 +334,36 @@ if ! docker run --rm --pull never \
   "${compose[@]}" logs --no-color av upstream >&2
   exit 1
 fi
+
+# Every normal connector CI run proves that static connector values, request
+# canaries, and both fields of real short-lived database credentials are absent
+# from AV process logs and its persisted audit metadata.
+docker logs "$av_container" >"$workdir/av.log" 2>&1
+chmod 0600 "$workdir/av.log"
+"${compose[@]}" exec --no-TTY postgres \
+  psql -U infisical -d av -tAc \
+  "SELECT concat_ws('|', actor, action, profile, route, executable_basename) FROM av_audit_events" \
+  >"$workdir/audit.log"
+chmod 0600 "$workdir/audit.log"
+for canary in \
+  infisical-ok \
+  openbao+ok \
+  managed-ui-password \
+  av-request-body-canary-9e8c \
+  av-sensitive-header-canary-7d31
+do
+  assert_literal_absent_from \
+    "sensitive connector canary" "$canary" "$workdir/av.log" "$workdir/audit.log"
+done
+for canary_file in \
+  "$workdir/dynamic-credentials/user" \
+  "$workdir/dynamic-credentials/password" \
+  "$workdir/revoked-grant-credentials/user" \
+  "$workdir/revoked-grant-credentials/password"
+do
+  assert_pattern_file_absent_from \
+    "short-lived database credential" \
+    "$canary_file" "$workdir/av.log" "$workdir/audit.log"
+done
 
 printf 'connector_cli_integration=ok\n'

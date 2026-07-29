@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repository=noeljackson/av
+signer_workflow=github.com/noeljackson/av/.github/workflows/release.yml
+version=${1:-}
+
+if [[ ! $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+  printf 'usage: %s vX.Y.Z\n' "${0##*/}" >&2
+  exit 2
+fi
+for command in gh docker jq sha256sum; do
+  command -v "$command" >/dev/null || {
+    printf 'required command is unavailable: %s\n' "$command" >&2
+    exit 2
+  }
+done
+
+workdir=$(mktemp -d)
+cleanup() {
+  find "$workdir" -type f -exec shred --remove --zero {} + 2>/dev/null || true
+  rmdir "$workdir" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+archive="av-${version}-x86_64-unknown-linux-gnu.tar.gz"
+sbom="av-${version}-image.spdx.json"
+gh release download "$version" \
+  --repo "$repository" \
+  --dir "$workdir" \
+  --pattern "$archive" \
+  --pattern "$archive.sha256" \
+  --pattern "$sbom" \
+  --pattern "$sbom.sha256"
+
+(
+  cd "$workdir"
+  sha256sum --check "$archive.sha256"
+  sha256sum --check "$sbom.sha256"
+)
+
+for artifact in "$archive" "$sbom"; do
+  gh attestation verify "$workdir/$artifact" \
+    --repo "$repository" \
+    --signer-workflow "$signer_workflow" \
+    --source-ref "refs/tags/$version" >/dev/null
+done
+
+image_ref="ghcr.io/noeljackson/av:$version"
+gh attestation verify "oci://$image_ref" \
+  --repo "$repository" \
+  --signer-workflow "$signer_workflow" \
+  --source-ref "refs/tags/$version" >/dev/null
+docker buildx imagetools inspect "$image_ref" \
+  --format '{{ json .SBOM }}' |
+  jq -e '.SPDX.spdxVersion | startswith("SPDX-")' >/dev/null
+
+printf 'release_verification=ok version=%s\n' "$version"

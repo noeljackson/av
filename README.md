@@ -204,7 +204,9 @@ AV_ALLOW_INSECURE_AUTH=1 cargo run -- serve --config config.local.json
   lock, or browser-side dependency install in the release image.
 - CI uses `noeljackson/supplychain` pinned to an immutable commit.
 - Release artifacts and container images are built by GitHub Actions and receive
-  GitHub artifact attestations.
+  GitHub artifact attestations. The exact published image is scanned again,
+  carries BuildKit provenance and an SPDX SBOM, and has a separately attested
+  downloadable SPDX asset.
 
 Run the local gates with:
 
@@ -215,6 +217,7 @@ helm lint chart/av
 tests/connector-integration.sh
 tests/security-scan.sh
 AV_UI_CONTAINER=av-ui-local AV_UI_URL=http://127.0.0.1:14322 tests/ui-smoke.sh
+./scripts/verify-release vX.Y.Z
 ```
 
 The integration runner starts separate pinned containers for AV, Infisical,
@@ -224,8 +227,9 @@ reads plus hostile Tier 2 behavior, then copies the release CLI from the AV
 image and verifies `av profiles` and both `av <profile> -- <command>` paths.
 The CLI checks that wrapper credentials never reach its child process. The
 runner removes containers and volumes on exit.
-The security runner adds a pinned, isolated ZAP passive scan. See
-[`SECURITY.md`](SECURITY.md) for the trust boundaries and test procedure.
+The security runner adds fail-closed capability/credential leak canaries and a
+pinned, isolated ZAP passive scan. See [`SECURITY.md`](SECURITY.md) for the
+trust boundaries, security gates, and reproducible release verification.
 
 Install or update the CLI repeatedly from an attested release without a
 `curl | sh` path:

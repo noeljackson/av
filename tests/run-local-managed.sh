@@ -2,6 +2,10 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+# shellcheck source=integration-tls.sh
+# Resolved from the repository root at runtime.
+# shellcheck disable=SC1091
+source "$root/tests/integration-tls.sh"
 temporary_secret_directory=''
 temporary_tls_directory=''
 
@@ -55,13 +59,7 @@ fi
 
 temporary_tls_directory=$(mktemp -d "$root/.tmp.local-managed-tls.XXXXXX")
 export AV_POSTGRES_TLS_DIR="$temporary_tls_directory/postgres-tls"
-mkdir -p "$AV_POSTGRES_TLS_DIR"
-openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
-  -keyout "$AV_POSTGRES_TLS_DIR/server.key" \
-  -out "$AV_POSTGRES_TLS_DIR/server.crt" \
-  -subj "/CN=postgres" \
-  -addext "subjectAltName=DNS:postgres" >/dev/null 2>&1
-chmod 0600 "$AV_POSTGRES_TLS_DIR/server.key"
+generate_integration_tls "$AV_POSTGRES_TLS_DIR"
 
 compose=(
   docker compose

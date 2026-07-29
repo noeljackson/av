@@ -1,0 +1,16 @@
+data_dir = ".deepsec"
+
+[matchers]
+extra_paths = []
+
+[[projects]]
+id = "av"
+root = "."
+github_url = "https://github.com/noeljackson/av/blob/main"
+priority_paths = [
+  "src/auth.rs",
+  "src/connector.rs",
+  "src/server.rs",
+  "src/store.rs",
+  "src/transparent_proxy.rs",
+]

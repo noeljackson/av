@@ -263,6 +263,7 @@ services:
     volumes:
       - connector-state:/state:ro
       - agent-credentials:/credentials:ro
+      - security-results:/results
       - ./verify.py:/test/verify.py:ro
     networks: [connectors]
 
@@ -301,3 +302,4 @@ volumes:
   agent-credentials:
   postgres-data:
   postgres-tls:
+  security-results:

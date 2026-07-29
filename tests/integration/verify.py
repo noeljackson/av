@@ -12,6 +12,14 @@ import urllib.request
 AV_URL = os.environ["AV_URL"].rstrip("/")
 AUTH = "Basic " + base64.b64encode(b"operator:password").decode()
 CREDENTIAL_FILE = pathlib.Path("/credentials/database-credentials.json")
+RESULTS = pathlib.Path("/results")
+
+
+def record_log_canary(name, value):
+    path = RESULTS / name
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        output.write(value)
 
 
 def request(path, method="GET", auth=True, origin=None, body=None, headers=None, accepted=(200,)):
@@ -224,6 +232,7 @@ def main():
     assert agent["name"] == "integration-agent"
     assert agent["enabled"] is True
     assert agent["token"].startswith("av_agent_")
+    record_log_canary("agent-token", agent["token"])
     agent_auth = "Agent " + agent["token"]
     connect(
         "ControlService",
@@ -282,6 +291,7 @@ def main():
         {"profile": "openbao-integration"},
     )
     assert proxy_session["token"]
+    record_log_canary("proxy-session-token", proxy_session["token"])
     proxy_expiry = int(proxy_session["expiresUnixSeconds"])
     assert proxy_expiry > int(time.time())
     _, renewed_session, _ = connect(
@@ -331,6 +341,23 @@ def main():
         headers={"Content-Type": "application/json"},
     )
     assert substituted == {"token": "[REDACTED]"}
+    _, rejected_canary, rejected_canary_headers = request(
+        "/v1/proxy/openbao-body/body",
+        method="POST",
+        body=b'{"token":"__AV_SECRET_TOKEN__","canary":"av-request-body-canary-9e8c"}',
+        headers={
+            "Content-Type": "application/json",
+            "X-Canary": "av-sensitive-header-canary-7d31",
+        },
+        accepted=(403,),
+    )
+    assert b"av-request-body-canary-9e8c" not in rejected_canary
+    assert b"av-sensitive-header-canary-7d31" not in rejected_canary
+    assert all(
+        "av-request-body-canary-9e8c" not in value
+        and "av-sensitive-header-canary-7d31" not in value
+        for value in rejected_canary_headers.values()
+    )
     request(
         "/v1/proxy/openbao-body/body",
         method="POST",
