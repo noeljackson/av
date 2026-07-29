@@ -15,11 +15,46 @@ use sha2::{Digest, Sha256};
 use url::Url;
 use zeroize::Zeroizing;
 
-use crate::config::ProxyRouteConfig;
+use crate::config::{ProxyRouteConfig, ProxyTunnelConfig};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TransparentRouteCatalog {
-    routes_by_host: BTreeMap<String, String>,
+    destinations_by_host: BTreeMap<String, TransparentDestination>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransparentDestination {
+    Injecting {
+        name: String,
+        profile: String,
+    },
+    Tunnel {
+        name: String,
+        profile: String,
+        host: String,
+        allow_private_ips: bool,
+    },
+}
+
+impl TransparentDestination {
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Injecting { name, .. } | Self::Tunnel { name, .. } => name,
+        }
+    }
+
+    pub fn profile(&self) -> &str {
+        match self {
+            Self::Injecting { profile, .. } | Self::Tunnel { profile, .. } => profile,
+        }
+    }
+
+    pub fn mode(&self) -> &'static str {
+        match self {
+            Self::Injecting { .. } => "injecting",
+            Self::Tunnel { .. } => "tunnel",
+        }
+    }
 }
 
 /// A one-time generated proxy capability. `token` is intentionally separate
@@ -34,7 +69,7 @@ pub struct ProxySessionCredential {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthorizedConnect {
-    pub route_name: String,
+    pub destination: TransparentDestination,
     pub host: String,
     pub token_hash: [u8; 32],
 }
@@ -58,14 +93,18 @@ pub fn proxy_session_token_hash(token: &[u8]) -> [u8; 32] {
 }
 
 impl TransparentRouteCatalog {
-    /// Build the strict host catalog from AV's immutable named-route policy.
+    /// Build the strict host catalog from AV's immutable route and tunnel
+    /// policy.
     ///
     /// The first transparent-proxy release supports one route per DNS host and
     /// only the standard HTTPS port. Multiple policies for one host are easy to
     /// make ambiguous before request decryption, so configuration must be
     /// rejected rather than choosing one at runtime.
-    pub fn from_proxy_routes(routes: &BTreeMap<String, ProxyRouteConfig>) -> Result<Self> {
-        let mut routes_by_host = BTreeMap::new();
+    pub fn from_config(
+        routes: &BTreeMap<String, ProxyRouteConfig>,
+        tunnels: &BTreeMap<String, ProxyTunnelConfig>,
+    ) -> Result<Self> {
+        let mut destinations_by_host = BTreeMap::new();
         for (route_name, route) in routes {
             let url = Url::parse(&route.base_url)
                 .with_context(|| format!("parse proxy route {route_name} base URL"))?;
@@ -79,26 +118,51 @@ impl TransparentRouteCatalog {
                 canonical_dns_host(url.host_str().with_context(|| {
                     format!("transparent proxy route {route_name} has no host")
                 })?)?;
-            if let Some(existing) = routes_by_host.insert(host.clone(), route_name.clone()) {
+            let destination = TransparentDestination::Injecting {
+                name: route_name.clone(),
+                profile: route.profile.clone(),
+            };
+            if let Some(existing) = destinations_by_host.insert(host.clone(), destination) {
                 bail!(
-                    "transparent proxy routes {existing} and {route_name} share host {host}; one host may have only one route"
+                    "transparent proxy destinations {} and {route_name} share host {host}; one host may have only one destination",
+                    existing.name()
                 );
             }
         }
-        Ok(Self { routes_by_host })
+        for (tunnel_name, tunnel) in tunnels {
+            let host = canonical_tunnel_host(&tunnel.host)?;
+            let destination = TransparentDestination::Tunnel {
+                name: tunnel_name.clone(),
+                profile: tunnel.profile.clone(),
+                host: host.clone(),
+                allow_private_ips: tunnel.allow_private_ips,
+            };
+            if let Some(existing) = destinations_by_host.insert(host.clone(), destination) {
+                bail!(
+                    "transparent proxy destinations {} and {tunnel_name} share host {host}; one host may have only one destination",
+                    existing.name()
+                );
+            }
+        }
+        Ok(Self {
+            destinations_by_host,
+        })
     }
 
     /// Return the single policy route matching an HTTP CONNECT authority.
     ///
     /// The caller must treat `None` as a deny decision and must not perform DNS
     /// resolution or connect an upstream socket first.
-    pub fn route_for_connect_authority(&self, authority: &str) -> Option<&str> {
+    pub fn destination_for_connect_authority(
+        &self,
+        authority: &str,
+    ) -> Option<&TransparentDestination> {
         let host = canonical_connect_authority(authority).ok()?;
-        self.routes_by_host.get(&host).map(String::as_str)
+        self.destinations_by_host.get(&host)
     }
 
     pub fn is_empty(&self) -> bool {
-        self.routes_by_host.is_empty()
+        self.destinations_by_host.is_empty()
     }
 }
 
@@ -128,8 +192,8 @@ pub fn authorize_connect_request(
         bail!("CONNECT Host header must exactly identify the requested authority");
     }
     let canonical_authority = canonical_connect_authority(authority)?;
-    let route_name = catalog
-        .routes_by_host
+    let destination = catalog
+        .destinations_by_host
         .get(&canonical_authority)
         .context("CONNECT destination is not configured")?;
     let values: Vec<_> = headers.get_all("proxy-authorization").iter().collect();
@@ -150,7 +214,7 @@ pub fn authorize_connect_request(
         bail!("CONNECT proxy bearer capability is malformed");
     }
     Ok(AuthorizedConnect {
-        route_name: route_name.to_owned(),
+        destination: destination.clone(),
         host: canonical_authority,
         token_hash: proxy_session_token_hash(token.as_bytes()),
     })
@@ -173,6 +237,13 @@ fn canonical_connect_authority(authority: &str) -> Result<String> {
         bail!("CONNECT authority must use port 443");
     }
     canonical_dns_host(url.host_str().context("CONNECT authority has no host")?)
+}
+
+pub fn canonical_tunnel_host(host: &str) -> Result<String> {
+    if host.contains([':', '/', '?', '#', '@']) || host.chars().any(char::is_whitespace) {
+        bail!("tunnel host must be an exact DNS name without a port");
+    }
+    canonical_dns_host(host)
 }
 
 fn canonical_dns_host(host: &str) -> Result<String> {
@@ -209,7 +280,7 @@ mod tests {
             .iter()
             .map(|(name, base_url)| ((*name).to_owned(), route(base_url)))
             .collect();
-        TransparentRouteCatalog::from_proxy_routes(&routes)
+        TransparentRouteCatalog::from_config(&routes, &BTreeMap::new())
     }
 
     #[test]
@@ -217,16 +288,22 @@ mod tests {
         let catalog = catalog(&[("provider", "https://api.example.test/v1")]).unwrap();
 
         assert_eq!(
-            catalog.route_for_connect_authority("api.example.test:443"),
-            Some("provider")
+            catalog
+                .destination_for_connect_authority("api.example.test:443")
+                .map(TransparentDestination::name),
+            Some("provider"),
         );
         assert_eq!(
-            catalog.route_for_connect_authority("API.EXAMPLE.TEST.:443"),
-            Some("provider")
+            catalog
+                .destination_for_connect_authority("API.EXAMPLE.TEST.:443")
+                .map(TransparentDestination::name),
+            Some("provider"),
         );
         assert_eq!(
-            catalog.route_for_connect_authority("api.example.test"),
-            Some("provider")
+            catalog
+                .destination_for_connect_authority("api.example.test")
+                .map(TransparentDestination::name),
+            Some("provider"),
         );
     }
 
@@ -235,15 +312,18 @@ mod tests {
         let catalog = catalog(&[("provider", "https://api.example.test")]).unwrap();
 
         assert_eq!(
-            catalog.route_for_connect_authority("other.example.test:443"),
+            catalog.destination_for_connect_authority("other.example.test:443"),
             None
         );
         assert_eq!(
-            catalog.route_for_connect_authority("api.example.test:8443"),
+            catalog.destination_for_connect_authority("api.example.test:8443"),
             None
         );
-        assert_eq!(catalog.route_for_connect_authority("127.0.0.1:443"), None);
-        assert_eq!(catalog.route_for_connect_authority("[::1]:443"), None);
+        assert_eq!(
+            catalog.destination_for_connect_authority("127.0.0.1:443"),
+            None
+        );
+        assert_eq!(catalog.destination_for_connect_authority("[::1]:443"), None);
     }
 
     #[test]
@@ -278,7 +358,7 @@ mod tests {
             "api.example.test:443 extra",
         ] {
             assert_eq!(
-                catalog.route_for_connect_authority(authority),
+                catalog.destination_for_connect_authority(authority),
                 None,
                 "{authority}"
             );
@@ -324,7 +404,8 @@ mod tests {
             &catalog,
         )
         .unwrap();
-        assert_eq!(authorized.route_name, "provider");
+        assert_eq!(authorized.destination.name(), "provider");
+        assert_eq!(authorized.destination.mode(), "injecting");
         assert_eq!(authorized.host, "api.example.test");
         assert_eq!(authorized.token_hash, credential.token_hash);
 
@@ -358,6 +439,34 @@ mod tests {
                 &catalog
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn tunnel_destinations_are_exact_and_cannot_overlap_injecting_routes() {
+        let tunnels = BTreeMap::from([(
+            "control-plane".into(),
+            ProxyTunnelConfig {
+                profile: "example".into(),
+                host: "control.example.test".into(),
+                allow_private_ips: false,
+            },
+        )]);
+        let catalog = TransparentRouteCatalog::from_config(&BTreeMap::new(), &tunnels).unwrap();
+        let destination = catalog
+            .destination_for_connect_authority("control.example.test:443")
+            .unwrap();
+        assert_eq!(destination.name(), "control-plane");
+        assert_eq!(destination.profile(), "example");
+        assert_eq!(destination.mode(), "tunnel");
+
+        let routes =
+            BTreeMap::from([("injecting".into(), route("https://control.example.test/v1"))]);
+        let error = TransparentRouteCatalog::from_config(&routes, &tunnels).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("share host control.example.test")
         );
     }
 

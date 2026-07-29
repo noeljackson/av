@@ -61,6 +61,14 @@ run_cli profiles >"$workdir/profiles"
 grep --quiet '^infisical-integration' "$workdir/profiles"
 grep --quiet '^openbao-integration' "$workdir/profiles"
 
+run_cli routes >"$workdir/routes"
+grep --quiet $'^openbao-upstream\tinjecting\topenbao-integration\tupstream$' "$workdir/routes"
+grep --quiet $'^openbao-x-api\tinjecting\topenbao-integration\tupstream$' "$workdir/routes"
+if grep --quiet '^ungranted-upstream' "$workdir/routes"; then
+  echo "ungranted route was disclosed by CLI discovery" >&2
+  exit 1
+fi
+
 # shellcheck disable=SC2016 # The child shell, not this harness, expands these variables.
 run_cli infisical-integration -- sh -eu -c '
   test "${INFISICAL_MARKER:-}" = infisical-ok

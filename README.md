@@ -37,6 +37,7 @@ version resource and authenticate with ADC/Workload Identity Federation. See
 av login
 
 av profiles
+av routes
 av infra -- ./scripts/atmos-run terraform plan headscale -s system
 av example-dev -- cargo test
 av example-prod -- ./scripts/check-production

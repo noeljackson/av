@@ -6,6 +6,7 @@ service SessionService {
   rpc GetAuthConfig(GetAuthConfigRequest) returns (AuthConfig);
   rpc GetStatus(GetStatusRequest) returns (Status);
   rpc ListProfiles(ListProfilesRequest) returns (ListProfilesResponse);
+  rpc ListProxyDestinations(ListProxyDestinationsRequest) returns (ListProxyDestinationsResponse);
   rpc GetProfileEnvironment(GetProfileEnvironmentRequest) returns (ProfileEnvironment);
   rpc CreateProxySession(CreateProxySessionRequest) returns (ProxySessionLease);
   rpc RevokeProxySession(RevokeProxySessionRequest) returns (ProxySessionLease);
@@ -69,6 +70,20 @@ message Profile {
 
 message ListProfilesResponse {
   repeated Profile profiles = 1;
+}
+
+message ListProxyDestinationsRequest {}
+
+message ProxyDestination {
+  string name = 1;
+  string profile = 2;
+  string host = 3;
+  // injecting or tunnel
+  string mode = 4;
+}
+
+message ListProxyDestinationsResponse {
+  repeated ProxyDestination destinations = 1;
 }
 
 message GetProfileEnvironmentRequest {

@@ -26,6 +26,10 @@ pub struct Config {
     pub profiles: BTreeMap<String, ProfileConfig>,
     #[serde(default)]
     pub proxy_routes: BTreeMap<String, ProxyRouteConfig>,
+    /// Exact credentialless HTTPS destinations available to transparent proxy
+    /// sessions. These are raw TLS tunnels: AV never intercepts or injects.
+    #[serde(default)]
+    pub proxy_tunnels: BTreeMap<String, ProxyTunnelConfig>,
     /// The planned private CONNECT/MITM listener. It is intentionally absent
     /// from ordinary deployments and must never share the public API listener.
     #[serde(default)]
@@ -344,6 +348,19 @@ pub struct ProxyRouteConfig {
     pub allowed_content_types: Vec<String>,
     #[serde(default = "default_proxy_max_body_bytes")]
     pub max_body_bytes: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyTunnelConfig {
+    pub profile: String,
+    /// Exact DNS host. The standard TLS port 443 is implicit.
+    pub host: String,
+    /// Private/CGNAT addresses are denied unless an operator opts in. Loopback,
+    /// link-local, multicast, unspecified, and broadcast addresses are always
+    /// denied, including cloud metadata destinations.
+    #[serde(default)]
+    pub allow_private_ips: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -741,6 +758,18 @@ impl Config {
             }
         }
 
+        for (name, tunnel) in &self.proxy_tunnels {
+            validate_name("proxy tunnel", name)?;
+            if !self.profiles.contains_key(&tunnel.profile) {
+                bail!(
+                    "proxy tunnel {name} references unknown profile {}",
+                    tunnel.profile
+                );
+            }
+            crate::transparent_proxy::canonical_tunnel_host(&tunnel.host)
+                .with_context(|| format!("proxy tunnel {name} has an invalid host"))?;
+        }
+
         if let Some(transparent_proxy) = &self.transparent_proxy {
             validate_transparent_proxy(self, transparent_proxy)?;
         }
@@ -1016,10 +1045,13 @@ fn validate_transparent_proxy(config: &Config, proxy: &TransparentProxyConfig) -
     if !(60..=3600).contains(&proxy.session_ttl_seconds) {
         bail!("transparent proxy session_ttl_seconds must be between 60 and 3600");
     }
-    if config.proxy_routes.is_empty() {
-        bail!("transparent_proxy requires at least one immutable proxy route");
+    if config.proxy_routes.is_empty() && config.proxy_tunnels.is_empty() {
+        bail!("transparent_proxy requires at least one immutable proxy route or tunnel");
     }
-    crate::transparent_proxy::TransparentRouteCatalog::from_proxy_routes(&config.proxy_routes)?;
+    crate::transparent_proxy::TransparentRouteCatalog::from_config(
+        &config.proxy_routes,
+        &config.proxy_tunnels,
+    )?;
     Ok(())
 }
 
@@ -1181,6 +1213,7 @@ mod tests {
             connectors: BTreeMap::new(),
             profiles: BTreeMap::new(),
             proxy_routes: BTreeMap::new(),
+            proxy_tunnels: BTreeMap::new(),
             transparent_proxy: None,
             max_connector_concurrency: 16,
             api_rate_limit_per_second: 50,
@@ -1439,6 +1472,33 @@ mod tests {
             session_ttl_seconds: 900,
         });
         assert!(config.validate().is_ok());
+        config.proxy_tunnels.insert(
+            "control-plane".into(),
+            ProxyTunnelConfig {
+                profile: "example".into(),
+                host: "control.example.test".into(),
+                allow_private_ips: false,
+            },
+        );
+        assert!(config.validate().is_ok());
+        config.proxy_tunnels.get_mut("control-plane").unwrap().host =
+            "control.example.test:443".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("invalid host")
+        );
+        config.proxy_tunnels.get_mut("control-plane").unwrap().host = "api.example.test".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("share host")
+        );
+        config.proxy_tunnels.get_mut("control-plane").unwrap().host = "control.example.test".into();
 
         config.mode = ConfigMode::Static;
         assert!(

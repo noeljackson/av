@@ -123,6 +123,25 @@ def main():
         {"name": "infisical-integration", "environment": "dev", "path": "/"},
         {"name": "openbao-integration", "environment": "", "path": "secret/data/av-integration"},
     ]
+    _, destinations, _ = connect(
+        "SessionService",
+        "ListProxyDestinations",
+        {},
+    )
+    assert destinations["destinations"] == [
+        {
+            "name": "openbao-upstream",
+            "profile": "openbao-integration",
+            "host": "upstream",
+            "mode": "injecting",
+        },
+        {
+            "name": "openbao-x-api",
+            "profile": "openbao-integration",
+            "host": "upstream",
+            "mode": "injecting",
+        },
+    ]
     _, missing_api, _ = request("/v1/register", auth=False, accepted=(404,))
     assert b"api endpoint not found" in missing_api
 

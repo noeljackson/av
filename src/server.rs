@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    net::{IpAddr, Ipv4Addr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -37,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    net::TcpListener,
+    net::{TcpListener, TcpStream, lookup_host},
     sync::{Mutex, Semaphore},
     time::Instant,
 };
@@ -55,10 +56,11 @@ use crate::{
         ListAuditEventsRequest, ListAuditEventsResponse, ListBasicUsersRequest,
         ListBasicUsersResponse, ListPrincipalRolesRequest, ListPrincipalRolesResponse,
         ListProfileGrantsRequest, ListProfileGrantsResponse, ListProfilesRequest,
-        ListProfilesResponse, PrincipalRole as RpcPrincipalRole, Profile as RpcProfile,
-        ProfileEnvironment, ProfileGrant as RpcProfileGrant, ProxySessionLease,
-        RevokeProfileRequest, RevokeProxySessionRequest, RotateAgentRequest, SessionService,
-        SessionServiceExt, SetAgentEnabledRequest, SetBasicUserEnabledRequest,
+        ListProfilesResponse, ListProxyDestinationsRequest, ListProxyDestinationsResponse,
+        PrincipalRole as RpcPrincipalRole, Profile as RpcProfile, ProfileEnvironment,
+        ProfileGrant as RpcProfileGrant, ProxyDestination as RpcProxyDestination,
+        ProxySessionLease, RevokeProfileRequest, RevokeProxySessionRequest, RotateAgentRequest,
+        SessionService, SessionServiceExt, SetAgentEnabledRequest, SetBasicUserEnabledRequest,
         SetPrincipalRoleRequest, Status as RpcStatus, UpsertBasicUserRequest,
     },
     config::{AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyRouteConfig},
@@ -66,7 +68,8 @@ use crate::{
     proxy_ca::ProxyCertificateAuthority,
     store::{GrantMode, PrincipalRole, Store},
     transparent_proxy::{
-        TransparentRouteCatalog, authorize_connect_request, mint_proxy_session_credential,
+        TransparentDestination, TransparentRouteCatalog, authorize_connect_request,
+        mint_proxy_session_credential,
     },
     transport_tls::ReloadingTransportTls,
 };
@@ -1092,6 +1095,64 @@ impl SessionService for ConnectSessionService {
         })
     }
 
+    async fn list_proxy_destinations(
+        &self,
+        ctx: connectrpc::RequestContext,
+        _request: connectrpc::ServiceRequest<'_, ListProxyDestinationsRequest>,
+    ) -> connectrpc::ServiceResult<ListProxyDestinationsResponse> {
+        let identity = authorize_connect(&self.state, ctx.headers()).await?;
+        let mut destinations = Vec::new();
+        for (name, route) in &self.state.config.proxy_routes {
+            if profile_permitted(
+                &self.state,
+                &identity.subject,
+                &route.profile,
+                GrantMode::Proxy,
+            )
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+            {
+                let host = url::Url::parse(&route.base_url)
+                    .ok()
+                    .and_then(|url| url.host_str().map(str::to_owned))
+                    .ok_or_else(|| {
+                        connectrpc::ConnectError::internal("proxy route configuration unavailable")
+                    })?;
+                destinations.push(RpcProxyDestination {
+                    name: name.clone(),
+                    profile: route.profile.clone(),
+                    host,
+                    mode: "injecting".into(),
+                    ..Default::default()
+                });
+            }
+        }
+        for (name, tunnel) in &self.state.config.proxy_tunnels {
+            if profile_permitted(
+                &self.state,
+                &identity.subject,
+                &tunnel.profile,
+                GrantMode::Proxy,
+            )
+            .await
+            .map_err(|_| connectrpc::ConnectError::internal("managed store unavailable"))?
+            {
+                destinations.push(RpcProxyDestination {
+                    name: name.clone(),
+                    profile: tunnel.profile.clone(),
+                    host: tunnel.host.clone(),
+                    mode: "tunnel".into(),
+                    ..Default::default()
+                });
+            }
+        }
+        destinations.sort_by(|left, right| left.name.cmp(&right.name));
+        connectrpc::Response::ok(ListProxyDestinationsResponse {
+            destinations,
+            ..Default::default()
+        })
+    }
+
     async fn get_profile_environment(
         &self,
         ctx: connectrpc::RequestContext,
@@ -1507,7 +1568,10 @@ pub async fn run(config: Config) -> Result<()> {
                 listen: proxy.listen.clone(),
                 proxy_url: proxy.proxy_url.clone(),
                 session_ttl: Duration::from_secs(proxy.session_ttl_seconds),
-                catalog: TransparentRouteCatalog::from_proxy_routes(&config.proxy_routes)?,
+                catalog: TransparentRouteCatalog::from_config(
+                    &config.proxy_routes,
+                    &config.proxy_tunnels,
+                )?,
                 certificate_authority: ProxyCertificateAuthority::load(
                     std::path::Path::new(&proxy.ca_certificate_file),
                     std::path::Path::new(&proxy.ca_private_key_file),
@@ -2737,10 +2801,7 @@ async fn transparent_connect_response(
             return transparent_response(StatusCode::SERVICE_UNAVAILABLE, "proxy unavailable\n");
         }
     };
-    let Some(route) = state.config.proxy_routes.get(&authorized.route_name) else {
-        return transparent_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
-    };
-    if session.profile != route.profile {
+    if session.profile != authorized.destination.profile() {
         return transparent_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
     }
     match profile_permitted(&state, &session.subject, &session.profile, GrantMode::Proxy).await {
@@ -2753,30 +2814,58 @@ async fn transparent_connect_response(
             return transparent_response(StatusCode::SERVICE_UNAVAILABLE, "proxy unavailable\n");
         }
     }
-    let host = authorized.host.clone();
+    let tunnel_upstream = match &authorized.destination {
+        TransparentDestination::Injecting { .. } => None,
+        TransparentDestination::Tunnel {
+            host,
+            allow_private_ips,
+            ..
+        } => match connect_credentialless_upstream(host, *allow_private_ips).await {
+            Ok(upstream) => Some(upstream),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    destination = authorized.destination.name(),
+                    "credentialless tunnel upstream denied or unavailable"
+                );
+                return transparent_response(StatusCode::BAD_GATEWAY, "proxy request failed\n");
+            }
+        },
+    };
     let upgraded = hyper::upgrade::on(&mut request);
     let state_for_tunnel = state.clone();
     let runtime_for_tunnel = runtime.clone();
-    let route_name = authorized.route_name.clone();
+    let destination = authorized.destination.clone();
+    let destination_name = destination.name().to_owned();
+    let host = authorized.host.clone();
     let token_hash = authorized.token_hash;
     let session_id = session.session_id.clone();
     tokio::spawn(async move {
         match upgraded.await {
-            Ok(upgraded) => {
-                if let Err(error) = serve_transparent_tls_tunnel(
-                    upgraded,
-                    state_for_tunnel,
-                    runtime_for_tunnel,
-                    route_name,
-                    host,
-                    token_hash,
-                    session_id,
-                )
-                .await
-                {
-                    tracing::debug!(%error, "transparent proxy TLS tunnel ended");
+            Ok(upgraded) => match destination {
+                TransparentDestination::Injecting { name, .. } => {
+                    if let Err(error) = serve_transparent_tls_tunnel(
+                        upgraded,
+                        state_for_tunnel,
+                        runtime_for_tunnel,
+                        name,
+                        host,
+                        token_hash,
+                        session_id,
+                    )
+                    .await
+                    {
+                        tracing::debug!(%error, "transparent proxy TLS tunnel ended");
+                    }
                 }
-            }
+                TransparentDestination::Tunnel { .. } => {
+                    if let Some(upstream) = tunnel_upstream
+                        && let Err(error) = serve_credentialless_tunnel(upgraded, upstream).await
+                    {
+                        tracing::debug!(%error, "credentialless TLS tunnel ended");
+                    }
+                }
+            },
             Err(error) => tracing::debug!(%error, "transparent proxy CONNECT upgrade failed"),
         }
     });
@@ -2785,7 +2874,7 @@ async fn transparent_connect_response(
         &session.subject,
         "transparent_proxy_connect",
         Some(&session.profile),
-        Some(&authorized.route_name),
+        Some(&destination_name),
         None,
     )
     .await
@@ -2794,6 +2883,91 @@ async fn transparent_connect_response(
         return transparent_response(StatusCode::SERVICE_UNAVAILABLE, "proxy unavailable\n");
     }
     transparent_response(StatusCode::OK, "")
+}
+
+async fn connect_credentialless_upstream(host: &str, allow_private_ips: bool) -> Result<TcpStream> {
+    let mut addresses = lookup_host((host, 443))
+        .await
+        .with_context(|| format!("resolve configured tunnel host {host}"))?
+        .collect::<BTreeSet<_>>();
+    if addresses.is_empty() || addresses.len() > 16 {
+        bail!("configured tunnel host resolved to an invalid number of addresses");
+    }
+    if addresses
+        .iter()
+        .any(|address| !tunnel_ip_allowed(address.ip(), allow_private_ips))
+    {
+        bail!("configured tunnel host resolved to a denied address");
+    }
+    let mut last_error = None;
+    for address in std::mem::take(&mut addresses) {
+        match tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(address)).await {
+            Ok(Ok(stream)) => {
+                stream
+                    .set_nodelay(true)
+                    .context("configure credentialless tunnel socket")?;
+                return Ok(stream);
+            }
+            Ok(Err(error)) => last_error = Some(anyhow::Error::new(error)),
+            Err(error) => last_error = Some(anyhow::Error::new(error)),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("tunnel upstream is unavailable")))
+}
+
+fn tunnel_ip_allowed(address: IpAddr, allow_private_ips: bool) -> bool {
+    match address {
+        IpAddr::V4(address) => {
+            if address.is_unspecified()
+                || address.is_loopback()
+                || address.is_link_local()
+                || address.is_multicast()
+                || address.is_broadcast()
+                || address.is_documentation()
+                || address.octets()[0] == 0
+                || address.octets()[0] >= 240
+            {
+                return false;
+            }
+            allow_private_ips
+                || (!address.is_private()
+                    && !ipv4_in_prefix(address, Ipv4Addr::new(100, 64, 0, 0), 10)
+                    && !ipv4_in_prefix(address, Ipv4Addr::new(198, 18, 0, 0), 15))
+        }
+        IpAddr::V6(address) => {
+            if address.is_unspecified()
+                || address.is_loopback()
+                || address.is_multicast()
+                || address.is_unicast_link_local()
+                || address.segments()[0] == 0x2001 && address.segments()[1] == 0x0db8
+            {
+                return false;
+            }
+            allow_private_ips || !address.is_unique_local()
+        }
+    }
+}
+
+fn ipv4_in_prefix(address: Ipv4Addr, network: Ipv4Addr, prefix: u32) -> bool {
+    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
+    u32::from(address) & mask == u32::from(network) & mask
+}
+
+async fn serve_credentialless_tunnel(
+    upgraded: hyper::upgrade::Upgraded,
+    upstream: TcpStream,
+) -> Result<()> {
+    relay_credentialless_tunnel(TokioIo::new(upgraded), upstream).await
+}
+
+async fn relay_credentialless_tunnel(
+    mut client: impl AsyncRead + AsyncWrite + Unpin,
+    mut upstream: impl AsyncRead + AsyncWrite + Unpin,
+) -> Result<()> {
+    tokio::io::copy_bidirectional(&mut client, &mut upstream)
+        .await
+        .context("relay credentialless TLS tunnel")?;
+    Ok(())
 }
 
 async fn serve_transparent_tls_tunnel(
@@ -3658,6 +3832,7 @@ mod tests {
             connectors: BTreeMap::new(),
             profiles,
             proxy_routes: routes.clone(),
+            proxy_tunnels: BTreeMap::new(),
             transparent_proxy: Some(TransparentProxyConfig {
                 listen: "127.0.0.1:0".into(),
                 proxy_url: "https://av.example.test:14323".into(),
@@ -3688,7 +3863,7 @@ mod tests {
             listen: "127.0.0.1:0".into(),
             proxy_url: "https://av.example.test:14323".into(),
             session_ttl: Duration::from_secs(60),
-            catalog: TransparentRouteCatalog::from_proxy_routes(&routes).unwrap(),
+            catalog: TransparentRouteCatalog::from_config(&routes, &BTreeMap::new()).unwrap(),
             certificate_authority: ProxyCertificateAuthority::load(
                 &ca_certificate_file,
                 &ca_private_key_file,
@@ -4465,6 +4640,53 @@ mod tests {
         );
         assert_eq!(redact(b"c2VjcmV0LXRva2Vu", b"secret-token"), b"[REDACTED]");
         assert_eq!(redact(b"secret%2Btoken", b"secret+token"), b"[REDACTED]");
+    }
+
+    #[test]
+    fn credentialless_tunnel_ip_policy_blocks_metadata_and_requires_private_opt_in() {
+        assert!(tunnel_ip_allowed("1.1.1.1".parse().unwrap(), false));
+        assert!(!tunnel_ip_allowed("10.0.0.1".parse().unwrap(), false));
+        assert!(tunnel_ip_allowed("10.0.0.1".parse().unwrap(), true));
+        assert!(!tunnel_ip_allowed(
+            "100.100.100.100".parse().unwrap(),
+            false
+        ));
+        assert!(tunnel_ip_allowed("100.100.100.100".parse().unwrap(), true));
+        for address in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "0.0.0.1",
+            "224.0.0.1",
+            "::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(
+                !tunnel_ip_allowed(address.parse().unwrap(), true),
+                "{address}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn credentialless_tunnel_relays_bytes_without_http_or_tls_interception() {
+        let (mut child, helper_side) = tokio::io::duplex(1024);
+        let (upstream_side, mut upstream) = tokio::io::duplex(1024);
+        let relay = tokio::spawn(relay_credentialless_tunnel(helper_side, upstream_side));
+
+        child.write_all(b"opaque-client-tls").await.unwrap();
+        let mut request = [0_u8; 17];
+        upstream.read_exact(&mut request).await.unwrap();
+        assert_eq!(&request, b"opaque-client-tls");
+
+        upstream.write_all(b"opaque-server-tls").await.unwrap();
+        let mut response = [0_u8; 17];
+        child.read_exact(&mut response).await.unwrap();
+        assert_eq!(&response, b"opaque-server-tls");
+
+        drop(child);
+        drop(upstream);
+        relay.await.unwrap().unwrap();
     }
 
     #[test]

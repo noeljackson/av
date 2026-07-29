@@ -135,6 +135,7 @@ config:
   connectors: {}
   profiles: {}
   proxy_routes: {}
+  proxy_tunnels: {}
   max_connector_concurrency: 16
   api_rate_limit_per_second: 50
   api_rate_limit_burst: 100

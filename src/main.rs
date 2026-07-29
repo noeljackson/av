@@ -17,9 +17,9 @@ use av::{
         CreateProxySessionRequest, DeleteAgentRequest, GetAuthConfigRequest,
         GetProfileEnvironmentRequest, GrantProfileRequest, ListAgentsRequest, ListAgentsResponse,
         ListPrincipalRolesRequest, ListPrincipalRolesResponse, ListProfilesRequest,
-        ListProfilesResponse, ProfileEnvironment, ProxySessionLease, RevokeProfileRequest,
-        RevokeProxySessionRequest, RotateAgentRequest, SetAgentEnabledRequest,
-        SetPrincipalRoleRequest,
+        ListProfilesResponse, ListProxyDestinationsRequest, ListProxyDestinationsResponse,
+        ProfileEnvironment, ProxySessionLease, RevokeProfileRequest, RevokeProxySessionRequest,
+        RotateAgentRequest, SetAgentEnabledRequest, SetPrincipalRoleRequest,
     },
     config::{AuthConfig, AuthMode, Config, ConfigMode, ManagedConfig, OidcSigningAlgorithm},
     keyring,
@@ -64,6 +64,8 @@ enum Command {
     Logout,
     /// List profiles available to the current identity.
     Profiles,
+    /// List injecting routes and credentialless tunnels available to the current identity.
+    Routes,
     /// Run a child through a profile-scoped transparent proxy session.
     Run {
         profile: String,
@@ -203,6 +205,10 @@ async fn run() -> Result<u8> {
         }
         Some(Command::Profiles) => {
             list_profiles(&cli.api_url).await?;
+            Ok(0)
+        }
+        Some(Command::Routes) => {
+            list_proxy_destinations(&cli.api_url).await?;
             Ok(0)
         }
         Some(Command::Run { profile, command }) => {
@@ -471,6 +477,7 @@ fn local_init(
         connectors: BTreeMap::new(),
         profiles: BTreeMap::new(),
         proxy_routes: BTreeMap::new(),
+        proxy_tunnels: BTreeMap::new(),
         transparent_proxy: None,
         max_connector_concurrency: 16,
         api_rate_limit_per_second: 50,
@@ -499,6 +506,7 @@ fn local_init(
         "connectors": {},
         "profiles": {},
         "proxy_routes": {},
+        "proxy_tunnels": {},
         "transparent_proxy": null,
         "max_connector_concurrency": config.max_connector_concurrency,
         "api_rate_limit_per_second": config.api_rate_limit_per_second,
@@ -639,6 +647,23 @@ async fn list_profiles(api_url: &str) -> Result<()> {
         println!(
             "{}\t{}\t{}",
             profile.name, profile.environment, profile.secret_path
+        );
+    }
+    Ok(())
+}
+
+async fn list_proxy_destinations(api_url: &str) -> Result<()> {
+    let response: ListProxyDestinationsResponse = connect_request(
+        api_url,
+        "av.v1.SessionService/ListProxyDestinations",
+        &ListProxyDestinationsRequest::default(),
+        true,
+    )
+    .await?;
+    for destination in response.destinations {
+        println!(
+            "{}\t{}\t{}\t{}",
+            destination.name, destination.mode, destination.profile, destination.host
         );
     }
     Ok(())

@@ -97,6 +97,13 @@
       "max_body_bytes": 1048576
     }
   },
+  "proxy_tunnels": {
+    "source-control": {
+      "profile": "infra",
+      "host": "github.com",
+      "allow_private_ips": false
+    }
+  },
   "max_connector_concurrency": 16,
   "api_rate_limit_per_second": 50,
   "api_rate_limit_burst": 100

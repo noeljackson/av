@@ -30,13 +30,15 @@ advertised or enabled:
 
 1. It is a **private** service. It is never exposed by public Ingress, a public
    LoadBalancer, or a tailnet funnel.
-2. It is **strict deny**. A destination not backed by a configured AV connector
-   route fails closed. There is no pass-through mode.
+2. It is **strict deny**. A destination not backed by a configured AV injecting
+   route or exact credentialless tunnel fails closed. There is no unmatched
+   pass-through mode.
 3. A session is short-lived, profile-scoped, auditable, and revocable. It is a
    capability to make policy-approved requests; it is not a provider
    credential.
-4. AV does TLS interception only for configured connector hosts. A caller does
-   not get a general-purpose decryption service.
+4. AV does TLS interception only for configured injecting-route hosts.
+   Credentialless tunnel bytes remain end-to-end opaque. A caller does not get
+   a general-purpose decryption or forwarding service.
 5. AV removes caller-supplied credential headers before injecting its own
    credential. It never forwards a provider credential to the workload.
 6. Direct outbound paths are blocked at the workload boundary. Proxy environment
@@ -115,9 +117,10 @@ therefore remain narrow.
    network proxy's HTTPS transport certificate, then sends its session
    capability. AV accepts only a configured `CONNECT host:443`; plaintext
    network proxy traffic and plaintext upstream destinations are rejected.
-6. AV maps the host to exactly one connector route, enforces that route's
-   method/path/query/header/content policy, fetches the provider credential,
-   strips caller auth, and injects the fixed credential form.
+6. AV maps the host to exactly one immutable destination. An injecting route
+   gets TLS interception, HTTP policy, and fixed credential injection. A
+   credentialless tunnel gets raw end-to-end TLS relay and never invokes a
+   secret backend.
 7. AV sends the request to the fixed HTTPS upstream, redacts any echoed
    credential, returns only permitted response headers, and records the policy
    decision and status.
@@ -182,10 +185,44 @@ hop-by-hop headers, `Proxy-Authorization` forwarding, cross-host redirects,
 and undeclared CRUD methods. A configured `Authorization` injection always
 overwrites the caller's `Authorization`; it never appends a second value.
 
-One host may map to multiple policies only when AV can choose unambiguously
-from authenticated session/profile and canonical path. Otherwise configuration
-validation must reject it. Ambiguity is a security failure, not a runtime
-selection problem.
+One host maps to exactly one injecting route or credentialless tunnel.
+Configuration validation rejects overlaps rather than choosing from decrypted
+paths at runtime. Ambiguity is a security failure.
+
+## Credentialless TLS tunnels
+
+Some wrapped tools also need ordinary HTTPS control-plane access that carries
+no AV-managed provider credential: for example, an explicitly approved source
+host or package mirror. Configure these separately from `proxy_routes`:
+
+```json
+{
+  "proxy_tunnels": {
+    "source-control": {
+      "profile": "orchard-dev",
+      "host": "github.com",
+      "allow_private_ips": false
+    }
+  }
+}
+```
+
+A tunnel declaration is an exact DNS host on port 443. It has no path policy
+because AV does not terminate its TLS. The caller must have a proxy grant for
+the tunnel's profile, and `av routes` shows only destinations visible through
+that grant. Unknown hosts and overlaps with injecting routes fail
+configuration or CONNECT authorization before DNS.
+
+AV resolves a configured tunnel only after authenticating the session and
+checking its live grant. It rejects mixed or unsafe DNS answers. Loopback,
+link-local, multicast, unspecified, broadcast, documentation, and metadata
+addresses are always denied. RFC1918, unique-local IPv6, benchmark, and CGNAT
+addresses require `allow_private_ips: true`; this explicit opt-in is useful for
+private Kubernetes and tailnet control planes without weakening public routes.
+
+Credentialless means AV does not fetch, inject, inspect, redact, or persist
+anything from the TLS stream. It is still a network capability, so declarations
+should be narrow and the workload must retain direct-egress denial.
 
 ## Kubernetes deployment and egress enforcement
 
