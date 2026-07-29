@@ -188,7 +188,9 @@ creating a free-form "service" database. Each policy entry must contain:
 - the credential key and a fixed injection location;
 - allowed methods and canonical path prefixes;
 - explicit query, request-header, response-header, content-type, and body-size
-  allowlists; and
+  allowlists;
+- an explicit buffered or streaming response mode with a total byte ceiling;
+  and
 - enabled/disabled state owned by immutable deployment configuration.
 
 The proxy must enforce the same policy as an explicit named route. In
@@ -199,6 +201,14 @@ overwrites the caller's `Authorization`; it never appends a second value.
 Only routes whose fixed origin is standard HTTPS on port 443 are eligible for
 transparent interception. Other explicit named routes remain usable through
 `/v1/proxy/<route>/...` but are absent from the CONNECT destination catalog.
+
+Streaming is opt-in per route with `response_mode: "streaming"` and a bounded
+`max_response_bytes`. AV begins forwarding ordinary and `text/event-stream`
+responses before upstream completion. The redactor retains only the minimum
+cross-chunk overlap needed to catch raw, Base64, URL-safe Base64,
+percent-encoded, and JSON-escaped credential forms split across arbitrary
+upstream chunks. Exceeding the byte ceiling terminates the body stream; it
+never silently switches to an unbounded relay.
 
 One host maps to exactly one injecting route or credentialless tunnel.
 Configuration validation rejects overlaps rather than choosing from decrypted

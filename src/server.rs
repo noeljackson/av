@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
+    io,
     net::{IpAddr, Ipv4Addr},
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -28,7 +29,8 @@ use base64::{
     Engine,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
 };
-use http_body_util::{BodyExt, Empty, Full};
+use futures_util::stream;
+use http_body_util::{BodyExt, Empty};
 use hyper::{
     Request as HyperRequest, Response as HyperResponse, body::Incoming, server::conn::http1,
     service::service_fn,
@@ -64,7 +66,10 @@ use crate::{
         SetAgentEnabledRequest, SetBasicUserEnabledRequest, SetPrincipalRoleRequest,
         Status as RpcStatus, UpsertBasicUserRequest,
     },
-    config::{AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyRouteConfig},
+    config::{
+        AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyResponseMode,
+        ProxyRouteConfig,
+    },
     connector::Connector,
     proxy_ca::ProxyCertificateAuthority,
     store::{GrantMode, PrincipalRole, Store},
@@ -3102,7 +3107,7 @@ async fn transparent_tunnel_response(
     route_name: String,
     token_hash: [u8; 32],
     session_id: String,
-) -> HyperResponse<Full<Bytes>> {
+) -> HyperResponse<axum::body::Body> {
     if !state.api_rate_limiter.try_acquire().await {
         return transparent_full_response(
             StatusCode::TOO_MANY_REQUESTS,
@@ -3213,21 +3218,7 @@ async fn transparent_tunnel_response(
         tracing::error!(%error, "record transparent proxy request audit event");
         return transparent_full_response(StatusCode::SERVICE_UNAVAILABLE, "proxy unavailable\n");
     }
-    let (parts, body) = response.into_parts();
-    let body = match axum::body::to_bytes(body, 4 * 1024 * 1024).await {
-        Ok(body) => body,
-        Err(error) => {
-            tracing::error!(%error, "read bounded transparent proxy response");
-            return transparent_full_response(StatusCode::BAD_GATEWAY, "proxy request failed\n");
-        }
-    };
-    let mut response = HyperResponse::builder().status(parts.status);
-    for (name, value) in &parts.headers {
-        response = response.header(name, value);
-    }
-    response.body(Full::new(body)).unwrap_or_else(|_| {
-        transparent_full_response(StatusCode::BAD_GATEWAY, "proxy request failed\n")
-    })
+    response
 }
 
 async fn collect_transparent_body(mut body: Incoming, maximum: usize) -> Result<Bytes> {
@@ -3260,10 +3251,10 @@ fn transparent_response(status: StatusCode, message: &str) -> HyperResponse<Empt
         .expect("constant transparent proxy response")
 }
 
-fn transparent_full_response(status: StatusCode, message: &str) -> HyperResponse<Full<Bytes>> {
+fn transparent_full_response(status: StatusCode, message: &str) -> HyperResponse<axum::body::Body> {
     HyperResponse::builder()
         .status(status)
-        .body(Full::new(Bytes::copy_from_slice(message.as_bytes())))
+        .body(axum::body::Body::from(message.to_owned()))
         .expect("constant transparent proxy response")
 }
 
@@ -3454,19 +3445,11 @@ async fn proxy_request(
     let status = upstream.status();
     if upstream
         .content_length()
-        .is_some_and(|length| length > 4 * 1024 * 1024)
+        .is_some_and(|length| length > route.max_response_bytes as u64)
     {
         bail!("upstream response is too large");
     }
     let upstream_headers = upstream.headers().clone();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = upstream.chunk().await? {
-        if bytes.len().saturating_add(chunk.len()) > 4 * 1024 * 1024 {
-            bail!("upstream response is too large");
-        }
-        bytes.extend_from_slice(&chunk);
-    }
-    let bytes = redact(&bytes, secret.as_bytes());
     let mut response = Response::builder().status(status);
     for configured in &route.allowed_response_headers {
         let name = HeaderName::from_bytes(configured.as_bytes())?;
@@ -3476,7 +3459,61 @@ async fn proxy_request(
             response = response.header(name, value);
         }
     }
-    Ok(response.body(axum::body::Body::from(bytes))?)
+    match route.response_mode {
+        ProxyResponseMode::Buffered => {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = upstream.chunk().await? {
+                if bytes.len().saturating_add(chunk.len()) > route.max_response_bytes {
+                    bail!("upstream response is too large");
+                }
+                bytes.extend_from_slice(&chunk);
+            }
+            let bytes = redact(&bytes, secret.as_bytes());
+            Ok(response.body(axum::body::Body::from(bytes))?)
+        }
+        ProxyResponseMode::Streaming => {
+            let maximum = route.max_response_bytes;
+            let redactor = StreamingRedactor::new(secret.as_bytes());
+            let body_stream = stream::try_unfold(
+                (upstream, redactor, 0_usize, false),
+                move |(mut upstream, mut redactor, mut total, finished)| async move {
+                    if finished {
+                        return Ok(None);
+                    }
+                    loop {
+                        match upstream.chunk().await.map_err(io::Error::other)? {
+                            Some(chunk) => {
+                                total = total.saturating_add(chunk.len());
+                                if total > maximum {
+                                    return Err(io::Error::other(
+                                        "upstream streaming response is too large",
+                                    ));
+                                }
+                                let output = redactor.push(&chunk);
+                                if !output.is_empty() {
+                                    return Ok(Some((
+                                        Bytes::from(output),
+                                        (upstream, redactor, total, false),
+                                    )));
+                                }
+                            }
+                            None => {
+                                let output = redactor.finish();
+                                if output.is_empty() {
+                                    return Ok(None);
+                                }
+                                return Ok(Some((
+                                    Bytes::from(output),
+                                    (upstream, redactor, total, true),
+                                )));
+                            }
+                        }
+                    }
+                },
+            );
+            Ok(response.body(axum::body::Body::from_stream(body_stream))?)
+        }
+    }
 }
 
 fn enforce_proxy_policy(route: &ProxyRouteConfig, path: &str, method: &Method) -> Result<String> {
@@ -3664,6 +3701,63 @@ fn validate_percent_encoding(value: &str) -> Result<()> {
     Ok(())
 }
 
+struct StreamingRedactor {
+    pending: Vec<u8>,
+    patterns: Vec<Vec<u8>>,
+    maximum_pattern_length: usize,
+}
+
+impl StreamingRedactor {
+    fn new(secret: &[u8]) -> Self {
+        let patterns = credential_encodings(secret)
+            .into_iter()
+            .filter(|pattern| !pattern.is_empty())
+            .collect::<Vec<_>>();
+        let maximum_pattern_length = patterns.iter().map(Vec::len).max().unwrap_or(1);
+        Self {
+            pending: Vec::new(),
+            patterns,
+            maximum_pattern_length,
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.pending.extend_from_slice(chunk);
+        self.emit(false)
+    }
+
+    fn finish(&mut self) -> Vec<u8> {
+        self.emit(true)
+    }
+
+    fn emit(&mut self, finished: bool) -> Vec<u8> {
+        let safe_limit = if finished {
+            self.pending.len()
+        } else {
+            self.pending
+                .len()
+                .saturating_sub(self.maximum_pattern_length.saturating_sub(1))
+        };
+        let mut consumed = 0;
+        let mut output = Vec::with_capacity(safe_limit);
+        while consumed < safe_limit {
+            if let Some(pattern) = self
+                .patterns
+                .iter()
+                .find(|pattern| self.pending[consumed..].starts_with(pattern.as_slice()))
+            {
+                output.extend_from_slice(b"[REDACTED]");
+                consumed += pattern.len();
+            } else {
+                output.push(self.pending[consumed]);
+                consumed += 1;
+            }
+        }
+        self.pending.drain(..consumed);
+        output
+    }
+}
+
 fn redact(body: &[u8], secret: &[u8]) -> Vec<u8> {
     let mut output = body.to_vec();
     for encoding in credential_encodings(secret) {
@@ -3817,6 +3911,8 @@ mod tests {
             allowed_query_parameters: vec!["source".into()],
             allowed_content_types: vec!["application/json".into()],
             max_body_bytes: 1024,
+            response_mode: crate::config::ProxyResponseMode::Buffered,
+            max_response_bytes: 4 * 1024 * 1024,
         }
     }
 
@@ -4738,6 +4834,39 @@ mod tests {
         );
         assert_eq!(redact(b"c2VjcmV0LXRva2Vu", b"secret-token"), b"[REDACTED]");
         assert_eq!(redact(b"secret%2Btoken", b"secret+token"), b"[REDACTED]");
+    }
+
+    #[test]
+    fn streaming_redaction_catches_credentials_split_across_every_chunk_boundary() {
+        let secret = b"stream+secret";
+        let encoded = STANDARD.encode(secret);
+        let percent = url::form_urlencoded::byte_serialize(secret).collect::<String>();
+        let input = format!("before stream+secret middle {encoded} after {percent}");
+        let mut redactor = StreamingRedactor::new(secret);
+        let mut output = Vec::new();
+        for byte in input.as_bytes() {
+            output.extend(redactor.push(std::slice::from_ref(byte)));
+        }
+        output.extend(redactor.finish());
+
+        assert!(!output.windows(secret.len()).any(|window| window == secret));
+        assert!(
+            !output
+                .windows(encoded.len())
+                .any(|window| window == encoded.as_bytes())
+        );
+        assert!(
+            !output
+                .windows(percent.len())
+                .any(|window| window == percent.as_bytes())
+        );
+        assert_eq!(
+            std::str::from_utf8(&output)
+                .unwrap()
+                .matches("[REDACTED]")
+                .count(),
+            3
+        );
     }
 
     #[test]

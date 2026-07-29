@@ -130,6 +130,12 @@ def main():
     )
     assert destinations["destinations"] == [
         {
+            "name": "openbao-stream",
+            "profile": "openbao-integration",
+            "host": "upstream-stream",
+            "mode": "injecting",
+        },
+        {
             "name": "openbao-upstream",
             "profile": "openbao-integration",
             "host": "upstream-auth",
@@ -285,6 +291,20 @@ def main():
     assert base64.b64encode(b"openbao+ok") not in encoded
     assert b"openbao%2Bok" not in encoded
     assert encoded.count(b"[REDACTED]") == 3
+
+    stream_request = urllib.request.Request(
+        AV_URL + "/v1/proxy/openbao-stream/stream",
+        headers={"Authorization": AUTH, "Accept": "text/event-stream"},
+    )
+    started = time.monotonic()
+    with urllib.request.urlopen(stream_request, timeout=15) as response:
+        first_line = response.readline()
+        first_line_elapsed = time.monotonic() - started
+        streamed = first_line + response.read()
+    assert first_line == b"data: ready\n"
+    assert first_line_elapsed < 0.8
+    assert b"openbao+ok" not in streamed
+    assert b"[REDACTED]" in streamed
     request(
         "/v1/proxy/openbao-upstream/verify?undeclared=value",
         accepted=(403,),

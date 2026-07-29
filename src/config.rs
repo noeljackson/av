@@ -348,6 +348,18 @@ pub struct ProxyRouteConfig {
     pub allowed_content_types: Vec<String>,
     #[serde(default = "default_proxy_max_body_bytes")]
     pub max_body_bytes: usize,
+    #[serde(default)]
+    pub response_mode: ProxyResponseMode,
+    #[serde(default = "default_proxy_max_response_bytes")]
+    pub max_response_bytes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyResponseMode {
+    #[default]
+    Buffered,
+    Streaming,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -695,6 +707,12 @@ impl Config {
             }
             if route.allowed_methods.is_empty() || route.allowed_path_prefixes.is_empty() {
                 bail!("proxy route {name} must constrain both methods and path prefixes");
+            }
+            if route.max_body_bytes == 0 || route.max_body_bytes > 16 * 1024 * 1024 {
+                bail!("proxy route {name} max_body_bytes must be between 1 and 16777216");
+            }
+            if route.max_response_bytes == 0 || route.max_response_bytes > 256 * 1024 * 1024 {
+                bail!("proxy route {name} max_response_bytes must be between 1 and 268435456");
             }
             if route.allowed_methods.iter().any(|method| {
                 !matches!(
@@ -1186,6 +1204,10 @@ fn default_proxy_max_body_bytes() -> usize {
     1024 * 1024
 }
 
+fn default_proxy_max_response_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
 fn default_proxy_session_ttl_seconds() -> u64 {
     5 * 60
 }
@@ -1406,6 +1428,8 @@ mod tests {
                 allowed_query_parameters: vec![],
                 allowed_content_types: vec![],
                 max_body_bytes: default_proxy_max_body_bytes(),
+                response_mode: ProxyResponseMode::Buffered,
+                max_response_bytes: default_proxy_max_response_bytes(),
             },
         );
         assert!(config.validate().is_err());
@@ -1479,6 +1503,8 @@ mod tests {
                 allowed_query_parameters: vec![],
                 allowed_content_types: vec![],
                 max_body_bytes: default_proxy_max_body_bytes(),
+                response_mode: ProxyResponseMode::Buffered,
+                max_response_bytes: default_proxy_max_response_bytes(),
             },
         );
         config.transparent_proxy = Some(TransparentProxyConfig {

@@ -79,6 +79,7 @@ grep --quiet '^openbao-integration' "$workdir/profiles"
 
 run_cli routes >"$workdir/routes"
 grep --quiet $'^openbao-upstream\tinjecting\topenbao-integration\tupstream-auth$' "$workdir/routes"
+grep --quiet $'^openbao-stream\tinjecting\topenbao-integration\tupstream-stream$' "$workdir/routes"
 grep --quiet $'^openbao-x-api\tinjecting\topenbao-integration\tupstream-x-api$' "$workdir/routes"
 if grep --quiet '^ungranted-upstream' "$workdir/routes"; then
   echo "ungranted route was disclosed by CLI discovery" >&2

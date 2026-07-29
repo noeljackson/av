@@ -149,6 +149,7 @@ services:
       connectors:
         aliases:
           - upstream-auth
+          - upstream-stream
           - upstream-x-api
           - upstream-ungranted
 

@@ -272,6 +272,8 @@ mod tests {
             allowed_query_parameters: vec![],
             allowed_content_types: vec![],
             max_body_bytes: 1024,
+            response_mode: crate::config::ProxyResponseMode::Buffered,
+            max_response_bytes: 4 * 1024 * 1024,
         }
     }
 

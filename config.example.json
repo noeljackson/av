@@ -94,7 +94,9 @@
       "allowed_response_headers": ["content-type", "etag", "last-modified", "retry-after"],
       "allowed_query_parameters": ["page", "per_page", "type", "name"],
       "allowed_content_types": ["application/json"],
-      "max_body_bytes": 1048576
+      "max_body_bytes": 1048576,
+      "response_mode": "buffered",
+      "max_response_bytes": 4194304
     }
   },
   "proxy_tunnels": {

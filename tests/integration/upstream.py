@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import quote, urlsplit
 
@@ -21,6 +22,19 @@ class Handler(BaseHTTPRequestHandler):
         if target.path == "/verify":
             status = 200 if authorized and query_preserved and forbidden_headers_absent else 403
             body = b'{"injection":"accepted"}' if status == 200 else b'{"error":"forbidden"}'
+        elif target.path == "/stream" and authorized:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            self.wfile.write(b"data: ready\n\n:" + b"x" * 64 + b"\n\n")
+            self.wfile.flush()
+            time.sleep(1)
+            self.wfile.write(b"data: openbao")
+            self.wfile.flush()
+            time.sleep(0.1)
+            self.wfile.write(b"+ok\n\n")
+            self.wfile.flush()
+            return
         elif target.path == "/x-header":
             api_keys = self.headers.get_all("X-Api-Key") or []
             status = 200 if api_keys == ["openbao+ok"] and forbidden_headers_absent else 403
