@@ -36,7 +36,8 @@ use hyper_util::rt::TokioIo;
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use tokio::{
-    net::{TcpListener, TcpStream},
+    io::{AsyncRead, AsyncWrite},
+    net::TcpListener,
     sync::{Mutex, Semaphore},
     time::Instant,
 };
@@ -63,6 +64,7 @@ use crate::{
     transparent_proxy::{
         TransparentRouteCatalog, authorize_connect_request, mint_proxy_session_credential,
     },
+    transport_tls::ReloadingTransportTls,
 };
 
 #[derive(Clone)]
@@ -84,6 +86,7 @@ struct TransparentProxyRuntime {
     session_ttl: Duration,
     catalog: TransparentRouteCatalog,
     certificate_authority: ProxyCertificateAuthority,
+    transport_tls: ReloadingTransportTls,
 }
 
 const GITHUB_AUTHORIZATION_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
@@ -1123,6 +1126,10 @@ pub async fn run(config: Config) -> Result<()> {
                     std::path::Path::new(&proxy.ca_certificate_file),
                     std::path::Path::new(&proxy.ca_private_key_file),
                 )?,
+                transport_tls: ReloadingTransportTls::load(
+                    std::path::Path::new(&proxy.transport_tls_certificate_file),
+                    std::path::Path::new(&proxy.transport_tls_private_key_file),
+                )?,
             }))
         })
         .transpose()?;
@@ -1919,6 +1926,17 @@ async fn run_transparent_proxy_listener(
         let state = state.clone();
         let runtime = runtime.clone();
         tokio::spawn(async move {
+            let (acceptor, reload_error) = runtime.transport_tls.acceptor();
+            if let Some(error) = reload_error {
+                tracing::warn!(%error, "retain last valid transparent proxy transport certificate");
+            }
+            let stream = match acceptor.accept(stream).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::debug!(%peer, %error, "transparent proxy transport TLS rejected");
+                    return;
+                }
+            };
             if let Err(error) = serve_transparent_proxy_connection(stream, state, runtime).await {
                 tracing::debug!(%peer, %error, "transparent proxy connection ended");
             }
@@ -1927,7 +1945,7 @@ async fn run_transparent_proxy_listener(
 }
 
 async fn serve_transparent_proxy_connection(
-    stream: TcpStream,
+    stream: impl AsyncRead + AsyncWrite + Unpin + Send + 'static,
     state: AppState,
     runtime: Arc<TransparentProxyRuntime>,
 ) -> Result<()> {
@@ -2772,10 +2790,15 @@ mod tests {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair, KeyUsagePurpose};
     use rustls::{
         ClientConfig, RootCertStore, ServerConfig,
-        pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName},
+        pki_types::{
+            CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, pem::PemObject,
+        },
     };
     use std::{collections::BTreeMap, sync::Arc};
-    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+        net::TcpStream,
+    };
     use tokio_rustls::{TlsAcceptor, TlsConnector};
 
     fn proxy_route(methods: &[&str], prefixes: &[&str]) -> ProxyRouteConfig {
@@ -2847,6 +2870,15 @@ mod tests {
         let ca_private_key_file = directory.path().join("ca.key");
         std::fs::write(&ca_certificate_file, ca_cert.pem()).unwrap();
         std::fs::write(&ca_private_key_file, ca_key.serialize_pem()).unwrap();
+        let transport_key = KeyPair::generate().unwrap();
+        let transport_certificate = CertificateParams::new(vec!["av.example.test".into()])
+            .unwrap()
+            .self_signed(&transport_key)
+            .unwrap();
+        let transport_certificate_file = directory.path().join("transport.crt");
+        let transport_private_key_file = directory.path().join("transport.key");
+        std::fs::write(&transport_certificate_file, transport_certificate.pem()).unwrap();
+        std::fs::write(&transport_private_key_file, transport_key.serialize_pem()).unwrap();
 
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -2887,7 +2919,9 @@ mod tests {
             proxy_routes: routes.clone(),
             transparent_proxy: Some(TransparentProxyConfig {
                 listen: "127.0.0.1:0".into(),
-                proxy_url: "http://127.0.0.1:1".into(),
+                proxy_url: "https://av.example.test:14323".into(),
+                transport_tls_certificate_file: transport_certificate_file.display().to_string(),
+                transport_tls_private_key_file: transport_private_key_file.display().to_string(),
                 ca_certificate_file: ca_certificate_file.display().to_string(),
                 ca_private_key_file: ca_private_key_file.display().to_string(),
                 session_ttl_seconds: 60,
@@ -2911,12 +2945,17 @@ mod tests {
         };
         let runtime = Arc::new(TransparentProxyRuntime {
             listen: "127.0.0.1:0".into(),
-            proxy_url: "http://127.0.0.1:1".into(),
+            proxy_url: "https://av.example.test:14323".into(),
             session_ttl: Duration::from_secs(60),
             catalog: TransparentRouteCatalog::from_proxy_routes(&routes).unwrap(),
             certificate_authority: ProxyCertificateAuthority::load(
                 &ca_certificate_file,
                 &ca_private_key_file,
+            )
+            .unwrap(),
+            transport_tls: ReloadingTransportTls::load(
+                &transport_certificate_file,
+                &transport_private_key_file,
             )
             .unwrap(),
         });
@@ -2936,7 +2975,11 @@ mod tests {
         (TcpStream::connect(address).await.unwrap(), task)
     }
 
-    async fn raw_connect(stream: &mut TcpStream, authority: &str, token: &str) -> Vec<u8> {
+    async fn raw_connect(
+        stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+        authority: &str,
+        token: &str,
+    ) -> Vec<u8> {
         stream
             .write_all(
                 format!(
@@ -2956,6 +2999,60 @@ mod tests {
                 return response;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn network_proxy_listener_requires_verified_transport_tls() {
+        let (state, runtime, _store, _token, _ca_der) = transparent_test_context().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(run_transparent_proxy_listener(
+            listener,
+            state.clone(),
+            runtime,
+        ));
+
+        let mut plaintext = TcpStream::connect(address).await.unwrap();
+        plaintext
+            .write_all(b"CONNECT api.example.com:443 HTTP/1.1\r\nHost: api.example.com:443\r\n\r\n")
+            .await
+            .unwrap();
+        let mut rejected = [0_u8; 1];
+        match tokio::time::timeout(Duration::from_secs(1), plaintext.read(&mut rejected)).await {
+            Ok(Ok(0)) => {}
+            Ok(Ok(1)) => assert_ne!(rejected[0], b'H'),
+            Ok(Ok(_)) => unreachable!("one-byte read returned more than one byte"),
+            Ok(Err(_)) | Err(_) => {}
+        }
+
+        let transport_path = std::path::Path::new(
+            &state
+                .config
+                .transparent_proxy
+                .as_ref()
+                .unwrap()
+                .transport_tls_certificate_file,
+        );
+        let transport_pem = std::fs::read(transport_path).unwrap();
+        let transport_certificate = CertificateDer::from_pem_slice(&transport_pem).unwrap();
+        let mut roots = RootCertStore::empty();
+        roots.add(transport_certificate).unwrap();
+        let connector = TlsConnector::from(Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        ));
+        let stream = TcpStream::connect(address).await.unwrap();
+        let mut stream = connector
+            .connect(ServerName::try_from("av.example.test").unwrap(), stream)
+            .await
+            .unwrap();
+        assert!(
+            raw_connect(&mut stream, "api.example.com:443", "invalid")
+                .await
+                .starts_with(b"HTTP/1.1 407")
+        );
+        task.abort();
     }
 
     async fn read_test_http_header<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {

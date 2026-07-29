@@ -18,17 +18,22 @@ use av::{
         ProfileEnvironment, ProxySessionLease, RevokeProxySessionRequest,
     },
     config::{AuthConfig, AuthMode, Config, ConfigMode, ManagedConfig, OidcSigningAlgorithm},
-    keyring, server,
+    keyring,
+    proxy_ca::install_rustls_provider,
+    server,
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use clap::{CommandFactory, Parser, Subcommand};
 use reqwest::{Client, StatusCode, header};
+use rustls::pki_types::{CertificateDer, pem::PemObject};
+use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
 };
+use tokio_rustls::TlsConnector;
 use tracing_subscriber::EnvFilter;
 use url::Url;
 use zeroize::Zeroizing;
@@ -564,9 +569,57 @@ async fn start_loopback_proxy(
     SocketAddr,
     impl std::future::Future<Output = Result<()>> + use<>,
 )> {
+    let transport_tls = transport_client_config()?;
+    start_loopback_proxy_with_tls(remote_proxy_url, token, transport_tls).await
+}
+
+fn transport_client_config() -> Result<std::sync::Arc<ClientConfig>> {
+    install_rustls_provider()?;
+    let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    if let Some(path) = std::env::var_os("AV_PROXY_TRANSPORT_CA_FILE") {
+        let path = PathBuf::from(path);
+        if !path.is_absolute() {
+            bail!("AV_PROXY_TRANSPORT_CA_FILE must be an absolute path");
+        }
+        let pem = fs::read(&path)
+            .with_context(|| format!("read proxy transport CA certificate {}", path.display()))?;
+        if pem.len() > 256 * 1024 {
+            bail!("proxy transport CA certificate is too large");
+        }
+        let certificates = CertificateDer::pem_slice_iter(&pem)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("parse proxy transport CA certificate")?;
+        if certificates.is_empty() {
+            bail!("proxy transport CA certificate is empty");
+        }
+        for certificate in certificates {
+            roots
+                .add(certificate)
+                .context("proxy transport CA certificate is invalid")?;
+        }
+    }
+    Ok(std::sync::Arc::new(
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    ))
+}
+
+async fn start_loopback_proxy_with_tls(
+    remote_proxy_url: &str,
+    token: Zeroizing<String>,
+    transport_tls: std::sync::Arc<ClientConfig>,
+) -> Result<(
+    watch::Sender<bool>,
+    SocketAddr,
+    impl std::future::Future<Output = Result<()>> + use<>,
+)> {
     let remote = Url::parse(remote_proxy_url).context("proxy session has an invalid proxy URL")?;
-    if remote.scheme() != "http"
+    if remote.scheme() != "https"
         || remote.host_str().is_none()
+        || remote
+            .host_str()
+            .is_some_and(|host| host.parse::<std::net::IpAddr>().is_ok())
         || remote.port().is_none()
         || remote.username() != ""
         || remote.password().is_some()
@@ -577,6 +630,8 @@ async fn start_loopback_proxy(
         bail!("proxy session has an unsafe proxy URL");
     }
     let remote_host = remote.host_str().expect("checked host");
+    let remote_server_name = ServerName::try_from(remote_host.to_owned())
+        .context("proxy session has an invalid DNS name")?;
     let remote_address = if remote_host.parse::<std::net::Ipv6Addr>().is_ok() {
         format!("[{remote_host}]:{}", remote.port().expect("checked port"))
     } else {
@@ -599,10 +654,19 @@ async fn start_loopback_proxy(
                 accepted = listener.accept() => {
                     let (stream, _) = accepted.context("accept local proxy client")?;
                     let remote_address = remote_address.clone();
+                    let remote_server_name = remote_server_name.clone();
+                    let transport_tls = transport_tls.clone();
                     let token = token.clone();
                     let stopped = stopped.clone();
                     tokio::spawn(async move {
-                        if let Err(error) = proxy_local_connection(stream, &remote_address, token, stopped).await {
+                        if let Err(error) = proxy_local_connection(
+                            stream,
+                            &remote_address,
+                            remote_server_name,
+                            transport_tls,
+                            token,
+                            stopped,
+                        ).await {
                             tracing::debug!(%error, "local proxy helper connection ended");
                         }
                     });
@@ -616,14 +680,20 @@ async fn start_loopback_proxy(
 async fn proxy_local_connection(
     mut client: TcpStream,
     remote_address: &str,
+    remote_server_name: ServerName<'static>,
+    transport_tls: std::sync::Arc<ClientConfig>,
     token: std::sync::Arc<Zeroizing<String>>,
     mut stopped: watch::Receiver<bool>,
 ) -> Result<()> {
     let (header, remaining) = read_proxy_header(&mut client).await?;
     let rewritten = inject_proxy_authorization(&header, token.as_str())?;
-    let mut remote = TcpStream::connect(remote_address)
+    let remote = TcpStream::connect(remote_address)
         .await
         .context("connect private AV proxy")?;
+    let mut remote = TlsConnector::from(transport_tls)
+        .connect(remote_server_name, remote)
+        .await
+        .context("verify private AV proxy transport TLS")?;
     remote.write_all(&rewritten).await?;
     let (response, remote_remaining) = read_proxy_header(&mut remote).await?;
     client.write_all(&response).await?;
@@ -647,7 +717,7 @@ async fn proxy_local_connection(
     Ok(())
 }
 
-async fn read_proxy_header(stream: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>)> {
+async fn read_proxy_header(stream: &mut (impl AsyncRead + Unpin)) -> Result<(Vec<u8>, Vec<u8>)> {
     const MAX_PROXY_HEADER: usize = 16 * 1024;
     let mut bytes = Vec::new();
     let mut chunk = [0_u8; 2048];
@@ -781,6 +851,7 @@ fn proxy_child_command(
         .env_remove("AV_TOKEN")
         .env_remove("AV_BASIC_USER")
         .env_remove("AV_BASIC_PASSWORD")
+        .env_remove("AV_PROXY_TRANSPORT_CA_FILE")
         .env_remove("NO_PROXY")
         .env_remove("no_proxy")
         .env_remove("ALL_PROXY")
@@ -804,7 +875,8 @@ fn profile_command(
         .envs(secrets)
         .env_remove("AV_TOKEN")
         .env_remove("AV_BASIC_USER")
-        .env_remove("AV_BASIC_PASSWORD");
+        .env_remove("AV_BASIC_PASSWORD")
+        .env_remove("AV_PROXY_TRANSPORT_CA_FILE");
     command
 }
 
@@ -1006,6 +1078,7 @@ mod tests {
             "AV_TOKEN",
             "AV_BASIC_USER",
             "AV_BASIC_PASSWORD",
+            "AV_PROXY_TRANSPORT_CA_FILE",
             "NO_PROXY",
             "no_proxy",
             "ALL_PROXY",
@@ -1047,11 +1120,43 @@ mod tests {
 
     #[tokio::test]
     async fn local_helper_forwards_only_its_opaque_session_credential() {
+        install_rustls_provider().unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let certificate = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let server_tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![rustls::pki_types::CertificateDer::from(
+                    certificate.der().to_vec(),
+                )],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(
+                    rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()),
+                ),
+            )
+            .unwrap();
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                certificate.der().to_vec(),
+            ))
+            .unwrap();
+        let client_tls = std::sync::Arc::new(
+            ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
         let remote_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let remote_address = remote_listener.local_addr().unwrap();
         let (header_sent, header_received) = tokio::sync::oneshot::channel();
         let remote_task = tokio::spawn(async move {
-            let (mut remote, _) = remote_listener.accept().await.unwrap();
+            let (remote, _) = remote_listener.accept().await.unwrap();
+            let mut remote = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(server_tls))
+                .accept(remote)
+                .await
+                .unwrap();
             let (header, _) = read_proxy_header(&mut remote).await.unwrap();
             header_sent.send(header).unwrap();
             remote
@@ -1061,9 +1166,10 @@ mod tests {
                 .await
                 .unwrap();
         });
-        let (shutdown, local_address, local_helper) = start_loopback_proxy(
-            &format!("http://{remote_address}"),
+        let (shutdown, local_address, local_helper) = start_loopback_proxy_with_tls(
+            &format!("https://localhost:{}", remote_address.port()),
             Zeroizing::new("opaque-test-session".to_owned()),
+            client_tls,
         )
         .await
         .unwrap();

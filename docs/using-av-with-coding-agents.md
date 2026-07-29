@@ -104,8 +104,11 @@ av run orchard-dev -- claude
 
 The child receives `HTTP_PROXY` and `HTTPS_PROXY` pointed only at a loopback
 helper plus the deployment CA certificate. It does not receive AV's remote
-session capability or a provider credential. The helper mints one short-lived,
-revocable session and removes it when the child exits.
+session capability or a provider credential. The helper validates the remote
+AV proxy's HTTPS certificate before sending that capability, mints one
+short-lived, revocable session, and removes it when the child exits. The remote
+proxy URL itself must be an HTTPS DNS origin; only the process-local loopback
+helper is HTTP.
 
 This still is not permission for arbitrary egress. AV accepts only configured
 HTTPS hosts, maps each to one immutable named route, and applies that route's

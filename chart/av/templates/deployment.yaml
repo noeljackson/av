@@ -80,8 +80,11 @@ spec:
               readOnly: true
             {{- end }}
             {{- if .Values.transparentProxy.enabled }}
+            - name: transparent-proxy-transport
+              mountPath: /var/run/av/transparent-proxy-transport
+              readOnly: true
             - name: transparent-proxy-ca
-              mountPath: /var/run/av/transparent-proxy
+              mountPath: /var/run/av/transparent-proxy-ca
               readOnly: true
             {{- end }}
       volumes:
@@ -104,6 +107,14 @@ spec:
             secretName: {{ .secretName }}
         {{- end }}
         {{- if .Values.transparentProxy.enabled }}
+        - name: transparent-proxy-transport
+          secret:
+            secretName: {{ required "transparentProxy.transportTlsSecret.name is required when transparentProxy.enabled" .Values.transparentProxy.transportTlsSecret.name }}
+            items:
+              - key: {{ .Values.transparentProxy.transportTlsSecret.certificateKey }}
+                path: tls.crt
+              - key: {{ .Values.transparentProxy.transportTlsSecret.privateKeyKey }}
+                path: tls.key
         - name: transparent-proxy-ca
           secret:
             secretName: {{ required "transparentProxy.caSecret.name is required when transparentProxy.enabled" .Values.transparentProxy.caSecret.name }}

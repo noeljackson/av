@@ -1,6 +1,6 @@
 [package]
 name = "av"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 description = "Stateless OIDC-authenticated credential connector and policy proxy"
@@ -36,6 +36,7 @@ tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt", "json"] }
 rustls = "=0.23.42"
 url = "=2.5.8"
+webpki-roots = "=1.0.9"
 zeroize = "=1.9.0"
 
 [build-dependencies]
