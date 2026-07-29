@@ -124,8 +124,20 @@ therefore remain narrow.
 7. AV sends the request to the fixed HTTPS upstream, redacts any echoed
    credential, returns only permitted response headers, and records the policy
    decision and status.
-8. When the command exits, the helper terminates and AV revokes the session.
-   Expiry and explicit revocation are independent backstops.
+8. While the child remains alive, the helper renews the same capability before
+   each five-minute sliding expiry. Renewal rechecks the original subject and
+   live proxy grant and cannot extend beyond the deployment's absolute session
+   lifetime.
+9. When the command exits, the helper terminates and AV revokes the session.
+   If renewal fails, the helper closes and the child is terminated. Expiry and
+   explicit revocation remain independent backstops.
+
+The defaults are a five-minute sliding TTL and an eight-hour absolute lifetime.
+Helm exposes these as `transparentProxy.sessionTtlSeconds` and
+`transparentProxy.sessionMaxLifetimeSeconds`. Shorter TTLs reduce revocation
+latency during tests; longer than one hour is rejected for a sliding window,
+and the absolute lifetime cannot exceed 24 hours. Starting a new child always
+creates a new independently audited session and capability.
 
 The proxy must reject HTTP `CONNECT` for a non-catalog host before attempting
 DNS resolution or a TCP connection. It must not follow redirects across hosts,
@@ -184,6 +196,9 @@ particular, it must reject traversal encodings, duplicate query parameters,
 hop-by-hop headers, `Proxy-Authorization` forwarding, cross-host redirects,
 and undeclared CRUD methods. A configured `Authorization` injection always
 overwrites the caller's `Authorization`; it never appends a second value.
+Only routes whose fixed origin is standard HTTPS on port 443 are eligible for
+transparent interception. Other explicit named routes remain usable through
+`/v1/proxy/<route>/...` but are absent from the CONNECT destination catalog.
 
 One host maps to exactly one injecting route or credentialless tunnel.
 Configuration validation rejects overlaps rather than choosing from decrypted

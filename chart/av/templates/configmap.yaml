@@ -36,7 +36,7 @@
 {{- $caSecretName := required "transparentProxy.caSecret.name is required when transparentProxy.enabled" .Values.transparentProxy.caSecret.name -}}
 {{- $_ := $transportTlsSecretName -}}
 {{- $_ := $caSecretName -}}
-{{- $_ := set $config "transparent_proxy" (dict "listen" (printf "0.0.0.0:%v" .Values.transparentProxy.port) "proxy_url" $proxyURL "transport_tls_certificate_file" "/var/run/av/transparent-proxy-transport/tls.crt" "transport_tls_private_key_file" "/var/run/av/transparent-proxy-transport/tls.key" "ca_certificate_file" "/var/run/av/transparent-proxy-ca/ca.crt" "ca_private_key_file" "/var/run/av/transparent-proxy-ca/ca.key") -}}
+{{- $_ := set $config "transparent_proxy" (dict "listen" (printf "0.0.0.0:%v" .Values.transparentProxy.port) "proxy_url" $proxyURL "transport_tls_certificate_file" "/var/run/av/transparent-proxy-transport/tls.crt" "transport_tls_private_key_file" "/var/run/av/transparent-proxy-transport/tls.key" "ca_certificate_file" "/var/run/av/transparent-proxy-ca/ca.crt" "ca_private_key_file" "/var/run/av/transparent-proxy-ca/ca.key" "session_ttl_seconds" .Values.transparentProxy.sessionTtlSeconds "session_max_lifetime_seconds" .Values.transparentProxy.sessionMaxLifetimeSeconds) -}}
 {{- else -}}
 {{- $_ := unset $config "transparent_proxy" -}}
 {{- end -}}

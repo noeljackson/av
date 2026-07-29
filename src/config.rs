@@ -382,6 +382,11 @@ pub struct TransparentProxyConfig {
     pub ca_private_key_file: String,
     #[serde(default = "default_proxy_session_ttl_seconds")]
     pub session_ttl_seconds: u64,
+    /// Hard ceiling for one helper session, even when sliding renewal remains
+    /// healthy. A new child process receives a new independently audited
+    /// session.
+    #[serde(default = "default_proxy_session_max_lifetime_seconds")]
+    pub session_max_lifetime_seconds: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1042,16 +1047,26 @@ fn validate_transparent_proxy(config: &Config, proxy: &TransparentProxyConfig) -
     {
         bail!("transparent proxy CA and transport TLS files must use four distinct absolute paths");
     }
-    if !(60..=3600).contains(&proxy.session_ttl_seconds) {
-        bail!("transparent proxy session_ttl_seconds must be between 60 and 3600");
+    if !(5..=3600).contains(&proxy.session_ttl_seconds) {
+        bail!("transparent proxy session_ttl_seconds must be between 5 and 3600");
+    }
+    if proxy.session_max_lifetime_seconds < proxy.session_ttl_seconds
+        || proxy.session_max_lifetime_seconds > 24 * 60 * 60
+    {
+        bail!(
+            "transparent proxy session_max_lifetime_seconds must be at least the session TTL and at most 86400"
+        );
     }
     if config.proxy_routes.is_empty() && config.proxy_tunnels.is_empty() {
         bail!("transparent_proxy requires at least one immutable proxy route or tunnel");
     }
-    crate::transparent_proxy::TransparentRouteCatalog::from_config(
+    let catalog = crate::transparent_proxy::TransparentRouteCatalog::from_config(
         &config.proxy_routes,
         &config.proxy_tunnels,
     )?;
+    if catalog.is_empty() {
+        bail!("transparent_proxy has no eligible HTTPS route or credentialless tunnel");
+    }
     Ok(())
 }
 
@@ -1172,7 +1187,11 @@ fn default_proxy_max_body_bytes() -> usize {
 }
 
 fn default_proxy_session_ttl_seconds() -> u64 {
-    15 * 60
+    5 * 60
+}
+
+fn default_proxy_session_max_lifetime_seconds() -> u64 {
+    8 * 60 * 60
 }
 
 fn valid_github_organization(organization: &str) -> bool {
@@ -1470,6 +1489,7 @@ mod tests {
             ca_certificate_file: "/run/av/proxy/ca.crt".into(),
             ca_private_key_file: "/run/av/proxy/ca.key".into(),
             session_ttl_seconds: 900,
+            session_max_lifetime_seconds: 8 * 60 * 60,
         });
         assert!(config.validate().is_ok());
         config.proxy_tunnels.insert(
@@ -1533,13 +1553,13 @@ mod tests {
             .transparent_proxy
             .as_mut()
             .unwrap()
-            .session_ttl_seconds = 30;
+            .session_ttl_seconds = 3;
         assert!(
             config
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("between 60 and 3600")
+                .contains("between 5 and 3600")
         );
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
     }

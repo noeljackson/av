@@ -108,11 +108,11 @@ impl TransparentRouteCatalog {
         for (route_name, route) in routes {
             let url = Url::parse(&route.base_url)
                 .with_context(|| format!("parse proxy route {route_name} base URL"))?;
-            if url.scheme() != "https" {
-                bail!("transparent proxy route {route_name} must use HTTPS");
-            }
-            if url.port_or_known_default() != Some(443) {
-                bail!("transparent proxy route {route_name} must use the default HTTPS port 443");
+            // Named routes may deliberately target a nonstandard or
+            // integration-only origin. They remain available through the
+            // explicit route API but are not eligible for transparent MITM.
+            if url.scheme() != "https" || url.port_or_known_default() != Some(443) {
+                continue;
             }
             let host =
                 canonical_dns_host(url.host_str().with_context(|| {
@@ -338,9 +338,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_nonstandard_ports_and_ip_literal_route_hosts() {
-        let port_error = catalog(&[("provider", "https://api.example.test:8443")]).unwrap_err();
-        assert!(port_error.to_string().contains("port 443"));
+    fn excludes_nonstandard_routes_and_rejects_ip_literal_route_hosts() {
+        let nonstandard = catalog(&[("provider", "https://api.example.test:8443")]).unwrap();
+        assert!(nonstandard.is_empty());
 
         let ip_error = catalog(&[("provider", "https://192.0.2.10")]).unwrap_err();
         assert!(ip_error.to_string().contains("not IP literals"));

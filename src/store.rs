@@ -1082,6 +1082,7 @@ impl Store {
         subject: &str,
         profile: &str,
         expires_unix_seconds: i64,
+        maximum_expires_unix_seconds: i64,
     ) -> Result<()> {
         validate_proxy_session(
             session_id,
@@ -1089,10 +1090,12 @@ impl Store {
             subject,
             profile,
             expires_unix_seconds,
+            maximum_expires_unix_seconds,
         )?;
         match self {
             Self::Postgres(database) => {
                 let pool = database.pool();
+                let mut transaction = pool.begin().await?;
                 sqlx::query(
                     "INSERT INTO av_proxy_sessions \
                      (session_id, token_hash, subject, profile, expires_unix_seconds, revoked) \
@@ -1103,11 +1106,22 @@ impl Store {
                 .bind(subject)
                 .bind(profile)
                 .bind(expires_unix_seconds)
-                .execute(&pool)
+                .execute(&mut *transaction)
                 .await
                 .context("write proxy session")?;
+                sqlx::query(
+                    "INSERT INTO av_proxy_session_bounds \
+                     (session_id, maximum_expires_unix_seconds) VALUES ($1, $2)",
+                )
+                .bind(session_id)
+                .bind(maximum_expires_unix_seconds)
+                .execute(&mut *transaction)
+                .await
+                .context("write proxy session bound")?;
+                transaction.commit().await?;
             }
             Self::Sqlite(pool) => {
+                let mut transaction = pool.begin().await?;
                 sqlx::query(
                     "INSERT INTO av_proxy_sessions \
                      (session_id, token_hash, subject, profile, expires_unix_seconds, revoked) \
@@ -1118,9 +1132,19 @@ impl Store {
                 .bind(subject)
                 .bind(profile)
                 .bind(expires_unix_seconds)
-                .execute(pool)
+                .execute(&mut *transaction)
                 .await
                 .context("write proxy session")?;
+                sqlx::query(
+                    "INSERT INTO av_proxy_session_bounds \
+                     (session_id, maximum_expires_unix_seconds) VALUES (?, ?)",
+                )
+                .bind(session_id)
+                .bind(maximum_expires_unix_seconds)
+                .execute(&mut *transaction)
+                .await
+                .context("write proxy session bound")?;
+                transaction.commit().await?;
             }
         }
         Ok(())
@@ -1153,6 +1177,89 @@ impl Store {
                  WHERE token_hash = ? AND revoked = FALSE AND expires_unix_seconds > ?",
                 )
                 .bind(token_hash)
+                .bind(now)
+                .fetch_optional(pool)
+                .await?
+            }
+        };
+        Ok(row.map(
+            |(session_id, subject, profile, expires_unix_seconds)| ProxySession {
+                session_id,
+                subject,
+                profile,
+                expires_unix_seconds,
+            },
+        ))
+    }
+
+    /// Extend one live session without changing its bearer capability. The
+    /// caller is bound to the original subject, and the database-enforced
+    /// absolute expiry cannot be exceeded.
+    pub async fn renew_proxy_session_for_subject(
+        &self,
+        session_id: &str,
+        subject: &str,
+        requested_expires_unix_seconds: i64,
+    ) -> Result<Option<ProxySession>> {
+        if session_id.is_empty()
+            || subject.is_empty()
+            || session_id.len() > 256
+            || subject.len() > 1024
+            || session_id.chars().any(char::is_control)
+            || subject.chars().any(char::is_control)
+        {
+            bail!("proxy session identity is invalid");
+        }
+        let now = now_unix_seconds()?;
+        if requested_expires_unix_seconds <= now {
+            bail!("proxy session renewal expiry must be in the future");
+        }
+        let row: Option<ProxySessionRow> = match self {
+            Self::Postgres(database) => {
+                let pool = database.pool();
+                sqlx::query_as(
+                    "UPDATE av_proxy_sessions AS sessions \
+                     SET expires_unix_seconds = LEAST($3, bounds.maximum_expires_unix_seconds) \
+                     FROM av_proxy_session_bounds AS bounds \
+                     WHERE sessions.session_id = $1 \
+                       AND sessions.subject = $2 \
+                       AND sessions.revoked = FALSE \
+                       AND sessions.expires_unix_seconds > $4 \
+                       AND bounds.session_id = sessions.session_id \
+                       AND bounds.maximum_expires_unix_seconds > $4 \
+                     RETURNING sessions.session_id, sessions.subject, sessions.profile, \
+                               sessions.expires_unix_seconds",
+                )
+                .bind(session_id)
+                .bind(subject)
+                .bind(requested_expires_unix_seconds)
+                .bind(now)
+                .fetch_optional(&pool)
+                .await?
+            }
+            Self::Sqlite(pool) => {
+                sqlx::query_as(
+                    "UPDATE av_proxy_sessions \
+                     SET expires_unix_seconds = MIN(?, (\
+                         SELECT maximum_expires_unix_seconds \
+                         FROM av_proxy_session_bounds \
+                         WHERE session_id = av_proxy_sessions.session_id\
+                     )) \
+                     WHERE session_id = ? \
+                       AND subject = ? \
+                       AND revoked = FALSE \
+                       AND expires_unix_seconds > ? \
+                       AND EXISTS (\
+                         SELECT 1 FROM av_proxy_session_bounds \
+                         WHERE session_id = av_proxy_sessions.session_id \
+                           AND maximum_expires_unix_seconds > ?\
+                       ) \
+                     RETURNING session_id, subject, profile, expires_unix_seconds",
+                )
+                .bind(requested_expires_unix_seconds)
+                .bind(session_id)
+                .bind(subject)
+                .bind(now)
                 .bind(now)
                 .fetch_optional(pool)
                 .await?
@@ -1304,6 +1411,10 @@ impl Store {
         )";
         const CREATE_PROXY_SESSIONS_TOKEN_INDEX: &str = "CREATE INDEX IF NOT EXISTS av_proxy_sessions_token_idx \
             ON av_proxy_sessions (token_hash)";
+        const CREATE_PROXY_SESSION_BOUNDS: &str = "CREATE TABLE IF NOT EXISTS av_proxy_session_bounds (\
+                session_id TEXT PRIMARY KEY,\
+                maximum_expires_unix_seconds BIGINT NOT NULL\
+            )";
         match self {
             Self::Postgres(database) => {
                 let pool = database.pool();
@@ -1324,6 +1435,9 @@ impl Store {
                 sqlx::query(CREATE_PROXY_SESSIONS_TOKEN_INDEX)
                     .execute(&pool)
                     .await?;
+                sqlx::query(CREATE_PROXY_SESSION_BOUNDS)
+                    .execute(&pool)
+                    .await?;
             }
             Self::Sqlite(pool) => {
                 sqlx::query(CREATE_OWNERS).execute(pool).await?;
@@ -1341,6 +1455,9 @@ impl Store {
                     .execute(pool)
                     .await?;
                 sqlx::query(CREATE_PROXY_SESSIONS_TOKEN_INDEX)
+                    .execute(pool)
+                    .await?;
+                sqlx::query(CREATE_PROXY_SESSION_BOUNDS)
                     .execute(pool)
                     .await?;
             }
@@ -1538,6 +1655,7 @@ fn validate_proxy_session(
     subject: &str,
     profile: &str,
     expires_unix_seconds: i64,
+    maximum_expires_unix_seconds: i64,
 ) -> Result<()> {
     if session_id.is_empty()
         || subject.is_empty()
@@ -1556,6 +1674,9 @@ fn validate_proxy_session(
     }
     if expires_unix_seconds <= now_unix_seconds()? {
         bail!("proxy session expiry must be in the future");
+    }
+    if maximum_expires_unix_seconds < expires_unix_seconds {
+        bail!("proxy session maximum expiry must not precede its sliding expiry");
     }
     Ok(())
 }
@@ -1759,6 +1880,7 @@ mod tests {
                 "agent:builder",
                 "example",
                 expiry,
+                expiry + 60,
             )
             .await
             .unwrap();
@@ -1899,6 +2021,7 @@ mod tests {
                 "oidc:developer",
                 "example-dev",
                 expiry,
+                expiry + 60,
             )
             .await
             .unwrap();
@@ -1911,6 +2034,31 @@ mod tests {
                 expires_unix_seconds: expiry,
             })
         );
+        assert!(
+            store
+                .renew_proxy_session_for_subject("session-1", "oidc:other", expiry + 30)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .renew_proxy_session_for_subject("session-1", "oidc:developer", expiry + 30)
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_unix_seconds,
+            expiry + 30
+        );
+        assert_eq!(
+            store
+                .renew_proxy_session_for_subject("session-1", "oidc:developer", expiry + 600)
+                .await
+                .unwrap()
+                .unwrap()
+                .expires_unix_seconds,
+            expiry + 60
+        );
         assert!(store.revoke_proxy_session("session-1").await.unwrap());
         assert!(!store.revoke_proxy_session("session-1").await.unwrap());
         assert!(
@@ -1922,13 +2070,15 @@ mod tests {
         );
 
         let owned_hash = [6_u8; 32];
+        let owned_expiry = now_unix_seconds().unwrap() + 60;
         store
             .create_proxy_session(
                 "owned-session",
                 &owned_hash,
                 "oidc:developer",
                 "example-dev",
-                now_unix_seconds().unwrap() + 60,
+                owned_expiry,
+                owned_expiry + 60,
             )
             .await
             .unwrap();
@@ -1946,26 +2096,30 @@ mod tests {
         );
 
         let expired_hash = [8_u8; 32];
+        let expired = now_unix_seconds().unwrap();
         let error = store
             .create_proxy_session(
                 "expired-session",
                 &expired_hash,
                 "oidc:developer",
                 "example-dev",
-                now_unix_seconds().unwrap(),
+                expired,
+                expired + 60,
             )
             .await
             .unwrap_err();
         assert!(error.to_string().contains("expiry must be in the future"));
 
         let invalid_hash = [9_u8; 31];
+        let invalid_expiry = now_unix_seconds().unwrap() + 60;
         let error = store
             .create_proxy_session(
                 "invalid-hash",
                 &invalid_hash,
                 "oidc:developer",
                 "example-dev",
-                now_unix_seconds().unwrap() + 60,
+                invalid_expiry,
+                invalid_expiry + 60,
             )
             .await
             .unwrap_err();

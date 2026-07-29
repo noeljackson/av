@@ -32,6 +32,8 @@ transparentProxy:
   enabled: false
   port: 14323
   proxyUrl: ""
+  sessionTtlSeconds: 300
+  sessionMaxLifetimeSeconds: 28800
   transportTlsSecret:
     name: ""
     certificateKey: tls.crt

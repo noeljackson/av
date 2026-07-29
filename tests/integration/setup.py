@@ -345,7 +345,7 @@ def write_config(project_id, environment):
         "proxy_routes": {
             "openbao-upstream": {
                 "profile": "openbao-integration",
-                "base_url": "http://upstream:8081",
+                "base_url": "http://upstream-auth:8081",
                 "secret_key": "OPENBAO_MARKER",
                 "header": "Authorization",
                 "header_prefix": "Bearer ",
@@ -359,7 +359,7 @@ def write_config(project_id, environment):
             },
             "openbao-x-api": {
                 "profile": "openbao-integration",
-                "base_url": "http://upstream:8081",
+                "base_url": "http://upstream-x-api:8081",
                 "secret_key": "OPENBAO_MARKER",
                 "header": "X-Api-Key",
                 "header_prefix": "",
@@ -373,7 +373,7 @@ def write_config(project_id, environment):
             },
             "ungranted-upstream": {
                 "profile": "ungranted-integration",
-                "base_url": "http://upstream:8081",
+                "base_url": "http://upstream-ungranted:8081",
                 "secret_key": "OPENBAO_MARKER",
                 "header": "Authorization",
                 "header_prefix": "Bearer ",
@@ -385,6 +385,23 @@ def write_config(project_id, environment):
                 "allowed_content_types": [],
                 "max_body_bytes": 1024,
             },
+        },
+        "proxy_tunnels": {
+            "ungranted-session-fixture": {
+                "profile": "ungranted-integration",
+                "host": "example.com",
+                "allow_private_ips": False,
+            }
+        },
+        "transparent_proxy": {
+            "listen": "0.0.0.0:14323",
+            "proxy_url": "https://localhost:14323",
+            "transport_tls_certificate_file": "/test-tls/proxy-transport.crt",
+            "transport_tls_private_key_file": "/test-tls/proxy-transport.key",
+            "ca_certificate_file": "/test-tls/proxy-ca.crt",
+            "ca_private_key_file": "/test-tls/proxy-ca.key",
+            "session_ttl_seconds": 5,
+            "session_max_lifetime_seconds": 20,
         },
         "max_connector_concurrency": 4,
         "api_rate_limit_per_second": 100,

@@ -7,7 +7,7 @@ use std::{
     path::Path,
     path::PathBuf,
     process::{Command as ProcessCommand, ExitCode},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -18,8 +18,9 @@ use av::{
         GetProfileEnvironmentRequest, GrantProfileRequest, ListAgentsRequest, ListAgentsResponse,
         ListPrincipalRolesRequest, ListPrincipalRolesResponse, ListProfilesRequest,
         ListProfilesResponse, ListProxyDestinationsRequest, ListProxyDestinationsResponse,
-        ProfileEnvironment, ProxySessionLease, RevokeProfileRequest, RevokeProxySessionRequest,
-        RotateAgentRequest, SetAgentEnabledRequest, SetPrincipalRoleRequest,
+        ProfileEnvironment, ProxySessionLease, RenewProxySessionRequest, RevokeProfileRequest,
+        RevokeProxySessionRequest, RotateAgentRequest, SetAgentEnabledRequest,
+        SetPrincipalRoleRequest,
     },
     config::{AuthConfig, AuthMode, Config, ConfigMode, ManagedConfig, OidcSigningAlgorithm},
     keyring,
@@ -751,6 +752,7 @@ async fn run_transparent_proxy(
         bail!("AV returned an incomplete proxy session");
     }
     let session_id = lease.session_id;
+    let initial_expires_unix_seconds = lease.expires_unix_seconds;
     let token = Zeroizing::new(lease.token);
     // From this point forward revocation is mandatory, including failures while
     // writing the public CA or binding loopback. TTL is a backstop, not normal
@@ -761,7 +763,17 @@ async fn run_transparent_proxy(
             start_loopback_proxy(&lease.proxy_url, token.clone()).await?;
         let proxy_url = format!("http://{listener_address}");
         let listener_task = tokio::spawn(listener);
-        let status = run_proxy_child(executable, arguments, &proxy_url, &ca.path).await;
+        let status = tokio::select! {
+            status = run_proxy_child(executable, arguments, &proxy_url, &ca.path) => status,
+            renewal = renew_proxy_session_loop(
+                api_url,
+                &session_id,
+                initial_expires_unix_seconds,
+            ) => {
+                renewal?;
+                bail!("transparent proxy session renewal stopped unexpectedly")
+            }
+        };
         let _ = shutdown.send(true);
         let _ = listener_task.await;
         status
@@ -784,6 +796,54 @@ async fn run_transparent_proxy(
         (Err(error), Err(revoke_error)) => Err(error).context(format!(
             "proxied child failed and AV session revocation also failed: {revoke_error:#}"
         )),
+    }
+}
+
+async fn renew_proxy_session_loop(
+    api_url: &str,
+    session_id: &str,
+    mut expires_unix_seconds: i64,
+) -> Result<()> {
+    if expires_unix_seconds <= 0 {
+        bail!("AV returned an invalid proxy session expiry");
+    }
+    loop {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_secs();
+        let now = i64::try_from(now).context("system clock is outside supported range")?;
+        let remaining = expires_unix_seconds
+            .checked_sub(now)
+            .filter(|remaining| *remaining > 0)
+            .context("transparent proxy session expired before renewal")?;
+        let delay = u64::try_from((remaining / 2).max(1))
+            .context("proxy renewal delay is outside supported range")?;
+        tokio::time::sleep(Duration::from_secs(delay)).await;
+        let renewed: ProxySessionLease = connect_request(
+            api_url,
+            "av.v1.SessionService/RenewProxySession",
+            &RenewProxySessionRequest {
+                session_id: session_id.to_owned(),
+                ..Default::default()
+            },
+            true,
+        )
+        .await
+        .context("renew transparent proxy session")?;
+        let renewed_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .context("system clock is before Unix epoch")?
+            .as_secs();
+        let renewed_now =
+            i64::try_from(renewed_now).context("system clock is outside supported range")?;
+        if renewed.session_id != session_id
+            || renewed.revoked
+            || renewed.expires_unix_seconds <= renewed_now
+        {
+            bail!("AV returned an invalid proxy session renewal");
+        }
+        expires_unix_seconds = renewed.expires_unix_seconds;
     }
 }
 
@@ -1054,11 +1114,11 @@ async fn run_proxy_child(
     proxy_url: &str,
     ca_path: &Path,
 ) -> Result<u8> {
-    let mut child = tokio::process::Command::from(proxy_child_command(
+    let mut command = tokio::process::Command::from(proxy_child_command(
         executable, arguments, proxy_url, ca_path,
-    )?)
-    .spawn()
-    .context("start proxied child process")?;
+    )?);
+    command.kill_on_drop(true);
+    let mut child = command.spawn().context("start proxied child process")?;
     let status = tokio::select! {
         status = child.wait() => status.context("wait for proxied child process")?,
         signal = tokio::signal::ctrl_c() => {

@@ -19,6 +19,22 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
   -subj "/CN=postgres" \
   -addext "subjectAltName=DNS:postgres" >/dev/null 2>&1
 chmod 0600 "$AV_POSTGRES_TLS_DIR/server.key"
+openssl req -x509 -newkey ed25519 -nodes -days 1 \
+  -keyout "$AV_POSTGRES_TLS_DIR/proxy-ca.key" \
+  -out "$AV_POSTGRES_TLS_DIR/proxy-ca.crt" \
+  -subj "/CN=av-integration-proxy-ca" >/dev/null 2>&1
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 1 \
+  -keyout "$AV_POSTGRES_TLS_DIR/proxy-transport.key" \
+  -out "$AV_POSTGRES_TLS_DIR/proxy-transport.crt" \
+  -subj "/CN=localhost" \
+  -addext "subjectAltName=DNS:localhost" >/dev/null 2>&1
+# Disposable synthetic fixtures are bind-mounted read-only for AV's non-root
+# runtime UID and removed by the harness trap.
+chmod 0444 \
+  "$AV_POSTGRES_TLS_DIR/proxy-ca.key" \
+  "$AV_POSTGRES_TLS_DIR/proxy-ca.crt" \
+  "$AV_POSTGRES_TLS_DIR/proxy-transport.key" \
+  "$AV_POSTGRES_TLS_DIR/proxy-transport.crt"
 
 "${compose[@]}" config --quiet
 if [[ -n ${AV_IMAGE:-} ]]; then
@@ -62,8 +78,8 @@ grep --quiet '^infisical-integration' "$workdir/profiles"
 grep --quiet '^openbao-integration' "$workdir/profiles"
 
 run_cli routes >"$workdir/routes"
-grep --quiet $'^openbao-upstream\tinjecting\topenbao-integration\tupstream$' "$workdir/routes"
-grep --quiet $'^openbao-x-api\tinjecting\topenbao-integration\tupstream$' "$workdir/routes"
+grep --quiet $'^openbao-upstream\tinjecting\topenbao-integration\tupstream-auth$' "$workdir/routes"
+grep --quiet $'^openbao-x-api\tinjecting\topenbao-integration\tupstream-x-api$' "$workdir/routes"
 if grep --quiet '^ungranted-upstream' "$workdir/routes"; then
   echo "ungranted route was disclosed by CLI discovery" >&2
   exit 1

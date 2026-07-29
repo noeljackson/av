@@ -9,6 +9,7 @@ service SessionService {
   rpc ListProxyDestinations(ListProxyDestinationsRequest) returns (ListProxyDestinationsResponse);
   rpc GetProfileEnvironment(GetProfileEnvironmentRequest) returns (ProfileEnvironment);
   rpc CreateProxySession(CreateProxySessionRequest) returns (ProxySessionLease);
+  rpc RenewProxySession(RenewProxySessionRequest) returns (ProxySessionLease);
   rpc RevokeProxySession(RevokeProxySessionRequest) returns (ProxySessionLease);
 }
 
@@ -102,6 +103,10 @@ message ProfileEnvironment {
 
 message CreateProxySessionRequest {
   string profile = 1;
+}
+
+message RenewProxySessionRequest {
+  string session_id = 1;
 }
 
 message RevokeProxySessionRequest {

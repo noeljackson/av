@@ -145,7 +145,12 @@ services:
       interval: 2s
       timeout: 5s
       retries: 30
-    networks: [connectors]
+    networks:
+      connectors:
+        aliases:
+          - upstream-auth
+          - upstream-x-api
+          - upstream-ungranted
 
   setup:
     image: docker.io/library/python:3.13-alpine@sha256:399babc8b49529dabfd9c922f2b5eea81d611e4512e3ed250d75bd2e7683f4b0
@@ -202,6 +207,7 @@ services:
     volumes:
       - connector-state:/state:ro
       - agent-credentials:/credentials:ro
+      - ${AV_POSTGRES_TLS_DIR:-/dev/null}:/test-tls:ro
     networks: [connectors]
 
   managed-seed:

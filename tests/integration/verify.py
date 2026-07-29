@@ -132,13 +132,13 @@ def main():
         {
             "name": "openbao-upstream",
             "profile": "openbao-integration",
-            "host": "upstream",
+            "host": "upstream-auth",
             "mode": "injecting",
         },
         {
             "name": "openbao-x-api",
             "profile": "openbao-integration",
-            "host": "upstream",
+            "host": "upstream-x-api",
             "mode": "injecting",
         },
     ]
@@ -230,6 +230,36 @@ def main():
     )
     _, roles, _ = connect("ControlService", "ListPrincipalRoles", {})
     assert {"subject": "basic:operator", "role": "owner"} in roles["roles"]
+
+    # Exercise the PostgreSQL sliding-session transaction through the release
+    # ConnectRPC service, including subject-bound renewal and explicit revoke.
+    _, proxy_session, _ = connect(
+        "SessionService",
+        "CreateProxySession",
+        {"profile": "openbao-integration"},
+    )
+    assert proxy_session["token"]
+    proxy_expiry = int(proxy_session["expiresUnixSeconds"])
+    assert proxy_expiry > int(time.time())
+    _, renewed_session, _ = connect(
+        "SessionService",
+        "RenewProxySession",
+        {"sessionId": proxy_session["sessionId"]},
+    )
+    assert renewed_session["sessionId"] == proxy_session["sessionId"]
+    assert int(renewed_session["expiresUnixSeconds"]) >= proxy_expiry
+    _, revoked_session, _ = connect(
+        "SessionService",
+        "RevokeProxySession",
+        {"sessionId": proxy_session["sessionId"]},
+    )
+    assert revoked_session["revoked"] is True
+    connect(
+        "SessionService",
+        "RenewProxySession",
+        {"sessionId": proxy_session["sessionId"]},
+        accepted=(404,),
+    )
 
     _, proxy, proxy_headers = request(
         "/v1/proxy/openbao-upstream/verify?source=integration",

@@ -59,9 +59,10 @@ use crate::{
         ListProfilesResponse, ListProxyDestinationsRequest, ListProxyDestinationsResponse,
         PrincipalRole as RpcPrincipalRole, Profile as RpcProfile, ProfileEnvironment,
         ProfileGrant as RpcProfileGrant, ProxyDestination as RpcProxyDestination,
-        ProxySessionLease, RevokeProfileRequest, RevokeProxySessionRequest, RotateAgentRequest,
-        SessionService, SessionServiceExt, SetAgentEnabledRequest, SetBasicUserEnabledRequest,
-        SetPrincipalRoleRequest, Status as RpcStatus, UpsertBasicUserRequest,
+        ProxySessionLease, RenewProxySessionRequest, RevokeProfileRequest,
+        RevokeProxySessionRequest, RotateAgentRequest, SessionService, SessionServiceExt,
+        SetAgentEnabledRequest, SetBasicUserEnabledRequest, SetPrincipalRoleRequest,
+        Status as RpcStatus, UpsertBasicUserRequest,
     },
     config::{AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyRouteConfig},
     connector::Connector,
@@ -91,6 +92,7 @@ struct TransparentProxyRuntime {
     listen: String,
     proxy_url: String,
     session_ttl: Duration,
+    session_max_lifetime: Duration,
     catalog: TransparentRouteCatalog,
     certificate_authority: ProxyCertificateAuthority,
     transport_tls: ReloadingTransportTls,
@@ -970,6 +972,17 @@ fn parse_grant_mode(value: &str) -> std::result::Result<GrantMode, connectrpc::C
     }
 }
 
+fn validate_proxy_session_id(
+    session_id: &str,
+) -> std::result::Result<(), connectrpc::ConnectError> {
+    if session_id.is_empty() || session_id.len() > 256 || session_id.chars().any(char::is_control) {
+        return Err(connectrpc::ConnectError::invalid_argument(
+            "session_id is invalid",
+        ));
+    }
+    Ok(())
+}
+
 fn external_identity_subject(kind: &str, identity: &str) -> Result<String> {
     let identity = identity.trim();
     match kind {
@@ -1253,18 +1266,24 @@ impl SessionService for ConnectSessionService {
             ));
         }
         let credential = mint_proxy_session_credential();
-        let expires_unix_seconds = SystemTime::now()
-            .checked_add(runtime.session_ttl)
-            .context("proxy session expiry overflow")
-            .and_then(|time| {
-                time.duration_since(UNIX_EPOCH)
-                    .context("system clock is before Unix epoch")
-            })
-            .and_then(|duration| {
-                i64::try_from(duration.as_secs())
-                    .context("proxy session expiry is outside supported range")
-            })
-            .map_err(|_| {
+        let now = SystemTime::now();
+        let expiration = |lifetime| {
+            now.checked_add(lifetime)
+                .context("proxy session expiry overflow")
+                .and_then(|time| {
+                    time.duration_since(UNIX_EPOCH)
+                        .context("system clock is before Unix epoch")
+                })
+                .and_then(|duration| {
+                    i64::try_from(duration.as_secs())
+                        .context("proxy session expiry is outside supported range")
+                })
+        };
+        let expires_unix_seconds = expiration(runtime.session_ttl).map_err(|_| {
+            connectrpc::ConnectError::internal("proxy session clock is unavailable")
+        })?;
+        let maximum_expires_unix_seconds =
+            expiration(runtime.session_max_lifetime).map_err(|_| {
                 connectrpc::ConnectError::internal("proxy session clock is unavailable")
             })?;
         store
@@ -1274,6 +1293,7 @@ impl SessionService for ConnectSessionService {
                 &identity.subject,
                 profile,
                 expires_unix_seconds,
+                maximum_expires_unix_seconds,
             )
             .await
             .map_err(|error| {
@@ -1301,6 +1321,86 @@ impl SessionService for ConnectSessionService {
         })
     }
 
+    async fn renew_proxy_session(
+        &self,
+        ctx: connectrpc::RequestContext,
+        request: connectrpc::ServiceRequest<'_, RenewProxySessionRequest>,
+    ) -> connectrpc::ServiceResult<ProxySessionLease> {
+        let identity = authorize_connect(&self.state, ctx.headers()).await?;
+        let session_id = request.session_id;
+        validate_proxy_session_id(session_id)?;
+        let runtime = self.state.transparent_proxy.as_ref().ok_or_else(|| {
+            connectrpc::ConnectError::failed_precondition("transparent proxy is not configured")
+        })?;
+        let store = self.state.store.as_ref().ok_or_else(|| {
+            connectrpc::ConnectError::failed_precondition("managed proxy sessions are required")
+        })?;
+        let expires_unix_seconds = SystemTime::now()
+            .checked_add(runtime.session_ttl)
+            .context("proxy session expiry overflow")
+            .and_then(|time| {
+                time.duration_since(UNIX_EPOCH)
+                    .context("system clock is before Unix epoch")
+            })
+            .and_then(|duration| {
+                i64::try_from(duration.as_secs())
+                    .context("proxy session expiry is outside supported range")
+            })
+            .map_err(|_| {
+                connectrpc::ConnectError::internal("proxy session clock is unavailable")
+            })?;
+        let Some(session) = store
+            .renew_proxy_session_for_subject(session_id, &identity.subject, expires_unix_seconds)
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "renew transparent proxy session");
+                connectrpc::ConnectError::internal("proxy session is unavailable")
+            })?
+        else {
+            return Err(connectrpc::ConnectError::not_found(
+                "active proxy session not found",
+            ));
+        };
+        match profile_permitted(
+            &self.state,
+            &identity.subject,
+            &session.profile,
+            GrantMode::Proxy,
+        )
+        .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = store.revoke_proxy_session(session_id).await;
+                return Err(connectrpc::ConnectError::permission_denied(
+                    "profile access is not granted",
+                ));
+            }
+            Err(error) => {
+                tracing::error!(%error, "check transparent proxy renewal grant");
+                return Err(connectrpc::ConnectError::internal(
+                    "managed store unavailable",
+                ));
+            }
+        }
+        audit_event(
+            &self.state,
+            &identity.subject,
+            "transparent_proxy_session_renewed",
+            Some(&session.profile),
+            Some(session_id),
+            None,
+        )
+        .await
+        .map_err(|_| connectrpc::ConnectError::internal("audit persistence unavailable"))?;
+        connectrpc::Response::ok(ProxySessionLease {
+            session_id: session.session_id,
+            expires_unix_seconds: session.expires_unix_seconds,
+            revoked: false,
+            ..Default::default()
+        })
+    }
+
     async fn revoke_proxy_session(
         &self,
         ctx: connectrpc::RequestContext,
@@ -1308,14 +1408,7 @@ impl SessionService for ConnectSessionService {
     ) -> connectrpc::ServiceResult<ProxySessionLease> {
         let identity = authorize_connect(&self.state, ctx.headers()).await?;
         let session_id = request.session_id;
-        if session_id.is_empty()
-            || session_id.len() > 256
-            || session_id.chars().any(char::is_control)
-        {
-            return Err(connectrpc::ConnectError::invalid_argument(
-                "session_id is invalid",
-            ));
-        }
+        validate_proxy_session_id(session_id)?;
         let store = self
             .state
             .store
@@ -1568,6 +1661,7 @@ pub async fn run(config: Config) -> Result<()> {
                 listen: proxy.listen.clone(),
                 proxy_url: proxy.proxy_url.clone(),
                 session_ttl: Duration::from_secs(proxy.session_ttl_seconds),
+                session_max_lifetime: Duration::from_secs(proxy.session_max_lifetime_seconds),
                 catalog: TransparentRouteCatalog::from_config(
                     &config.proxy_routes,
                     &config.proxy_tunnels,
@@ -3756,18 +3850,20 @@ mod tests {
             .unwrap();
         let credential = mint_proxy_session_credential();
         let token = credential.token.to_string();
+        let expiry: i64 = (SystemTime::now() + Duration::from_secs(60))
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .try_into()
+            .unwrap();
         store
             .create_proxy_session(
                 &credential.session_id,
                 &credential.token_hash,
                 "basic:operator",
                 "infra",
-                (SystemTime::now() + Duration::from_secs(60))
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs()
-                    .try_into()
-                    .unwrap(),
+                expiry,
+                expiry + 60,
             )
             .await
             .unwrap();
@@ -3841,6 +3937,7 @@ mod tests {
                 ca_certificate_file: ca_certificate_file.display().to_string(),
                 ca_private_key_file: ca_private_key_file.display().to_string(),
                 session_ttl_seconds: 60,
+                session_max_lifetime_seconds: 120,
             }),
             max_connector_concurrency: 1,
             api_rate_limit_per_second: 10,
@@ -3863,6 +3960,7 @@ mod tests {
             listen: "127.0.0.1:0".into(),
             proxy_url: "https://av.example.test:14323".into(),
             session_ttl: Duration::from_secs(60),
+            session_max_lifetime: Duration::from_secs(120),
             catalog: TransparentRouteCatalog::from_config(&routes, &BTreeMap::new()).unwrap(),
             certificate_authority: ProxyCertificateAuthority::load(
                 &ca_certificate_file,
