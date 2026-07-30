@@ -29,7 +29,8 @@ run_enforced() {
     AV_BASIC_PASSWORD=password \
     AV_PROXY_TRANSPORT_CA_FILE="$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt" \
     AV_SYSTEM_CA_FILE="$AV_POSTGRES_TLS_DIR/tunnel-ca.crt" \
-    "$AV_ENFORCED_CLI" run-container openbao-integration \
+    "$AV_ENFORCED_CLI" run openbao-integration \
+      --container \
       --image "$target_image" \
       --helper-image "$helper_image" \
       --workspace "$workspace" \
@@ -113,7 +114,8 @@ AV_URL=http://127.0.0.1:14322 \
   AV_BASIC_PASSWORD=password \
   AV_PROXY_TRANSPORT_CA_FILE="$AV_POSTGRES_TLS_DIR/proxy-transport-ca.crt" \
   AV_SYSTEM_CA_FILE="$AV_POSTGRES_TLS_DIR/tunnel-ca.crt" \
-  "$AV_ENFORCED_CLI" run-container openbao-integration \
+  "$AV_ENFORCED_CLI" run openbao-integration \
+    --container \
     --image "$target_image" \
     --helper-image "$helper_image" \
     --workspace "$workspace" \

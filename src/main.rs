@@ -74,22 +74,19 @@ enum Command {
     /// Run a child through a profile-scoped transparent proxy session.
     Run {
         profile: String,
+        /// Run the child in a network-isolated, digest-pinned Docker container.
+        #[arg(long, requires_all = ["image", "helper_image"])]
+        container: bool,
+        #[arg(long, requires = "container")]
+        image: Option<String>,
+        #[arg(long, env = "AV_CONTAINER_HELPER_IMAGE", requires = "container")]
+        helper_image: Option<String>,
+        #[arg(long, requires = "container")]
+        workspace: Option<PathBuf>,
         #[arg(required = true, last = true)]
         command: Vec<OsString>,
     },
-    /// Run a digest-pinned container with no network except AV's loopback proxy.
-    RunContainer {
-        profile: String,
-        #[arg(long)]
-        image: String,
-        #[arg(long, env = "AV_CONTAINER_HELPER_IMAGE")]
-        helper_image: String,
-        #[arg(long, default_value = ".")]
-        workspace: PathBuf,
-        #[arg(required = true, last = true)]
-        command: Vec<OsString>,
-    },
-    /// Internal network-none sidecar relay used by `run-container`.
+    /// Internal network-none sidecar relay used by isolated `run`.
     #[command(hide = true)]
     ContainerRelay {
         #[arg(long)]
@@ -236,25 +233,27 @@ async fn run() -> Result<u8> {
             list_proxy_destinations(&cli.api_url).await?;
             Ok(0)
         }
-        Some(Command::Run { profile, command }) => {
-            run_transparent_proxy(&cli.api_url, profile, command).await
-        }
-        Some(Command::RunContainer {
+        Some(Command::Run {
             profile,
+            container,
             image,
             helper_image,
             workspace,
             command,
         }) => {
-            run_enforced_container(
-                &cli.api_url,
-                profile,
-                image,
-                helper_image,
-                workspace,
-                command,
-            )
-            .await
+            if container {
+                run_enforced_container(
+                    &cli.api_url,
+                    profile,
+                    image.context("--container requires --image")?,
+                    helper_image.context("--container requires --helper-image")?,
+                    workspace.unwrap_or_else(|| PathBuf::from(".")),
+                    command,
+                )
+                .await
+            } else {
+                run_transparent_proxy(&cli.api_url, profile, command).await
+            }
         }
         Some(Command::ContainerRelay { socket, ready }) => {
             run_container_relay(&socket, &ready).await?;
@@ -954,7 +953,7 @@ async fn run_enforced_container(
     let executable = command
         .first()
         .cloned()
-        .context("usage: av run-container <profile> --image <digest> --helper-image <digest> -- <command> [args...]")?;
+        .context("usage: av run <profile> --container --image <digest> --helper-image <digest> -- <command> [args...]")?;
     let arguments = command.into_iter().skip(1).collect::<Vec<_>>();
     validate_digest_pinned_image(&image, "container image")?;
     validate_digest_pinned_image(&helper_image, "AV helper image")?;
@@ -1112,7 +1111,7 @@ async fn run_enforced_container(
     _workspace: PathBuf,
     _command: Vec<OsString>,
 ) -> Result<u8> {
-    bail!("av run-container currently requires a Unix host and Docker Engine")
+    bail!("av run --container currently requires a Unix host and Docker Engine")
 }
 
 fn validate_digest_pinned_image(image: &str, label: &str) -> Result<()> {
@@ -2126,12 +2125,13 @@ mod tests {
     }
 
     #[test]
-    fn enforced_container_cli_requires_explicit_images_and_command() {
+    fn isolated_run_cli_requires_explicit_images_and_command() {
         let digest = format!("sha256:{}", "a".repeat(64));
         let cli = Cli::try_parse_from([
             "av",
-            "run-container",
+            "run",
             "example-dev",
+            "--container",
             "--image",
             &format!("example/app@{digest}"),
             "--helper-image",
@@ -2143,26 +2143,47 @@ mod tests {
             "--flag",
         ])
         .unwrap();
-        let Some(Command::RunContainer {
+        let Some(Command::Run {
             profile,
+            container,
             image,
             helper_image,
             workspace,
             command,
         }) = cli.command
         else {
-            panic!("expected run-container command");
+            panic!("expected isolated run command");
         };
         assert_eq!(profile, "example-dev");
-        assert_eq!(image, format!("example/app@{digest}"));
-        assert_eq!(helper_image, format!("ghcr.io/example/av@{digest}"));
-        assert_eq!(workspace, PathBuf::from("/work"));
+        assert!(container);
+        assert_eq!(image.unwrap(), format!("example/app@{digest}"));
+        assert_eq!(
+            helper_image.unwrap(),
+            format!("ghcr.io/example/av@{digest}")
+        );
+        assert_eq!(workspace.unwrap(), PathBuf::from("/work"));
         assert_eq!(
             command,
             [
                 OsString::from("/usr/local/bin/tool"),
                 OsString::from("--flag")
             ]
+        );
+    }
+
+    #[test]
+    fn removed_run_container_command_is_not_registered() {
+        assert!(Cli::command().find_subcommand("run-container").is_none());
+    }
+
+    #[test]
+    fn isolated_run_requires_both_images() {
+        let error = Cli::try_parse_from(["av", "run", "example-dev", "--container", "--", "true"])
+            .err()
+            .expect("isolated run without images must not parse");
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
         );
     }
 

@@ -61,7 +61,7 @@ AV's explicit proxy routes and a transparent `HTTPS_PROXY` design.
 The transparent proxy is opt-in and private: it requires managed sessions, a
 deployment CA, a private listener, and workload egress enforcement. Use
 `av run <profile> -- codex` for cooperative host execution,
-`av run-container <profile> ... -- codex` for a locally enforced,
+`av run <profile> --container ... -- codex` for a locally enforced,
 network-none Docker child, or the Helm NetworkPolicy/Cilium mode for an
 enforced Kubernetes workload. Never set a remote AV listener directly as a
 child's `HTTPS_PROXY`. The complete deployment and security contract is in
@@ -71,6 +71,8 @@ Origin/subprotocol policy plus message, byte, and lifetime limits; live grants
 and sessions remain enforced after the upgrade.
 The stable product boundaries and active implementation sequence are tracked in
 the [roadmap](docs/roadmap.md).
+For production installation, validation, recovery, upgrades, and rollback,
+follow the [operator guide](docs/operator-guide.md).
 
 For Tier 2, callers use a named route:
 
@@ -243,7 +245,7 @@ Install or update the CLI repeatedly from an attested release without a
 
 ```bash
 ./scripts/install                 # latest release
-AV_VERSION=v0.1.0 ./scripts/install
+AV_VERSION=v0.5.0 ./scripts/install
 ```
 
 ## Helm
