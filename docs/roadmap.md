@@ -15,7 +15,7 @@ has its own acceptance criteria and implementation history:
 | Named agents and explicit RBAC grants | [#17](https://github.com/noeljackson/av/issues/17) | Implemented and covered by SQLite, PostgreSQL, CLI, and browser tests |
 | Proxy parity | [#16](https://github.com/noeljackson/av/issues/16) | Implemented: exact credentialless tunnels [#18](https://github.com/noeljackson/av/issues/18), sliding sessions [#19](https://github.com/noeljackson/av/issues/19), and streaming/typed injection/WebSockets [#20](https://github.com/noeljackson/av/issues/20) |
 | OpenBao and Infisical dynamic leases | [#14](https://github.com/noeljackson/av/issues/14) | Complete: backend adapters [#21](https://github.com/noeljackson/av/issues/21), child ownership [#22](https://github.com/noeljackson/av/issues/22), and Tier 2 request/stream/WebSocket cleanup [#23](https://github.com/noeljackson/av/issues/23) |
-| Production hardening, isolation, and deployment | [#15](https://github.com/noeljackson/av/issues/15) | In progress: Helm operations [#25](https://github.com/noeljackson/av/issues/25), security/release proof [#26](https://github.com/noeljackson/av/issues/26), and cooperative/enforced runtime isolation [#24](https://github.com/noeljackson/av/issues/24) are complete; production deployment/docs [#27](https://github.com/noeljackson/av/issues/27) remains |
+| Production hardening, isolation, and deployment | [#15](https://github.com/noeljackson/av/issues/15) | v0.5.0 is released and privately deployed with documented recovery, rotation, isolation, and rollback evidence; [#27](https://github.com/noeljackson/av/issues/27) remains open only for the live Google WIF proof in [#13](https://github.com/noeljackson/av/issues/13) |
 
 ## Fixed product boundaries
 
@@ -34,3 +34,6 @@ has its own acceptance criteria and implementation history:
 Issues preserve task state and design discussion; this document preserves the
 stable architecture and operator-facing sequence. Update both when a workstream
 changes scope or reaches its acceptance criteria.
+
+The current production acceptance record is
+[v0.5.0](releases/v0.5.0.md).

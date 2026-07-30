@@ -163,6 +163,31 @@ transparentProxy:
     }
     eprintln!("k8s-e2e: direct TCP blocked");
 
+    // Link-local cloud metadata must not be an implicit escape hatch. The
+    // Cilium policy has no toCIDR exception, so even a provider that exposes a
+    // metadata service at the conventional address remains unreachable.
+    let metadata = kubectl_status(
+        context,
+        [
+            "exec",
+            "-n",
+            namespace,
+            "client",
+            "--",
+            "nc",
+            "-z",
+            "-w",
+            "3",
+            "169.254.169.254",
+            "80",
+        ],
+        None,
+    )?;
+    if metadata.success() {
+        return Err("selected workload reached cloud metadata".into());
+    }
+    eprintln!("k8s-e2e: cloud metadata blocked");
+
     // UDP tools report success after a local send, so prove non-delivery with
     // a controlled UDP receiver rather than trusting the sender exit code.
     kubectl(
