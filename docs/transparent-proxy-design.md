@@ -17,7 +17,7 @@ models serve different needs:
 |---|---|---|
 | Named route | Purpose-built application tools and high-risk actions | No |
 | Cooperative `av run` | Host SDKs and tools that cannot be changed | No |
-| Enforced `av run-container` or Kubernetes policy | Untrusted local/containerized or cluster workloads | No |
+| Enforced `av run --container` or Kubernetes policy | Untrusted local/containerized or cluster workloads | No |
 | `av <profile> -- command` | A tool that genuinely needs a local secret value | Yes; only for the child lifetime |
 
 Use a named route whenever an application can be changed. Transparent proxying
@@ -53,7 +53,7 @@ If an environment cannot enforce direct-egress denial, AV describes the mode
 as *cooperative*. `av run` on an ordinary host is always in this category. It
 remains useful for credential non-disclosure, but it does not contain a
 compromised agent's outbound network access. Local enforced execution uses
-`av run-container`; Kubernetes enforcement uses workload NetworkPolicy/Cilium.
+`av run --container`; Kubernetes enforcement uses workload NetworkPolicy/Cilium.
 
 ## Architecture
 
@@ -108,7 +108,7 @@ therefore remain narrow.
 
 ### Enforced Docker launcher
 
-`av run-container` is the local enforcement boundary. The host AV process
+`av run --container` is the local enforcement boundary. The host AV process
 acquires and owns the remote session, opens a mode-`0700` Unix-socket
 directory, and launches two digest-pinned containers:
 
@@ -395,7 +395,8 @@ av run orchard-dev -- claude
 av run orchard-dev -- ./bin/orchard-worker
 
 # Local enforced mode: both images are already present and digest-pinned.
-av run-container orchard-dev \
+av run orchard-dev \
+  --container \
   --image 'ghcr.io/example/orchard-agent@sha256:<digest>' \
   --helper-image 'ghcr.io/noeljackson/av@sha256:<digest>' \
   --workspace "$PWD" \
@@ -447,7 +448,7 @@ AV should retain that interoperability while choosing stricter defaults:
 | Policy source | Mutable vault/service catalog | Immutable AV connector policy plus managed profile grants |
 | Exposure | Private networking recommended | Private listener and egress enforcement required |
 | Route policy | Service matching | Fixed origin plus explicit request/response constraints |
-| Local bypass control | Proxy environment is cooperative | `run-container` supplies a network-none target and relay |
+| Local bypass control | Proxy environment is cooperative | `run --container` supplies a network-none target and relay |
 
 This comparison does not imply compatibility with Agent Vault's API, storage,
 or credential database. AV continues to use Infisical and OpenBao as connector
@@ -471,7 +472,7 @@ The implementation is kept available only with these test layers:
 - an end-to-end credentialless HTTPS tunnel whose upstream certificate is
   signed by a CA distinct from AV's interception CA;
 - direct TCP and UDP/443 egress denial in the Kubernetes integration fixture;
-- a real `run-container` network-none fixture proving permitted HTTPS,
+- a real `run --container` network-none fixture proving permitted HTTPS,
   direct-TCP/metadata/UDP/unknown-host denial, no child AV credentials,
   digest-only launch, Ctrl-C container removal, and persisted session
   revocation;

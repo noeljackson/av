@@ -61,7 +61,7 @@ AV's explicit proxy routes and a transparent `HTTPS_PROXY` design.
 The transparent proxy is opt-in and private: it requires managed sessions, a
 deployment CA, a private listener, and workload egress enforcement. Use
 `av run <profile> -- codex` for cooperative host execution,
-`av run-container <profile> ... -- codex` for a locally enforced,
+`av run <profile> --container ... -- codex` for a locally enforced,
 network-none Docker child, or the Helm NetworkPolicy/Cilium mode for an
 enforced Kubernetes workload. Never set a remote AV listener directly as a
 child's `HTTPS_PROXY`. The complete deployment and security contract is in

@@ -171,7 +171,8 @@ export AV_HELPER_IMAGE='ghcr.io/noeljackson/av@sha256:<64-hex-digest>'
 docker pull "$AGENT_IMAGE"
 docker pull "$AV_HELPER_IMAGE"
 
-av run-container orchard-dev \
+av run orchard-dev \
+  --container \
   --image "$AGENT_IMAGE" \
   --helper-image "$AV_HELPER_IMAGE" \
   --workspace "$PWD" \
@@ -187,7 +188,7 @@ only `http://127.0.0.1:3128` plus public CA files. Direct TCP, UDP/443,
 metadata endpoints, and unknown proxy destinations therefore fail even if the
 child unsets its proxy environment.
 
-`av run-container` does not pull images and rejects mutable tags. Ctrl-C,
+`av run --container` does not pull images and rejects mutable tags. Ctrl-C,
 normal exit, helper failure, or renewal failure removes both containers and
 revokes the session. Docker Engine, the selected images, and the explicitly
 mounted workspace remain trust boundaries.
