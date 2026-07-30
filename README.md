@@ -71,6 +71,8 @@ Origin/subprotocol policy plus message, byte, and lifetime limits; live grants
 and sessions remain enforced after the upgrade.
 The stable product boundaries and active implementation sequence are tracked in
 the [roadmap](docs/roadmap.md).
+For production installation, validation, recovery, upgrades, and rollback,
+follow the [operator guide](docs/operator-guide.md).
 
 For Tier 2, callers use a named route:
 
@@ -243,7 +245,7 @@ Install or update the CLI repeatedly from an attested release without a
 
 ```bash
 ./scripts/install                 # latest release
-AV_VERSION=v0.1.0 ./scripts/install
+AV_VERSION=v0.5.0 ./scripts/install
 ```
 
 ## Helm
