@@ -60,9 +60,12 @@ generic application example with Codex and Claude, and for the boundary between
 AV's explicit proxy routes and a transparent `HTTPS_PROXY` design.
 The transparent proxy is opt-in and private: it requires managed sessions, a
 deployment CA, a private listener, and workload egress enforcement. Use
-`av run <profile> -- codex` or `av run <profile> -- claude`; never set a remote
-AV listener directly as a child's `HTTPS_PROXY`. The complete deployment and
-security contract is in [transparent proxy design](docs/transparent-proxy-design.md).
+`av run <profile> -- codex` for cooperative host execution,
+`av run-container <profile> ... -- codex` for a locally enforced,
+network-none Docker child, or the Helm NetworkPolicy/Cilium mode for an
+enforced Kubernetes workload. Never set a remote AV listener directly as a
+child's `HTTPS_PROXY`. The complete deployment and security contract is in
+[transparent proxy design](docs/transparent-proxy-design.md).
 WebSocket upgrades remain denied unless the route declares exact
 Origin/subprotocol policy plus message, byte, and lifetime limits; live grants
 and sessions remain enforced after the upgrade.
@@ -215,6 +218,7 @@ cargo test --locked --all-targets
 cargo clippy --locked --all-targets -- -D warnings
 helm lint chart/av
 tests/connector-integration.sh
+AV_ENFORCED_CONTAINER_TEST=1 tests/connector-integration.sh
 tests/security-scan.sh
 AV_UI_CONTAINER=av-ui-local AV_UI_URL=http://127.0.0.1:14322 tests/ui-smoke.sh
 ./scripts/verify-release vX.Y.Z
@@ -226,7 +230,10 @@ disposable test data on an internal Docker network, verifies both connector
 reads plus hostile Tier 2 behavior, then copies the release CLI from the AV
 image and verifies `av profiles` and both `av <profile> -- <command>` paths.
 The CLI checks that wrapper credentials never reach its child process. The
-runner removes containers and volumes on exit.
+optional enforced-container phase also proves a permitted HTTPS tunnel,
+direct-TCP/metadata/UDP/unknown-host denial, digest pinning, child credential
+non-disclosure, interrupt cleanup, and session revocation. The runner removes
+containers and volumes on exit.
 The security runner adds fail-closed capability/credential leak canaries and a
 pinned, isolated ZAP passive scan. See [`SECURITY.md`](SECURITY.md) for the
 trust boundaries, security gates, and reproducible release verification.

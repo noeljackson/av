@@ -118,8 +118,11 @@ and do not handle this lifecycle.
 
 ## Codex and Claude with the transparent proxy
 
-For a deployment that has enabled the private transparent listener and its
-egress policy, launch the agent through a profile-scoped helper:
+Choose the launcher by where the agent runs.
+
+### Cooperative host mode
+
+Launch a normal workstation process through a profile-scoped helper:
 
 ```bash
 av run orchard-dev -- codex
@@ -150,8 +153,52 @@ available for the provider credential.
 This still is not permission for arbitrary egress. AV accepts only configured
 HTTPS hosts, maps each to one immutable named route, and applies that route's
 method/path/query/header policy after TLS interception. If the workload lacks
-the accompanying NetworkPolicy/Cilium allowlist, this mode is cooperative and
-must not be treated as injection containment.
+an OS- or platform-enforced egress boundary, `av run` is cooperative: the
+child can ignore its proxy variables and use the host network directly. It
+protects provider credential disclosure, but must not be described as prompt
+injection containment.
+
+### Enforced local container mode
+
+For a local task that must not bypass AV, run the agent image in AV's
+network-none Docker launcher. Both images must already exist locally and must
+be named by registry digest or exact local content ID:
+
+```bash
+export AGENT_IMAGE='ghcr.io/example/orchard-agent@sha256:<64-hex-digest>'
+export AV_HELPER_IMAGE='ghcr.io/noeljackson/av@sha256:<64-hex-digest>'
+
+docker pull "$AGENT_IMAGE"
+docker pull "$AV_HELPER_IMAGE"
+
+av run-container orchard-dev \
+  --image "$AGENT_IMAGE" \
+  --helper-image "$AV_HELPER_IMAGE" \
+  --workspace "$PWD" \
+  -- codex
+```
+
+The target gets a read-only root filesystem, an explicit read/write
+`/workspace` bind mount, private tmpfs paths, no Linux capabilities, and no
+network route. It shares only the loopback namespace of a capability-free AV
+relay sidecar. The remote session token and AV login material stay in the host
+`av` process; the sidecar sees only a private Unix stream and the child sees
+only `http://127.0.0.1:3128` plus public CA files. Direct TCP, UDP/443,
+metadata endpoints, and unknown proxy destinations therefore fail even if the
+child unsets its proxy environment.
+
+`av run-container` does not pull images and rejects mutable tags. Ctrl-C,
+normal exit, helper failure, or renewal failure removes both containers and
+revokes the session. Docker Engine, the selected images, and the explicitly
+mounted workspace remain trust boundaries.
+
+### Enforced Kubernetes mode
+
+In Kubernetes, run `av run` as the workload command and enable the Helm
+NetworkPolicy plus Cilium policy for an explicit workload selector. The pod may
+reach only cluster DNS and AV's private proxy Service; it has no direct
+TCP/443 or UDP/443 path. This is the cluster-native enforced mode and does not
+require Docker-in-Docker.
 
 Use Tier 2 from a narrow tool or application endpoint that knows the named AV
 route when the action can be modeled explicitly. For `orchard-api`, that tool

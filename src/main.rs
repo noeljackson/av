@@ -3,10 +3,11 @@ use std::{
     env,
     ffi::OsString,
     fs,
+    io::IsTerminal,
     net::SocketAddr,
     path::Path,
     path::PathBuf,
-    process::{Command as ProcessCommand, ExitCode},
+    process::{Command as ProcessCommand, ExitCode, Stdio},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -34,8 +35,10 @@ use reqwest::{Client, StatusCode, header};
 use rustls::pki_types::{CertificateDer, pem::PemObject};
 use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+#[cfg(unix)]
+use tokio::net::{UnixListener, UnixStream};
 use tokio::{
-    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::watch,
 };
@@ -73,6 +76,26 @@ enum Command {
         profile: String,
         #[arg(required = true, last = true)]
         command: Vec<OsString>,
+    },
+    /// Run a digest-pinned container with no network except AV's loopback proxy.
+    RunContainer {
+        profile: String,
+        #[arg(long)]
+        image: String,
+        #[arg(long, env = "AV_CONTAINER_HELPER_IMAGE")]
+        helper_image: String,
+        #[arg(long, default_value = ".")]
+        workspace: PathBuf,
+        #[arg(required = true, last = true)]
+        command: Vec<OsString>,
+    },
+    /// Internal network-none sidecar relay used by `run-container`.
+    #[command(hide = true)]
+    ContainerRelay {
+        #[arg(long)]
+        socket: PathBuf,
+        #[arg(long)]
+        ready: PathBuf,
     },
     /// Manage named agent identities in a local or managed AV control plane.
     Agents {
@@ -215,6 +238,27 @@ async fn run() -> Result<u8> {
         }
         Some(Command::Run { profile, command }) => {
             run_transparent_proxy(&cli.api_url, profile, command).await
+        }
+        Some(Command::RunContainer {
+            profile,
+            image,
+            helper_image,
+            workspace,
+            command,
+        }) => {
+            run_enforced_container(
+                &cli.api_url,
+                profile,
+                image,
+                helper_image,
+                workspace,
+                command,
+            )
+            .await
+        }
+        Some(Command::ContainerRelay { socket, ready }) => {
+            run_container_relay(&socket, &ready).await?;
+            Ok(0)
         }
         Some(Command::Agents { command }) => {
             manage_agent(&cli.api_url, command).await?;
@@ -893,6 +937,482 @@ async fn run_transparent_proxy(
     }
 }
 
+#[cfg(unix)]
+async fn run_enforced_container(
+    api_url: &str,
+    profile: String,
+    image: String,
+    helper_image: String,
+    workspace: PathBuf,
+    mut command: Vec<OsString>,
+) -> Result<u8> {
+    use std::os::unix::fs::MetadataExt;
+
+    if command.first().is_some_and(|argument| argument == "--") {
+        command.remove(0);
+    }
+    let executable = command
+        .first()
+        .cloned()
+        .context("usage: av run-container <profile> --image <digest> --helper-image <digest> -- <command> [args...]")?;
+    let arguments = command.into_iter().skip(1).collect::<Vec<_>>();
+    validate_digest_pinned_image(&image, "container image")?;
+    validate_digest_pinned_image(&helper_image, "AV helper image")?;
+    let workspace = workspace
+        .canonicalize()
+        .context("resolve container workspace")?;
+    if !workspace.is_dir() || workspace == Path::new("/") {
+        bail!("container workspace must be an existing directory other than /");
+    }
+    if workspace.as_os_str().to_string_lossy().contains(',') {
+        bail!("container workspace cannot contain a comma");
+    }
+    docker_preflight(&image, &helper_image)?;
+
+    let lease: ProxySessionLease = connect_request(
+        api_url,
+        "av.v1.SessionService/CreateProxySession",
+        &CreateProxySessionRequest {
+            profile,
+            ..Default::default()
+        },
+        true,
+    )
+    .await?;
+    if lease.session_id.is_empty()
+        || lease.token.is_empty()
+        || lease.proxy_url.is_empty()
+        || lease.ca_certificate_pem.is_empty()
+    {
+        bail!("AV returned an incomplete proxy session");
+    }
+    let session_id = lease.session_id;
+    let initial_expires_unix_seconds = lease.expires_unix_seconds;
+    let token = Zeroizing::new(lease.token);
+    let status = async {
+        let ca = write_proxy_ca(&lease.ca_certificate_pem)?;
+        let relay_directory = tempfile::Builder::new()
+            .prefix("av-container-relay-")
+            .tempdir()
+            .context("create private container relay directory")?;
+        restrict_directory(relay_directory.path())?;
+        let relay_metadata =
+            fs::metadata(relay_directory.path()).context("inspect container relay directory")?;
+        let uid = relay_metadata.uid();
+        let gid = relay_metadata.gid();
+        let socket_path = relay_directory.path().join("proxy.sock");
+        let ready_path = relay_directory.path().join("ready");
+        let (shutdown, listener) =
+            start_unix_proxy(&socket_path, &lease.proxy_url, token.clone()).await?;
+        let listener_task = tokio::spawn(listener);
+        let (helper_name, target_name) = unique_container_names()?;
+        let cleanup = DockerContainerCleanup::new([helper_name.clone(), target_name.clone()]);
+
+        let helper_status = tokio::process::Command::from(container_relay_command(
+            &helper_image,
+            &helper_name,
+            relay_directory.path(),
+            &socket_path,
+            &ready_path,
+            uid,
+            gid,
+        )?)
+        .status()
+        .await
+        .context("start AV network-none relay container")?;
+        if !helper_status.success() {
+            bail!("AV network-none relay container failed to start");
+        }
+        wait_for_container_relay(&helper_name, &ready_path).await?;
+
+        let mut target = tokio::process::Command::from(enforced_container_command(
+            &image,
+            &helper_name,
+            &target_name,
+            &workspace,
+            ca._directory.path(),
+            executable,
+            arguments,
+            uid,
+            gid,
+        )?);
+        target.kill_on_drop(true);
+        let mut target = target
+            .spawn()
+            .context("start enforced network-none container")?;
+        let mut helper_wait = tokio::process::Command::new("docker");
+        helper_wait
+            .arg("wait")
+            .arg(&helper_name)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut helper_wait = helper_wait.spawn().context("monitor AV container relay")?;
+
+        let outcome = tokio::select! {
+            result = target.wait() => {
+                let status = result.context("wait for enforced container")?;
+                Ok(status.code().unwrap_or(1).clamp(0, 255) as u8)
+            }
+            result = helper_wait.wait() => {
+                result.context("wait for AV container relay")?;
+                let _ = target.kill().await;
+                let _ = target.wait().await;
+                bail!("AV network-none relay stopped while the container was running")
+            }
+            renewal = renew_proxy_session_loop(
+                api_url,
+                &session_id,
+                initial_expires_unix_seconds,
+            ) => {
+                let _ = target.kill().await;
+                let _ = target.wait().await;
+                renewal?;
+                bail!("transparent proxy session renewal stopped unexpectedly")
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("wait for interrupt")?;
+                let _ = target.kill().await;
+                let status = target.wait().await.context("wait for interrupted container")?;
+                Ok(status.code().unwrap_or(130).clamp(0, 255) as u8)
+            }
+        };
+        let _ = shutdown.send(true);
+        let _ = listener_task.await;
+        drop(cleanup);
+        outcome
+    }
+    .await;
+    let revoke = connect_request::<_, ProxySessionLease>(
+        api_url,
+        "av.v1.SessionService/RevokeProxySession",
+        &RevokeProxySessionRequest {
+            session_id,
+            ..Default::default()
+        },
+        true,
+    )
+    .await;
+    match (status, revoke) {
+        (Ok(status), Ok(_)) => Ok(status),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("revoke enforced container proxy session"),
+        (Err(error), Err(revoke_error)) => Err(error).context(format!(
+            "enforced container failed and AV session revocation also failed: {revoke_error:#}"
+        )),
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_enforced_container(
+    _api_url: &str,
+    _profile: String,
+    _image: String,
+    _helper_image: String,
+    _workspace: PathBuf,
+    _command: Vec<OsString>,
+) -> Result<u8> {
+    bail!("av run-container currently requires a Unix host and Docker Engine")
+}
+
+fn validate_digest_pinned_image(image: &str, label: &str) -> Result<()> {
+    if let Some(digest) = image.strip_prefix("sha256:")
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Ok(());
+    }
+    let Some((name, digest)) = image.rsplit_once("@sha256:") else {
+        bail!("{label} must be pinned by sha256 digest");
+    };
+    if name.is_empty()
+        || name.contains('@')
+        || name.chars().any(char::is_whitespace)
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        bail!("{label} has an invalid sha256 reference");
+    }
+    Ok(())
+}
+
+fn docker_preflight(image: &str, helper_image: &str) -> Result<()> {
+    let version = ProcessCommand::new("docker")
+        .args(["version", "--format", "{{.Server.Version}}"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("run Docker Engine preflight")?;
+    if !version.success() {
+        bail!("Docker Engine is unavailable");
+    }
+    for (label, image) in [
+        ("container image", image),
+        ("AV helper image", helper_image),
+    ] {
+        let status = ProcessCommand::new("docker")
+            .args(["image", "inspect", image])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .with_context(|| format!("inspect {label}"))?;
+        if !status.success() {
+            bail!("{label} is not present locally; pull its exact digest before launch");
+        }
+    }
+    Ok(())
+}
+
+fn unique_container_names() -> Result<(String, String)> {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before Unix epoch")?
+        .as_nanos();
+    let prefix = format!("av-{}-{nonce}", std::process::id());
+    Ok((format!("{prefix}-relay"), format!("{prefix}-child")))
+}
+
+struct DockerContainerCleanup {
+    names: Vec<String>,
+}
+
+impl DockerContainerCleanup {
+    fn new(names: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            names: names.into_iter().collect(),
+        }
+    }
+}
+
+impl Drop for DockerContainerCleanup {
+    fn drop(&mut self) {
+        for name in self.names.iter().rev() {
+            let _ = ProcessCommand::new("docker")
+                .args(["rm", "--force", name])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+}
+
+#[cfg(unix)]
+fn container_relay_command(
+    helper_image: &str,
+    helper_name: &str,
+    relay_directory: &Path,
+    socket_path: &Path,
+    ready_path: &Path,
+    uid: u32,
+    gid: u32,
+) -> Result<ProcessCommand> {
+    let socket_name = socket_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("container relay socket has no portable file name")?;
+    let ready_name = ready_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("container relay ready path has no portable file name")?;
+    let mut command = ProcessCommand::new("docker");
+    command
+        .args([
+            "run",
+            "--detach",
+            "--pull",
+            "never",
+            "--name",
+            helper_name,
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges:true",
+            "--pids-limit",
+            "64",
+            "--user",
+            &format!("{uid}:{gid}"),
+            "--mount",
+            &format!("type=bind,src={},dst=/run/av", relay_directory.display()),
+            "--entrypoint",
+            "/usr/local/bin/av",
+            helper_image,
+            "container-relay",
+            "--socket",
+            &format!("/run/av/{socket_name}"),
+            "--ready",
+            &format!("/run/av/{ready_name}"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    Ok(command)
+}
+
+#[cfg(unix)]
+async fn wait_for_container_relay(helper_name: &str, ready_path: &Path) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if ready_path.is_file() {
+            return Ok(());
+        }
+        let running = tokio::process::Command::new("docker")
+            .args(["inspect", "--format", "{{.State.Running}}", helper_name])
+            .stderr(Stdio::null())
+            .output()
+            .await
+            .context("inspect AV container relay")?;
+        if !running.status.success() || running.stdout != b"true\n" {
+            bail!("AV network-none relay exited before becoming ready");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("AV network-none relay did not become ready")
+}
+
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn enforced_container_command(
+    image: &str,
+    helper_name: &str,
+    target_name: &str,
+    workspace: &Path,
+    ca_directory: &Path,
+    executable: OsString,
+    arguments: Vec<OsString>,
+    uid: u32,
+    gid: u32,
+) -> Result<ProcessCommand> {
+    let executable_text = executable
+        .to_str()
+        .context("container executable must be valid UTF-8")?;
+    if executable_text.is_empty() {
+        bail!("container executable cannot be empty");
+    }
+    let mut command = ProcessCommand::new("docker");
+    command.args([
+        "run",
+        "--pull",
+        "never",
+        "--name",
+        target_name,
+        "--network",
+        &format!("container:{helper_name}"),
+        "--read-only",
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges:true",
+        "--pids-limit",
+        "512",
+        "--user",
+        &format!("{uid}:{gid}"),
+        "--tmpfs",
+        "/tmp:rw,nosuid,nodev,noexec,size=1g,mode=1777",
+        "--tmpfs",
+        "/home/av:rw,nosuid,nodev,size=256m,mode=1777",
+        "--mount",
+        &format!("type=bind,src={},dst=/workspace", workspace.display()),
+        "--mount",
+        &format!(
+            "type=bind,src={},dst=/run/av-ca,readonly",
+            ca_directory.display()
+        ),
+        "--workdir",
+        "/workspace",
+        "--env",
+        "HOME=/home/av",
+        "--env",
+        "HTTP_PROXY=http://127.0.0.1:3128",
+        "--env",
+        "HTTPS_PROXY=http://127.0.0.1:3128",
+        "--env",
+        "http_proxy=http://127.0.0.1:3128",
+        "--env",
+        "https_proxy=http://127.0.0.1:3128",
+        "--env",
+        "NO_PROXY=",
+        "--env",
+        "no_proxy=",
+        "--env",
+        "ALL_PROXY=",
+        "--env",
+        "all_proxy=",
+        "--env",
+        "SSL_CERT_FILE=/run/av-ca/ca-bundle.pem",
+        "--env",
+        "CURL_CA_BUNDLE=/run/av-ca/ca-bundle.pem",
+        "--env",
+        "REQUESTS_CA_BUNDLE=/run/av-ca/ca-bundle.pem",
+        "--env",
+        "GIT_SSL_CAINFO=/run/av-ca/ca-bundle.pem",
+        "--env",
+        "NODE_EXTRA_CA_CERTS=/run/av-ca/proxy-ca.pem",
+        "--env",
+        "CODEX_CA_CERTIFICATE=/run/av-ca/proxy-ca.pem",
+        "--entrypoint",
+        executable_text,
+        "--interactive",
+    ]);
+    if std::io::stdout().is_terminal() {
+        command.arg("--tty");
+    }
+    command.arg(image).args(arguments);
+    Ok(command)
+}
+
+#[cfg(unix)]
+async fn run_container_relay(socket_path: &Path, ready_path: &Path) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let socket_is_unix =
+        fs::metadata(socket_path).is_ok_and(|metadata| metadata.file_type().is_socket());
+    if !socket_path.is_absolute()
+        || !ready_path.is_absolute()
+        || socket_path.parent() != ready_path.parent()
+        || !socket_is_unix
+        || ready_path.exists()
+    {
+        bail!("container relay requires a mounted Unix socket and new ready path");
+    }
+    let listener = TcpListener::bind("127.0.0.1:3128")
+        .await
+        .context("bind network-none loopback relay")?;
+    write_private_file(ready_path, b"ready\n")?;
+    loop {
+        let (mut client, _) = listener
+            .accept()
+            .await
+            .context("accept network-none child proxy connection")?;
+        let socket_path = socket_path.to_owned();
+        tokio::spawn(async move {
+            let result = async {
+                let mut host = UnixStream::connect(&socket_path)
+                    .await
+                    .context("connect host AV relay socket")?;
+                tokio::io::copy_bidirectional(&mut client, &mut host)
+                    .await
+                    .context("relay network-none proxy stream")?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::debug!(%error, "network-none proxy relay connection ended");
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+async fn run_container_relay(_socket_path: &Path, _ready_path: &Path) -> Result<()> {
+    bail!("container relay requires Unix sockets")
+}
+
 async fn renew_proxy_session_loop(
     api_url: &str,
     session_id: &str,
@@ -1066,6 +1586,44 @@ async fn start_loopback_proxy_with_tls(
     SocketAddr,
     impl std::future::Future<Output = Result<()>> + use<>,
 )> {
+    let remote = remote_proxy_target(remote_proxy_url)?;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .context("bind local proxy helper")?;
+    let listener_address = listener
+        .local_addr()
+        .context("inspect local proxy helper")?;
+    let (shutdown, mut stopped) = watch::channel(false);
+    let token = std::sync::Arc::new(token);
+    let future = async move {
+        loop {
+            tokio::select! {
+                changed = stopped.changed() => {
+                    if changed.is_err() || *stopped.borrow() { return Ok(()); }
+                }
+                accepted = listener.accept() => {
+                    let (stream, _) = accepted.context("accept local proxy client")?;
+                    spawn_local_proxy_connection(
+                        stream,
+                        &remote,
+                        transport_tls.clone(),
+                        token.clone(),
+                        stopped.clone(),
+                    );
+                }
+            }
+        }
+    };
+    Ok((shutdown, listener_address, future))
+}
+
+#[derive(Clone)]
+struct RemoteProxyTarget {
+    address: String,
+    server_name: ServerName<'static>,
+}
+
+fn remote_proxy_target(remote_proxy_url: &str) -> Result<RemoteProxyTarget> {
     let remote = Url::parse(remote_proxy_url).context("proxy session has an invalid proxy URL")?;
     if remote.scheme() != "https"
         || remote.host_str().is_none()
@@ -1089,12 +1647,55 @@ async fn start_loopback_proxy_with_tls(
     } else {
         format!("{remote_host}:{}", remote.port().expect("checked port"))
     };
-    let listener = TcpListener::bind("127.0.0.1:0")
+    Ok(RemoteProxyTarget {
+        address: remote_address,
+        server_name: remote_server_name,
+    })
+}
+
+fn spawn_local_proxy_connection<ClientStream>(
+    stream: ClientStream,
+    remote: &RemoteProxyTarget,
+    transport_tls: std::sync::Arc<ClientConfig>,
+    token: std::sync::Arc<Zeroizing<String>>,
+    stopped: watch::Receiver<bool>,
+) where
+    ClientStream: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let remote_address = remote.address.clone();
+    let remote_server_name = remote.server_name.clone();
+    tokio::spawn(async move {
+        if let Err(error) = proxy_local_connection(
+            stream,
+            &remote_address,
+            remote_server_name,
+            transport_tls,
+            token,
+            stopped,
+        )
         .await
-        .context("bind local proxy helper")?;
-    let listener_address = listener
-        .local_addr()
-        .context("inspect local proxy helper")?;
+        {
+            tracing::debug!(%error, "local proxy helper connection ended");
+        }
+    });
+}
+
+#[cfg(unix)]
+async fn start_unix_proxy(
+    socket_path: &Path,
+    remote_proxy_url: &str,
+    token: Zeroizing<String>,
+) -> Result<(
+    watch::Sender<bool>,
+    impl std::future::Future<Output = Result<()>> + use<>,
+)> {
+    if !socket_path.is_absolute() || socket_path.exists() {
+        bail!("container relay socket must be a new absolute path");
+    }
+    let remote = remote_proxy_target(remote_proxy_url)?;
+    let transport_tls = transport_client_config()?;
+    let listener =
+        UnixListener::bind(socket_path).context("bind private container relay socket")?;
     let (shutdown, mut stopped) = watch::channel(false);
     let token = std::sync::Arc::new(token);
     let future = async move {
@@ -1104,39 +1705,32 @@ async fn start_loopback_proxy_with_tls(
                     if changed.is_err() || *stopped.borrow() { return Ok(()); }
                 }
                 accepted = listener.accept() => {
-                    let (stream, _) = accepted.context("accept local proxy client")?;
-                    let remote_address = remote_address.clone();
-                    let remote_server_name = remote_server_name.clone();
-                    let transport_tls = transport_tls.clone();
-                    let token = token.clone();
-                    let stopped = stopped.clone();
-                    tokio::spawn(async move {
-                        if let Err(error) = proxy_local_connection(
-                            stream,
-                            &remote_address,
-                            remote_server_name,
-                            transport_tls,
-                            token,
-                            stopped,
-                        ).await {
-                            tracing::debug!(%error, "local proxy helper connection ended");
-                        }
-                    });
+                    let (stream, _) = accepted.context("accept private container relay client")?;
+                    spawn_local_proxy_connection(
+                        stream,
+                        &remote,
+                        transport_tls.clone(),
+                        token.clone(),
+                        stopped.clone(),
+                    );
                 }
             }
         }
     };
-    Ok((shutdown, listener_address, future))
+    Ok((shutdown, future))
 }
 
-async fn proxy_local_connection(
-    mut client: TcpStream,
+async fn proxy_local_connection<ClientStream>(
+    mut client: ClientStream,
     remote_address: &str,
     remote_server_name: ServerName<'static>,
     transport_tls: std::sync::Arc<ClientConfig>,
     token: std::sync::Arc<Zeroizing<String>>,
     mut stopped: watch::Receiver<bool>,
-) -> Result<()> {
+) -> Result<()>
+where
+    ClientStream: AsyncRead + AsyncWrite + Unpin,
+{
     let (header, remaining) = read_proxy_header(&mut client).await?;
     let rewritten = inject_proxy_authorization(&header, token.as_str())?;
     let remote = TcpStream::connect(remote_address)
@@ -1529,6 +2123,149 @@ mod tests {
                 command: RoleCommand::Set { .. }
             })
         ));
+    }
+
+    #[test]
+    fn enforced_container_cli_requires_explicit_images_and_command() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let cli = Cli::try_parse_from([
+            "av",
+            "run-container",
+            "example-dev",
+            "--image",
+            &format!("example/app@{digest}"),
+            "--helper-image",
+            &format!("ghcr.io/example/av@{digest}"),
+            "--workspace",
+            "/work",
+            "--",
+            "/usr/local/bin/tool",
+            "--flag",
+        ])
+        .unwrap();
+        let Some(Command::RunContainer {
+            profile,
+            image,
+            helper_image,
+            workspace,
+            command,
+        }) = cli.command
+        else {
+            panic!("expected run-container command");
+        };
+        assert_eq!(profile, "example-dev");
+        assert_eq!(image, format!("example/app@{digest}"));
+        assert_eq!(helper_image, format!("ghcr.io/example/av@{digest}"));
+        assert_eq!(workspace, PathBuf::from("/work"));
+        assert_eq!(
+            command,
+            [
+                OsString::from("/usr/local/bin/tool"),
+                OsString::from("--flag")
+            ]
+        );
+    }
+
+    #[test]
+    fn enforced_container_images_must_be_lowercase_sha256_digests() {
+        let valid = format!("ghcr.io/example/app@sha256:{}", "a1".repeat(32));
+        assert!(validate_digest_pinned_image(&valid, "test").is_ok());
+        assert!(
+            validate_digest_pinned_image(&format!("sha256:{}", "a1".repeat(32)), "test").is_ok()
+        );
+        for invalid in [
+            "ghcr.io/example/app:latest".to_owned(),
+            format!("ghcr.io/example/app@sha256:{}", "A".repeat(64)),
+            format!("ghcr.io/example/app@sha256:{}", "g".repeat(64)),
+            format!("ghcr.io/example/app@sha256:{}", "a".repeat(63)),
+            format!("ghcr.io/example/app@sha256:{} extra", "a".repeat(64)),
+        ] {
+            assert!(
+                validate_digest_pinned_image(&invalid, "test").is_err(),
+                "{invalid}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enforced_container_commands_have_no_external_network_or_remote_capability() {
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let helper = container_relay_command(
+            &format!("ghcr.io/example/av@{digest}"),
+            "av-relay",
+            Path::new("/private/relay"),
+            Path::new("/private/relay/proxy.sock"),
+            Path::new("/private/relay/ready"),
+            1000,
+            1000,
+        )
+        .unwrap();
+        let helper_args = helper
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            helper_args
+                .windows(2)
+                .any(|pair| pair == ["--network", "none"])
+        );
+        assert!(
+            helper_args
+                .windows(2)
+                .any(|pair| pair == ["--pull", "never"])
+        );
+        assert!(!helper_args.iter().any(|argument| {
+            argument.contains("AV_TOKEN")
+                || argument.contains("AV_AGENT")
+                || argument.contains("Proxy-Authorization")
+        }));
+
+        let child = enforced_container_command(
+            &format!("example/app@{digest}"),
+            "av-relay",
+            "av-child",
+            Path::new("/work"),
+            Path::new("/private/ca"),
+            OsString::from("/usr/local/bin/tool"),
+            vec![OsString::from("--exact"), OsString::from("value")],
+            1000,
+            1000,
+        )
+        .unwrap();
+        let child_args = child
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(
+            child_args
+                .windows(2)
+                .any(|pair| pair == ["--network", "container:av-relay"])
+        );
+        assert!(
+            child_args
+                .windows(2)
+                .any(|pair| pair == ["--cap-drop", "ALL"])
+        );
+        assert!(
+            child_args
+                .windows(2)
+                .any(|pair| pair == ["--entrypoint", "/usr/local/bin/tool"])
+        );
+        for value in ["NO_PROXY=", "no_proxy=", "ALL_PROXY=", "all_proxy="] {
+            assert!(child_args.windows(2).any(|pair| pair == ["--env", value]));
+        }
+        assert!(
+            child_args
+                .iter()
+                .any(|argument| argument == "--interactive")
+        );
+        assert!(child_args.ends_with(&["--exact".to_owned(), "value".to_owned()]));
+        assert!(!child_args.iter().any(|argument| {
+            argument.contains("AV_TOKEN")
+                || argument.contains("AV_AGENT")
+                || argument.contains("Proxy-Authorization")
+        }));
     }
 
     #[test]

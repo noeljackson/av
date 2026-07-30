@@ -13,6 +13,7 @@ services:
   av:
     ports:
       - 127.0.0.1:14322:14322
+      - 127.0.0.1:14323:14323
     networks:
       - connectors
       - github-egress

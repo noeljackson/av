@@ -16,7 +16,8 @@ models serve different needs:
 | Model | Best for | Caller sees provider secret? |
 |---|---|---|
 | Named route | Purpose-built application tools and high-risk actions | No |
-| Transparent proxy | Existing SDKs and tools that cannot be changed | No |
+| Cooperative `av run` | Host SDKs and tools that cannot be changed | No |
+| Enforced `av run-container` or Kubernetes policy | Untrusted local/containerized or cluster workloads | No |
 | `av <profile> -- command` | A tool that genuinely needs a local secret value | Yes; only for the child lifetime |
 
 Use a named route whenever an application can be changed. Transparent proxying
@@ -48,9 +49,11 @@ advertised or enabled:
    redirect, DNS rebinding trick, or `CONNECT` target that is outside its
    configured connector catalog.
 
-If an environment cannot enforce direct-egress denial, AV must describe this
-mode as *cooperative*. It remains useful for credential non-disclosure, but it
-does not contain a compromised agent's outbound network access.
+If an environment cannot enforce direct-egress denial, AV describes the mode
+as *cooperative*. `av run` on an ordinary host is always in this category. It
+remains useful for credential non-disclosure, but it does not contain a
+compromised agent's outbound network access. Local enforced execution uses
+`av run-container`; Kubernetes enforcement uses workload NetworkPolicy/Cilium.
 
 ## Architecture
 
@@ -102,6 +105,47 @@ This is a containment improvement, not a magical sandbox. A process that can
 send HTTP through its loopback proxy can exercise the session's allowed
 capabilities until the helper is stopped. The profile and connector policy must
 therefore remain narrow.
+
+### Enforced Docker launcher
+
+`av run-container` is the local enforcement boundary. The host AV process
+acquires and owns the remote session, opens a mode-`0700` Unix-socket
+directory, and launches two digest-pinned containers:
+
+```text
+host av process (OIDC/agent auth + remote session capability)
+  |
+  | private Unix socket; not mounted in target
+  v
+AV relay sidecar (`--network none`, loopback :3128, no AV token)
+  ^
+  | shared network namespace, loopback only
+  |
+target child (`--network container:<relay>`)
+```
+
+The sidecar cannot contact AV or the internet itself. It only translates the
+child's loopback TCP connection into the host-owned Unix stream. The host
+helper validates the private AV proxy's transport TLS and adds the remote
+session capability. The target receives the public interception CA and system
+trust bundle, but no AV authentication, remote capability, connector
+credential, CA private key, or relay socket.
+
+Both image arguments must be a `name@sha256:<digest>` reference or an exact
+local `sha256:<content-id>`. AV verifies that both are already present and uses
+Docker's `--pull never`; mutable tags and surprise network fetches fail before
+a session is created. The target has a read-only root filesystem,
+`no-new-privileges`, all capabilities dropped, bounded PIDs, private tmpfs
+paths, and one explicit `/workspace` bind mount. Docker Engine, the image
+contents, and that writable workspace remain deliberate trust boundaries.
+
+The network namespace has only loopback. It has no route for direct TCP,
+metadata/link-local addresses, DNS, or QUIC/UDP. HTTPS clients send DNS
+hostnames in CONNECT to the loopback helper, and AV resolves only a configured
+destination after authorization. Unknown Docker/runtime state or relay
+failure terminates the child and fails closed. Normal exit, Ctrl-C, renewal
+failure, and helper failure remove both named containers and revoke the AV
+session.
 
 ## Request lifecycle
 
@@ -349,6 +393,13 @@ av run orchard-dev -- claude
 
 # An unmodified SDK inherits the same proxy environment when started this way.
 av run orchard-dev -- ./bin/orchard-worker
+
+# Local enforced mode: both images are already present and digest-pinned.
+av run-container orchard-dev \
+  --image 'ghcr.io/example/orchard-agent@sha256:<digest>' \
+  --helper-image 'ghcr.io/noeljackson/av@sha256:<digest>' \
+  --workspace "$PWD" \
+  -- codex
 ```
 
 Inside Codex or Claude, the normal workflow is simply to use a configured
@@ -396,6 +447,7 @@ AV should retain that interoperability while choosing stricter defaults:
 | Policy source | Mutable vault/service catalog | Immutable AV connector policy plus managed profile grants |
 | Exposure | Private networking recommended | Private listener and egress enforcement required |
 | Route policy | Service matching | Fixed origin plus explicit request/response constraints |
+| Local bypass control | Proxy environment is cooperative | `run-container` supplies a network-none target and relay |
 
 This comparison does not imply compatibility with Agent Vault's API, storage,
 or credential database. AV continues to use Infisical and OpenBao as connector
@@ -419,6 +471,10 @@ The implementation is kept available only with these test layers:
 - an end-to-end credentialless HTTPS tunnel whose upstream certificate is
   signed by a CA distinct from AV's interception CA;
 - direct TCP and UDP/443 egress denial in the Kubernetes integration fixture;
+- a real `run-container` network-none fixture proving permitted HTTPS,
+  direct-TCP/metadata/UDP/unknown-host denial, no child AV credentials,
+  digest-only launch, Ctrl-C container removal, and persisted session
+  revocation;
 - WebSocket handshake injection, exact Origin/subprotocol enforcement,
   bidirectional frame redaction, bounded lifetime/bytes, and live grant
   revocation;

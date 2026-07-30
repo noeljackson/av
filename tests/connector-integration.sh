@@ -10,6 +10,9 @@ source "$root/tests/integration-tls.sh"
 # shellcheck disable=SC1091
 source "$root/tests/sensitive-output.sh"
 compose=(docker compose --project-name "av-connectors-${UID}-$$" --file "$root/tests/integration/compose.yml")
+if [[ ${AV_ENFORCED_CONTAINER_TEST:-0} == 1 ]]; then
+  compose+=(--file "$root/tests/integration/enforced-container.compose.yml")
+fi
 workdir=$(mktemp -d "$root/.tmp.connector-cli.XXXXXX")
 export AV_POSTGRES_TLS_DIR="$workdir/postgres-tls"
 test_containers=()
@@ -87,6 +90,14 @@ if grep --quiet '^ungranted-upstream' "$workdir/routes"; then
   exit 1
 fi
 
+if [[ ${AV_ENFORCED_CONTAINER_TEST:-0} == 1 ]]; then
+  postgres_container=$("${compose[@]}" ps --quiet postgres)
+  AV_ENFORCED_CLI="${AV_ENFORCED_CLI:-$workdir/av}" \
+    AV_ENFORCED_SERVER_CONTAINER="$av_container" \
+    AV_ENFORCED_POSTGRES_CONTAINER="$postgres_container" \
+    "$root/tests/enforced-container-smoke.sh"
+fi
+
 # shellcheck disable=SC2016 # The child shell, not this harness, expands these variables.
 run_cli infisical-integration -- sh -eu -c '
   test "${INFISICAL_MARKER:-}" = infisical-ok
@@ -114,7 +125,7 @@ dynamic_role_count() {
 
 wait_for_dynamic_role_count() {
   local expected=$1
-  for _ in $(seq 1 40); do
+  for _ in $(seq 1 100); do
     if [[ $(dynamic_role_count) == "$expected" ]]; then
       return 0
     fi
