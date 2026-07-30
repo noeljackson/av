@@ -181,6 +181,11 @@ Tier 2 keeps the provider credential out of the caller. Verify:
 - redirects and credential-bearing response headers are not forwarded; and
 - grant removal stops active WebSockets and prevents the next request.
 
+Use `provider_operations` for actions in AV's curated provider catalog. AV
+then owns the fixed origin, authentication scheme, method, exact path, and
+request/response limits. Use raw `proxy_routes` only as a reviewed advanced
+escape hatch for operations that AV does not yet model.
+
 For a compatible command-line client:
 
 ```bash

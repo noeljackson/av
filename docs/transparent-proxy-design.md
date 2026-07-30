@@ -308,6 +308,36 @@ One host maps to exactly one injecting route or credentialless tunnel.
 Configuration validation rejects overlaps rather than choosing from decrypted
 paths at runtime. Ambiguity is a security failure.
 
+## Built-in provider operations
+
+Prefer a built-in provider operation when AV supports the intended action.
+Operators select the operation and supply only its profile, secret reference,
+and public resource identifiers. AV owns the provider origin, authentication
+scheme, HTTP method, exact path template, query/body policy, response limits,
+and redaction behavior.
+
+```json
+{
+  "provider_operations": {
+    "cloudflare-account-token-verify": {
+      "type": "cloudflare_account_token_verify",
+      "profile": "orchard-dev",
+      "account_id": "0123456789abcdef0123456789abcdef",
+      "secret_key": "CLOUDFLARE_API_TOKEN"
+    }
+  }
+}
+```
+
+This operation compiles to an exact `GET` request against Cloudflare's
+account-token verification endpoint with Bearer injection and no query string
+or request body. A suffix beneath the verification endpoint is denied.
+
+`proxy_routes` remains the explicit advanced escape hatch for an operation
+that is not yet in AV's curated catalog. Raw routes support both
+`allowed_exact_paths` and deliberately broader `allowed_path_prefixes`; use an
+exact path unless a reviewed provider resource subtree is required.
+
 ## Credentialless TLS tunnels
 
 Some wrapped tools also need ordinary HTTPS control-plane access that carries

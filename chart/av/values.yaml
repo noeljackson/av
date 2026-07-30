@@ -148,6 +148,7 @@ config:
     basic_users: []
   connectors: {}
   profiles: {}
+  provider_operations: {}
   proxy_routes: {}
   proxy_tunnels: {}
   max_connector_concurrency: 16
