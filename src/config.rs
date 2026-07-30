@@ -24,6 +24,11 @@ pub struct Config {
     pub connectors: BTreeMap<String, ConnectorConfig>,
     #[serde(default)]
     pub profiles: BTreeMap<String, ProfileConfig>,
+    /// Curated provider operations compiled by AV into immutable proxy routes.
+    /// Operators supply only public resource identifiers and secret references;
+    /// AV owns the origin, method, path, injection, and response policy.
+    #[serde(default)]
+    pub provider_operations: BTreeMap<String, ProviderOperationConfig>,
     #[serde(default)]
     pub proxy_routes: BTreeMap<String, ProxyRouteConfig>,
     /// Exact credentialless HTTPS destinations available to transparent proxy
@@ -347,6 +352,16 @@ pub struct ProfileExportConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderOperationConfig {
+    CloudflareAccountTokenVerify {
+        profile: String,
+        account_id: String,
+        secret_key: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyRouteConfig {
     pub profile: String,
@@ -368,6 +383,8 @@ pub struct ProxyRouteConfig {
     pub body_substitutions: BTreeMap<String, String>,
     #[serde(default)]
     pub allowed_methods: Vec<String>,
+    #[serde(default)]
+    pub allowed_exact_paths: Vec<String>,
     #[serde(default)]
     pub allowed_path_prefixes: Vec<String>,
     #[serde(default = "default_allowed_request_headers")]
@@ -491,13 +508,68 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let raw = std::fs::read_to_string(path)
             .with_context(|| format!("read configuration {}", path.display()))?;
-        let config: Self = serde_json::from_str(&raw)
+        let mut config: Self = serde_json::from_str(&raw)
             .with_context(|| format!("parse JSON configuration {}", path.display()))?;
+        config.expand_provider_operations()?;
         config.validate()?;
         Ok(config)
     }
 
+    fn expand_provider_operations(&mut self) -> Result<()> {
+        for (name, operation) in std::mem::take(&mut self.provider_operations) {
+            if self.proxy_routes.contains_key(&name) {
+                bail!("provider operation {name} conflicts with a custom proxy route");
+            }
+            let route = match operation {
+                ProviderOperationConfig::CloudflareAccountTokenVerify {
+                    profile,
+                    account_id,
+                    secret_key,
+                } => {
+                    if account_id.len() != 32
+                        || !account_id
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                    {
+                        bail!(
+                            "provider operation {name} Cloudflare account_id must be 32 lowercase hexadecimal characters"
+                        );
+                    }
+                    ProxyRouteConfig {
+                        profile,
+                        base_url: "https://api.cloudflare.com".into(),
+                        secret_key: String::new(),
+                        header: String::new(),
+                        header_prefix: String::new(),
+                        injection: Some(ProxyInjectionConfig::Bearer { secret_key }),
+                        body_substitutions: BTreeMap::new(),
+                        allowed_methods: vec!["GET".into()],
+                        allowed_exact_paths: vec![format!(
+                            "/client/v4/accounts/{account_id}/tokens/verify"
+                        )],
+                        allowed_path_prefixes: Vec::new(),
+                        allowed_request_headers: vec!["accept".into()],
+                        allowed_response_headers: vec!["content-type".into()],
+                        allowed_query_parameters: Vec::new(),
+                        allowed_content_types: Vec::new(),
+                        max_body_bytes: 1024,
+                        response_mode: ProxyResponseMode::Buffered,
+                        max_response_bytes: 1024 * 1024,
+                        websocket: None,
+                    }
+                }
+            };
+            self.proxy_routes.insert(name, route);
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
+        if !self.provider_operations.is_empty() {
+            let mut expanded = self.clone();
+            expanded.expand_provider_operations()?;
+            return expanded.validate();
+        }
         let public_url = Url::parse(&self.public_url).context("public_url must be a URL")?;
         if public_url.scheme() != "https" && !public_url.host_str().is_some_and(is_loopback_host) {
             bail!("public_url must use HTTPS unless it is loopback");
@@ -819,8 +891,10 @@ impl Config {
                     "proxy route {name} base_url may not contain credentials, query, or fragment"
                 );
             }
-            if route.allowed_methods.is_empty() || route.allowed_path_prefixes.is_empty() {
-                bail!("proxy route {name} must constrain both methods and path prefixes");
+            if route.allowed_methods.is_empty()
+                || (route.allowed_exact_paths.is_empty() && route.allowed_path_prefixes.is_empty())
+            {
+                bail!("proxy route {name} must constrain methods and at least one path");
             }
             if route.max_body_bytes == 0 || route.max_body_bytes > 16 * 1024 * 1024 {
                 bail!("proxy route {name} max_body_bytes must be between 1 and 16777216");
@@ -836,16 +910,19 @@ impl Config {
             }) {
                 bail!("proxy route {name} contains a non-CRUD HTTP method");
             }
-            if route.allowed_path_prefixes.iter().any(|prefix| {
-                !prefix.starts_with('/')
-                    || prefix.contains(['?', '#', '\\', '%'])
-                    || prefix.contains("//")
-                    || prefix.chars().any(char::is_control)
-                    || prefix
-                        .split('/')
-                        .any(|segment| matches!(segment, "." | ".."))
-            }) {
-                bail!("proxy route {name} contains an unsafe path prefix");
+            if route
+                .allowed_exact_paths
+                .iter()
+                .chain(&route.allowed_path_prefixes)
+                .any(|path| {
+                    !path.starts_with('/')
+                        || path.contains(['?', '#', '\\', '%'])
+                        || path.contains("//")
+                        || path.chars().any(char::is_control)
+                        || path.split('/').any(|segment| matches!(segment, "." | ".."))
+                })
+            {
+                bail!("proxy route {name} contains an unsafe path policy");
             }
             let (injection_header, injection_secret_keys): (&str, Vec<&str>) = match &route
                 .injection
@@ -1553,6 +1630,7 @@ mod tests {
             },
             connectors: BTreeMap::new(),
             profiles: BTreeMap::new(),
+            provider_operations: BTreeMap::new(),
             proxy_routes: BTreeMap::new(),
             proxy_tunnels: BTreeMap::new(),
             transparent_proxy: None,
@@ -1725,6 +1803,7 @@ mod tests {
                 injection: None,
                 body_substitutions: BTreeMap::new(),
                 allowed_methods: vec![],
+                allowed_exact_paths: vec![],
                 allowed_path_prefixes: vec![],
                 allowed_request_headers: default_allowed_request_headers(),
                 allowed_response_headers: default_allowed_response_headers(),
@@ -1755,6 +1834,70 @@ mod tests {
         }
         assert!(config.validate().is_err());
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
+    }
+
+    #[test]
+    fn cloudflare_account_verify_operation_compiles_to_exact_policy() {
+        let mut config = base_config();
+        config.provider_operations.insert(
+            "cloudflare-token-verify".into(),
+            ProviderOperationConfig::CloudflareAccountTokenVerify {
+                profile: "infra".into(),
+                account_id: "0123456789abcdef0123456789abcdef".into(),
+                secret_key: "CLOUDFLARE_API_TOKEN".into(),
+            },
+        );
+
+        config.expand_provider_operations().unwrap();
+        let route = config.proxy_routes.get("cloudflare-token-verify").unwrap();
+        assert_eq!(route.base_url, "https://api.cloudflare.com");
+        assert_eq!(route.allowed_methods, ["GET"]);
+        assert_eq!(
+            route.allowed_exact_paths,
+            ["/client/v4/accounts/0123456789abcdef0123456789abcdef/tokens/verify"]
+        );
+        assert!(route.allowed_path_prefixes.is_empty());
+        assert!(matches!(
+            route.injection,
+            Some(ProxyInjectionConfig::Bearer { ref secret_key })
+                if secret_key == "CLOUDFLARE_API_TOKEN"
+        ));
+    }
+
+    #[test]
+    fn provider_operations_reject_invalid_ids_and_route_name_collisions() {
+        let operation = ProviderOperationConfig::CloudflareAccountTokenVerify {
+            profile: "infra".into(),
+            account_id: "0123456789abcdef0123456789abcdef".into(),
+            secret_key: "TOKEN".into(),
+        };
+
+        let mut invalid = base_config();
+        invalid.provider_operations.insert(
+            "cloudflare".into(),
+            ProviderOperationConfig::CloudflareAccountTokenVerify {
+                profile: "infra".into(),
+                account_id: "not-an-account-id".into(),
+                secret_key: "TOKEN".into(),
+            },
+        );
+        assert!(invalid.expand_provider_operations().is_err());
+
+        let mut expanded = base_config();
+        expanded
+            .provider_operations
+            .insert("cloudflare".into(), operation.clone());
+        expanded.expand_provider_operations().unwrap();
+        let generated = expanded.proxy_routes.remove("cloudflare").unwrap();
+
+        let mut collision = base_config();
+        collision
+            .proxy_routes
+            .insert("cloudflare".into(), generated);
+        collision
+            .provider_operations
+            .insert("cloudflare".into(), operation);
+        assert!(collision.expand_provider_operations().is_err());
     }
 
     #[test]
@@ -1804,6 +1947,7 @@ mod tests {
                 injection: None,
                 body_substitutions: BTreeMap::new(),
                 allowed_methods: vec!["GET".into()],
+                allowed_exact_paths: vec![],
                 allowed_path_prefixes: vec!["/v1/".into()],
                 allowed_request_headers: vec![],
                 allowed_response_headers: vec![],

@@ -268,6 +268,7 @@ mod tests {
             injection: None,
             body_substitutions: BTreeMap::new(),
             allowed_methods: vec!["GET".into()],
+            allowed_exact_paths: Vec::new(),
             allowed_path_prefixes: vec!["/v1/".into()],
             allowed_request_headers: vec![],
             allowed_response_headers: vec![],

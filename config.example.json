@@ -81,6 +81,14 @@
       }
     }
   },
+  "provider_operations": {
+    "cloudflare-account-token-verify": {
+      "type": "cloudflare_account_token_verify",
+      "profile": "infra",
+      "account_id": "0123456789abcdef0123456789abcdef",
+      "secret_key": "CLOUDFLARE_API_TOKEN"
+    }
+  },
   "proxy_routes": {
     "cloudflare-dns": {
       "profile": "infra",

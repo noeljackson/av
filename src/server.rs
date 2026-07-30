@@ -4639,10 +4639,11 @@ fn enforce_proxy_policy(route: &ProxyRouteConfig, path: &str, method: &Method) -
         bail!("path contains a traversal sequence");
     }
 
-    if !route
-        .allowed_path_prefixes
-        .iter()
-        .any(|prefix| path_matches_prefix(&normalized_path, prefix))
+    if !route.allowed_exact_paths.contains(&normalized_path)
+        && !route
+            .allowed_path_prefixes
+            .iter()
+            .any(|prefix| path_matches_prefix(&normalized_path, prefix))
     {
         bail!("path is not allowed");
     }
@@ -5295,6 +5296,7 @@ mod tests {
             injection: None,
             body_substitutions: BTreeMap::new(),
             allowed_methods: methods.iter().map(|value| (*value).into()).collect(),
+            allowed_exact_paths: Vec::new(),
             allowed_path_prefixes: prefixes.iter().map(|value| (*value).into()).collect(),
             allowed_request_headers: vec!["accept".into(), "content-type".into()],
             allowed_response_headers: vec!["content-type".into()],
@@ -5415,6 +5417,7 @@ mod tests {
             },
             connectors: BTreeMap::new(),
             profiles,
+            provider_operations: BTreeMap::new(),
             proxy_routes: routes.clone(),
             proxy_tunnels: BTreeMap::new(),
             transparent_proxy: Some(TransparentProxyConfig {
@@ -6004,6 +6007,29 @@ mod tests {
         assert!(enforce_proxy_policy(&route, "zones/%2Fadmin", &Method::GET).is_err());
         assert!(enforce_proxy_policy(&route, "zones\\admin", &Method::GET).is_err());
         assert!(enforce_proxy_policy(&route, "zones/file..name", &Method::GET).is_ok());
+    }
+
+    #[test]
+    fn proxy_policy_exact_paths_reject_suffixes() {
+        let mut route = proxy_route(&["GET"], &[]);
+        route.allowed_exact_paths = vec!["/client/v4/accounts/example/tokens/verify".into()];
+
+        assert!(
+            enforce_proxy_policy(
+                &route,
+                "/client/v4/accounts/example/tokens/verify",
+                &Method::GET,
+            )
+            .is_ok()
+        );
+        assert!(
+            enforce_proxy_policy(
+                &route,
+                "/client/v4/accounts/example/tokens/verify/extra",
+                &Method::GET,
+            )
+            .is_err()
+        );
     }
 
     #[test]
