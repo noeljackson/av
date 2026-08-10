@@ -9,6 +9,12 @@ source "$root/tests/integration-tls.sh"
 # shellcheck source=sensitive-output.sh
 # shellcheck disable=SC1091
 source "$root/tests/sensitive-output.sh"
+# Infisical v0.160.7's bootstrap endpoint still issues a legacy token without
+# an exp claim. Anchor its legacy migration window to this disposable test run
+# so the immutable fixture does not expire solely because wall-clock time
+# passed. Production AV uses short-lived Kubernetes auth instead.
+AV_INFISICAL_LEGACY_TOKEN_ENFORCED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export AV_INFISICAL_LEGACY_TOKEN_ENFORCED_AT
 compose=(docker compose --project-name "av-connectors-${UID}-$$" --file "$root/tests/integration/compose.yml")
 if [[ ${AV_ENFORCED_CONTAINER_TEST:-0} == 1 ]]; then
   compose+=(--file "$root/tests/integration/enforced-container.compose.yml")
@@ -28,6 +34,7 @@ report_failure() {
   local status=$1
   local line=$2
   printf 'connector integration failed at line %d\n' "$line" >&2
+  "${compose[@]}" logs --no-color setup >&2 || true
   exit "$status"
 }
 trap cleanup EXIT

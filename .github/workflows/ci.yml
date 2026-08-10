@@ -33,6 +33,11 @@ jobs:
         run: |
           helm lint chart/av
           helm template av chart/av >/dev/null
+          label_test_dir="$(mktemp -d)"
+          trap 'rm -rf "$label_test_dir"' EXIT
+          helm package chart/av --destination "$label_test_dir" --version '0.6.1+digest'
+          helm template av "$label_test_dir/av-0.6.1+digest.tgz" |
+            grep --quiet 'helm.sh/chart: "av-0.6.1_digest"'
           helm lint chart/av -f tests/helm/transparent-values.yaml
           helm template av chart/av -f tests/helm/transparent-values.yaml >/tmp/av-transparent.yaml
           grep --quiet 'kind: CiliumNetworkPolicy' /tmp/av-transparent.yaml

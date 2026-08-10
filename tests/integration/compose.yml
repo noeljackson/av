@@ -102,6 +102,7 @@ services:
       AUTH_SECRET: integration-only-auth-secret-integration-only-auth-secret
       DB_CONNECTION_URI: postgres://infisical:integration-only@postgres:5432/infisical
       ENCRYPTION_KEY: 9e1884bb3f26d05f76c116a0d6e3b52f # gitleaks:allow -- synthetic disposable integration key
+      LEGACY_IDENTITY_ACCESS_TOKEN_EXPIRATION_ENFORCED_AT: ${AV_INFISICAL_LEGACY_TOKEN_ENFORCED_AT:?required}
       NODE_ENV: production
       OTEL_TELEMETRY_COLLECTION_ENABLED: "false"
       REDIS_URL: redis://redis:6379
