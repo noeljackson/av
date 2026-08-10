@@ -6,6 +6,10 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # Resolved from the repository root at runtime.
 # shellcheck disable=SC1091
 source "$root/tests/integration-tls.sh"
+# Keep the disposable Infisical fixture's legacy bootstrap token inside a
+# fresh migration window. Production AV does not use this authentication path.
+AV_INFISICAL_LEGACY_TOKEN_ENFORCED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export AV_INFISICAL_LEGACY_TOKEN_ENFORCED_AT
 temporary_secret_directory=''
 temporary_tls_directory=''
 
