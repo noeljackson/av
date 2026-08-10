@@ -862,7 +862,7 @@ impl Config {
                         } else {
                             &export.field
                         };
-                        validate_environment_name(field).with_context(|| {
+                        validate_backend_field_name(field).with_context(|| {
                             format!("profile {name} export {local_name} has an invalid field")
                         })?;
                     }
@@ -1225,6 +1225,18 @@ fn validate_environment_name(value: &str) -> Result<()> {
         || !bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
     {
         bail!("environment name must match [A-Za-z_][A-Za-z0-9_]*");
+    }
+    Ok(())
+}
+
+fn validate_backend_field_name(value: &str) -> Result<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        bail!("backend field must use 1-256 ASCII letters, digits, underscores, hyphens, or dots");
     }
     Ok(())
 }
@@ -2193,6 +2205,54 @@ mod tests {
                 .to_string()
                 .contains("allowed_keys or exports")
         );
+        unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
+    }
+
+    #[test]
+    fn path_profile_exports_accept_backend_native_field_names() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe { std::env::set_var("AV_ALLOW_INSECURE_AUTH", "1") };
+        let mut config = base_config();
+        config.connectors.insert(
+            "main".into(),
+            ConnectorConfig::OpenBao(
+                serde_json::from_value(serde_json::json!({
+                    "kind": "openbao",
+                    "base_url": "https://openbao.example.test",
+                    "auth": {"type": "token", "token_file": "/run/token"}
+                }))
+                .unwrap(),
+            ),
+        );
+        config.profiles.insert(
+            "example".into(),
+            ProfileConfig {
+                connector: "main".into(),
+                project_id: String::new(),
+                environment: String::new(),
+                secret_path: "secret/data/example".into(),
+                allowed_keys: vec![],
+                exports: BTreeMap::from([(
+                    "API_TOKEN".into(),
+                    ProfileExportConfig {
+                        resource: String::new(),
+                        field: "api-token.v2".into(),
+                    },
+                )]),
+                dynamic_secret: None,
+            },
+        );
+        assert!(config.validate().is_ok());
+
+        config
+            .profiles
+            .get_mut("example")
+            .unwrap()
+            .exports
+            .get_mut("API_TOKEN")
+            .unwrap()
+            .field = "api/token".into();
+        assert!(config.validate().is_err());
         unsafe { std::env::remove_var("AV_ALLOW_INSECURE_AUTH") };
     }
 
