@@ -33,7 +33,9 @@ name:
 
 `allowed_keys` and `exports` are mutually exclusive. When `exports` is used,
 AV fails the request if any configured remote field is absent and discards
-unmapped fields.
+unmapped fields. Local export names must be portable environment-variable
+names. Remote `field` names may additionally contain hyphens and dots, matching
+the native key conventions used by OpenBao and Infisical.
 
 Google Secret Manager has no path-wide list operation in AV. Every local name
 must name one exact version resource:
