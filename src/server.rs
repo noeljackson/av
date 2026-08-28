@@ -2,7 +2,6 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     convert::Infallible,
     io,
-    net::{IpAddr, Ipv4Addr},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -19,6 +18,12 @@ use argon2::{
     },
 };
 use askama::Template;
+use av_credential_proxy::{
+    RedactionSet, ValidatedProxyRequest, build_target_url, enforce_transparent_tunnel_target,
+    is_websocket_attempt, prepare_credentials, prepare_outbound_headers,
+    prepare_websocket_credentials, tunnel_ip_allowed, validate_proxy_request,
+    validate_websocket_handshake, websocket_subprotocols,
+};
 use axum::{
     Router,
     body::Bytes,
@@ -28,10 +33,9 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{any, get, post},
 };
-use base64::{
-    Engine,
-    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
-};
+#[cfg(test)]
+use base64::engine::general_purpose::STANDARD;
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use futures_util::{SinkExt, StreamExt, stream};
 use http_body_util::{BodyExt, Empty};
 use hyper::{
@@ -58,6 +62,8 @@ use tokio_tungstenite::{
 use tower_http::{set_header::SetResponseHeaderLayer, trace::TraceLayer};
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::config::ProxyInjectionConfig;
 use crate::{
     auth::Authenticator,
     av::v1::{
@@ -80,8 +86,8 @@ use crate::{
         UpsertBasicUserRequest,
     },
     config::{
-        AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyInjectionConfig,
-        ProxyResponseMode, ProxyRouteConfig, ProxyWebSocketConfig,
+        AuthMode, Config, ConfigMode, GithubAuthConfig, ProfileConfig, ProxyResponseMode,
+        ProxyRouteConfig, ProxyWebSocketConfig,
     },
     connector::{BackendLease, Connector, SecretAcquisition},
     proxy_ca::ProxyCertificateAuthority,
@@ -3504,44 +3510,6 @@ async fn connect_credentialless_upstream(host: &str, allow_private_ips: bool) ->
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("tunnel upstream is unavailable")))
 }
 
-fn tunnel_ip_allowed(address: IpAddr, allow_private_ips: bool) -> bool {
-    match address {
-        IpAddr::V4(address) => {
-            if address.is_unspecified()
-                || address.is_loopback()
-                || address.is_link_local()
-                || address.is_multicast()
-                || address.is_broadcast()
-                || address.is_documentation()
-                || address.octets()[0] == 0
-                || address.octets()[0] >= 240
-            {
-                return false;
-            }
-            allow_private_ips
-                || (!address.is_private()
-                    && !ipv4_in_prefix(address, Ipv4Addr::new(100, 64, 0, 0), 10)
-                    && !ipv4_in_prefix(address, Ipv4Addr::new(198, 18, 0, 0), 15))
-        }
-        IpAddr::V6(address) => {
-            if address.is_unspecified()
-                || address.is_loopback()
-                || address.is_multicast()
-                || address.is_unicast_link_local()
-                || address.segments()[0] == 0x2001 && address.segments()[1] == 0x0db8
-            {
-                return false;
-            }
-            allow_private_ips || !address.is_unique_local()
-        }
-    }
-}
-
-fn ipv4_in_prefix(address: Ipv4Addr, network: Ipv4Addr, prefix: u32) -> bool {
-    let mask = u32::MAX.checked_shl(32 - prefix).unwrap_or(0);
-    u32::from(address) & mask == u32::from(network) & mask
-}
-
 async fn serve_credentialless_tunnel(
     upgraded: hyper::upgrade::Upgraded,
     upstream: TcpStream,
@@ -3568,8 +3536,10 @@ async fn serve_transparent_tls_tunnel(
     token_hash: [u8; 32],
     session_id: String,
 ) -> Result<()> {
-    let leaf = runtime.certificate_authority.issue_leaf(&host)?;
-    let tls = tokio_rustls::TlsAcceptor::from(Arc::new(leaf.server_config()?))
+    let server_config = runtime
+        .certificate_authority
+        .issue_server_config(&host, crate::proxy_ca::crypto_provider())?;
+    let tls = tokio_rustls::TlsAcceptor::from(Arc::new(server_config))
         .accept(TokioIo::new(upgraded))
         .await
         .context("accept transparent proxy TLS")?;
@@ -3664,13 +3634,6 @@ async fn transparent_tunnel_response(
         tracing::warn!(%error, route = route_name, "transparent proxy request target denied");
         return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
     }
-    let normalized_path = match enforce_proxy_policy(route, parts.uri.path(), &parts.method) {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(%error, route = route_name, "transparent proxy request denied by route policy");
-            return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
-        }
-    };
     let body = match collect_transparent_body(body, route.max_body_bytes).await {
         Ok(body) => body,
         Err(error) => {
@@ -3687,14 +3650,17 @@ async fn transparent_tunnel_response(
             "WebSocket upgrade body is forbidden\n",
         );
     }
-    if let Err(error) = enforce_proxy_content_type(route, &parts.headers, body.len()) {
-        tracing::warn!(%error, route = route_name, "transparent proxy content type rejected");
-        return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
-    }
-    let query = match validate_proxy_query(route, parts.uri.query()) {
-        Ok(query) => query,
+    let validated = match validate_proxy_request(
+        route,
+        parts.uri.path(),
+        parts.uri.query(),
+        &parts.method,
+        &parts.headers,
+        body.len(),
+    ) {
+        Ok(validated) => validated,
         Err(error) => {
-            tracing::warn!(%error, route = route_name, "transparent proxy query rejected");
+            tracing::warn!(%error, route = route_name, "transparent proxy request denied by route policy");
             return transparent_full_response(StatusCode::FORBIDDEN, "proxy request forbidden\n");
         }
     };
@@ -3704,8 +3670,7 @@ async fn transparent_tunnel_response(
             route,
             ProxyRequestContext {
                 subject: &session.subject,
-                normalized_path: &normalized_path,
-                query: &query,
+                validated: &validated,
                 method: parts.method,
                 headers: parts.headers,
             },
@@ -3722,8 +3687,7 @@ async fn transparent_tunnel_response(
             route,
             ProxyRequestContext {
                 subject: &session.subject,
-                normalized_path: &normalized_path,
-                query: &query,
+                validated: &validated,
                 method: parts.method,
                 headers: parts.headers,
             },
@@ -3862,13 +3826,6 @@ async fn proxy(
         tracing::warn!(subject = %identity.subject, route = route_name, "proxy request rejected for untrusted browser origin");
         return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();
     }
-    let normalized_path = match enforce_proxy_policy(route, &path, &method) {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::warn!(subject = %identity.subject, route = route_name, path, error = %error, "proxy request forbidden by route policy");
-            return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();
-        }
-    };
     if body.len() > route.max_body_bytes {
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -3876,14 +3833,17 @@ async fn proxy(
         )
             .into_response();
     }
-    if let Err(error) = enforce_proxy_content_type(route, &headers, body.len()) {
-        tracing::warn!(subject = %identity.subject, route = route_name, error = %error, "proxy request content type rejected by route policy");
-        return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();
-    }
-    let query = match validate_proxy_query(route, uri.query()) {
-        Ok(query) => query,
+    let validated = match validate_proxy_request(
+        route,
+        &path,
+        uri.query(),
+        &method,
+        &headers,
+        body.len(),
+    ) {
+        Ok(validated) => validated,
         Err(error) => {
-            tracing::warn!(subject = %identity.subject, route = route_name, error = %error, "proxy request query rejected by route policy");
+            tracing::warn!(subject = %identity.subject, route = route_name, path, error = %error, "proxy request forbidden by route policy");
             return (StatusCode::FORBIDDEN, "proxy request forbidden\n").into_response();
         }
     };
@@ -3904,8 +3864,7 @@ async fn proxy(
         route,
         ProxyRequestContext {
             subject: &identity.subject,
-            normalized_path: &normalized_path,
-            query: &query,
+            validated: &validated,
             method,
             headers,
         },
@@ -3936,56 +3895,6 @@ async fn audit_event(
         store
             .record_audit(actor, action, profile, route, executable_basename)
             .await?;
-    }
-    Ok(())
-}
-
-fn is_websocket_attempt(headers: &HeaderMap) -> bool {
-    [
-        header::UPGRADE,
-        header::SEC_WEBSOCKET_KEY,
-        header::SEC_WEBSOCKET_VERSION,
-        header::SEC_WEBSOCKET_PROTOCOL,
-        header::SEC_WEBSOCKET_EXTENSIONS,
-    ]
-    .iter()
-    .any(|name| headers.contains_key(name))
-        || header_contains_token(headers, header::CONNECTION, "upgrade")
-}
-
-fn validate_websocket_handshake(headers: &HeaderMap, policy: &ProxyWebSocketConfig) -> Result<()> {
-    if !header_contains_token(headers, header::CONNECTION, "upgrade")
-        || !single_header_equals(headers, header::UPGRADE, "websocket")
-        || !single_header_equals(headers, header::SEC_WEBSOCKET_VERSION, "13")
-        || headers.contains_key(header::SEC_WEBSOCKET_EXTENSIONS)
-    {
-        bail!("WebSocket upgrade headers are invalid or extensions were requested");
-    }
-    let key = single_header_text(headers, header::SEC_WEBSOCKET_KEY)?;
-    if !matches!(STANDARD.decode(key.as_bytes()), Ok(decoded) if decoded.len() == 16) {
-        bail!("WebSocket key is invalid");
-    }
-    match single_optional_header_text(headers, header::ORIGIN)? {
-        Some(origin) => {
-            if !policy
-                .allowed_origins
-                .iter()
-                .any(|allowed| allowed == origin)
-            {
-                bail!("WebSocket Origin is not allowed");
-            }
-        }
-        None if !policy.allow_missing_origin => bail!("WebSocket Origin is required"),
-        None => {}
-    }
-    let requested = websocket_subprotocols(headers)?;
-    if requested.iter().any(|protocol| {
-        !policy
-            .allowed_subprotocols
-            .iter()
-            .any(|allowed| allowed == protocol)
-    }) {
-        bail!("WebSocket subprotocol is not allowed");
     }
     Ok(())
 }
@@ -4027,47 +3936,9 @@ fn single_optional_header_text(headers: &HeaderMap, name: HeaderName) -> Result<
     }
 }
 
-fn websocket_subprotocols(headers: &HeaderMap) -> Result<Vec<String>> {
-    let Some(value) = single_optional_header_text(headers, header::SEC_WEBSOCKET_PROTOCOL)? else {
-        return Ok(Vec::new());
-    };
-    let mut unique = BTreeSet::new();
-    let mut protocols = Vec::new();
-    for protocol in value.split(',').map(str::trim) {
-        if protocol.is_empty()
-            || !protocol.bytes().all(|byte| {
-                byte.is_ascii_alphanumeric()
-                    || matches!(
-                        byte,
-                        b'!' | b'#'
-                            | b'$'
-                            | b'%'
-                            | b'&'
-                            | b'\''
-                            | b'*'
-                            | b'+'
-                            | b'-'
-                            | b'.'
-                            | b'^'
-                            | b'_'
-                            | b'`'
-                            | b'|'
-                            | b'~'
-                    )
-            })
-            || !unique.insert(protocol.to_owned())
-        {
-            bail!("WebSocket subprotocol list is invalid");
-        }
-        protocols.push(protocol.to_owned());
-    }
-    Ok(protocols)
-}
-
 struct ProxyRequestContext<'a> {
     subject: &'a str,
-    normalized_path: &'a str,
-    query: &'a [(String, String)],
+    validated: &'a ValidatedProxyRequest,
     method: Method,
     headers: HeaderMap,
 }
@@ -4080,8 +3951,7 @@ async fn proxy_websocket_request(
 ) -> Result<Response> {
     let ProxyRequestContext {
         subject,
-        normalized_path,
-        query,
+        validated,
         method,
         headers,
     } = request;
@@ -4100,24 +3970,9 @@ async fn proxy_websocket_request(
         .context("proxy profile disappeared")?;
     let mut acquisition =
         acquire_owned_proxy_secrets(state, &route.profile, profile, subject).await?;
-    let (injection_name, injection_value, sensitive_values) =
-        build_proxy_injection(route, &acquisition.values)?;
-    let mut target =
-        url::Url::parse(&route.base_url).context("proxy route base URL disappeared")?;
-    let target_path = format!("{}{}", target.path().trim_end_matches('/'), normalized_path);
-    target.set_path(&target_path);
-    target.set_query(None);
-    if !query.is_empty() {
-        target.query_pairs_mut().extend_pairs(query);
-    }
-
-    let mut outbound_headers = HeaderMap::new();
-    for configured in &route.allowed_request_headers {
-        let name = HeaderName::from_bytes(configured.as_bytes())?;
-        if let Some(value) = headers.get(&name) {
-            outbound_headers.insert(name, value.clone());
-        }
-    }
+    let prepared = prepare_websocket_credentials(route, &acquisition.values)?;
+    let target = build_target_url(route, validated)?;
+    let mut outbound_headers = prepare_outbound_headers(route, &headers, &prepared)?;
     for name in [
         header::ORIGIN,
         header::SEC_WEBSOCKET_KEY,
@@ -4130,8 +3985,7 @@ async fn proxy_websocket_request(
     }
     outbound_headers.insert(header::CONNECTION, HeaderValue::from_static("Upgrade"));
     outbound_headers.insert(header::UPGRADE, HeaderValue::from_static("websocket"));
-    outbound_headers.remove(&injection_name);
-    outbound_headers.insert(injection_name, injection_value);
+    let (_, redaction) = prepared.into_body_and_redaction();
 
     let upstream = state
         .websocket_client
@@ -4175,7 +4029,7 @@ async fn proxy_websocket_request(
         session_id: upgrade.session_id,
         profile: route.profile.clone(),
         policy,
-        sensitive_values,
+        redaction,
         dynamic_lease: acquisition.lease.take(),
     };
     tokio::spawn(async move {
@@ -4212,7 +4066,7 @@ struct WebSocketSessionContext {
     session_id: String,
     profile: String,
     policy: ProxyWebSocketConfig,
-    sensitive_values: Vec<Vec<u8>>,
+    redaction: RedactionSet,
     dynamic_lease: Option<DynamicLeaseOwner>,
 }
 
@@ -4235,7 +4089,7 @@ async fn relay_websocket_streams(
         session_id,
         profile,
         policy,
-        sensitive_values,
+        redaction,
         mut dynamic_lease,
     } = session;
     let websocket_config = WebSocketConfig::default()
@@ -4290,7 +4144,7 @@ async fn relay_websocket_streams(
                         bail!("WebSocket byte limit reached");
                     }
                     let closed = message.is_close();
-                    let message = redact_websocket_message(message, &sensitive_values)?;
+                    let message = redact_websocket_message(message, &redaction)?;
                     tokio::time::timeout(Duration::from_secs(5), upstream.send(message))
                         .await
                         .context("upstream WebSocket write timed out")??;
@@ -4308,7 +4162,7 @@ async fn relay_websocket_streams(
                         bail!("WebSocket byte limit reached");
                     }
                     let closed = message.is_close();
-                    let message = redact_websocket_message(message, &sensitive_values)?;
+                    let message = redact_websocket_message(message, &redaction)?;
                     tokio::time::timeout(Duration::from_secs(5), client.send(message))
                         .await
                         .context("caller WebSocket write timed out")??;
@@ -4353,27 +4207,19 @@ async fn websocket_session_is_active(
     profile_permitted(state, &session.subject, profile, GrantMode::Proxy).await
 }
 
-fn redact_websocket_message(message: Message, sensitive_values: &[Vec<u8>]) -> Result<Message> {
+fn redact_websocket_message(message: Message, redaction: &RedactionSet) -> Result<Message> {
     Ok(match message {
-        Message::Text(value) => Message::Text(
-            String::from_utf8(redact_secrets(value.as_bytes(), sensitive_values))?.into(),
-        ),
-        Message::Binary(value) => {
-            Message::Binary(Bytes::from(redact_secrets(&value, sensitive_values)))
+        Message::Text(value) => {
+            Message::Text(String::from_utf8(redaction.redact_bytes(value.as_bytes()))?.into())
         }
-        Message::Ping(value) => {
-            Message::Ping(Bytes::from(redact_secrets(&value, sensitive_values)))
-        }
-        Message::Pong(value) => {
-            Message::Pong(Bytes::from(redact_secrets(&value, sensitive_values)))
-        }
+        Message::Binary(value) => Message::Binary(Bytes::from(redaction.redact_bytes(&value))),
+        Message::Ping(value) => Message::Ping(Bytes::from(redaction.redact_bytes(&value))),
+        Message::Pong(value) => Message::Pong(Bytes::from(redaction.redact_bytes(&value))),
         Message::Close(frame) => Message::Close(
             frame
                 .map(|frame| {
-                    let reason = String::from_utf8(redact_secrets(
-                        frame.reason.as_bytes(),
-                        sensitive_values,
-                    ))?;
+                    let reason =
+                        String::from_utf8(redaction.redact_bytes(frame.reason.as_bytes()))?;
                     Ok::<_, anyhow::Error>(tokio_tungstenite::tungstenite::protocol::CloseFrame {
                         code: frame.code,
                         reason: reason.into(),
@@ -4393,8 +4239,7 @@ async fn proxy_request(
 ) -> Result<Response> {
     let ProxyRequestContext {
         subject,
-        normalized_path,
-        query,
+        validated,
         method,
         headers,
     } = request;
@@ -4405,28 +4250,10 @@ async fn proxy_request(
         .context("proxy profile disappeared")?;
     let mut acquisition =
         acquire_owned_proxy_secrets(state, &route.profile, profile, subject).await?;
-    let (injection_name, injection_value, mut sensitive_values) =
-        build_proxy_injection(route, &acquisition.values)?;
-    let (body, body_sensitive_values) =
-        apply_body_substitutions(route, &acquisition.values, &body)?;
-    sensitive_values.extend(body_sensitive_values);
-    let mut target =
-        url::Url::parse(&route.base_url).context("proxy route base URL disappeared")?;
-    let target_path = format!("{}{}", target.path().trim_end_matches('/'), normalized_path);
-    target.set_path(&target_path);
-    target.set_query(None);
-    if !query.is_empty() {
-        target.query_pairs_mut().extend_pairs(query);
-    }
-    let mut outbound_headers = HeaderMap::new();
-    for configured in &route.allowed_request_headers {
-        let name = HeaderName::from_bytes(configured.as_bytes())?;
-        if let Some(value) = headers.get(&name) {
-            outbound_headers.insert(name, value.clone());
-        }
-    }
-    outbound_headers.remove(&injection_name);
-    outbound_headers.insert(injection_name, injection_value);
+    let prepared = prepare_credentials(route, &acquisition.values, &body)?;
+    let target = build_target_url(route, validated)?;
+    let outbound_headers = prepare_outbound_headers(route, &headers, &prepared)?;
+    let (body, redaction) = prepared.into_body_and_redaction();
     let mut upstream = state
         .proxy_client
         .request(method, target)
@@ -4446,7 +4273,7 @@ async fn proxy_request(
     for configured in &route.allowed_response_headers {
         let name = HeaderName::from_bytes(configured.as_bytes())?;
         if let Some(value) = upstream_headers.get(&name)
-            && let Some(value) = redact_header(value, &sensitive_values)
+            && let Some(value) = redaction.redact_header(value)
         {
             response = response.header(name, value);
         }
@@ -4460,7 +4287,7 @@ async fn proxy_request(
                 }
                 bytes.extend_from_slice(&chunk);
             }
-            let bytes = redact_secrets(&bytes, &sensitive_values);
+            let bytes = redaction.redact_bytes(&bytes);
             let response = response.body(axum::body::Body::from(bytes))?;
             if let Some(lease) = acquisition.lease.take() {
                 lease
@@ -4472,7 +4299,7 @@ async fn proxy_request(
         }
         ProxyResponseMode::Streaming => {
             let maximum = route.max_response_bytes;
-            let redactor = StreamingRedactor::new_multiple(&sensitive_values);
+            let redactor = redaction.into_streaming();
             let body_stream = stream::try_unfold(
                 (upstream, redactor, 0_usize, false, acquisition.lease.take()),
                 move |(mut upstream, mut redactor, mut total, finished, mut lease)| async move {
@@ -4518,189 +4345,10 @@ async fn proxy_request(
     }
 }
 
-fn build_proxy_injection(
-    route: &ProxyRouteConfig,
-    secrets: &BTreeMap<String, String>,
-) -> Result<(HeaderName, HeaderValue, Vec<Vec<u8>>)> {
-    let (name, value, mut sensitive_values) = match &route.injection {
-        None => {
-            let secret = secrets
-                .get(&route.secret_key)
-                .context("proxy credential is unavailable")?;
-            (
-                route.header.as_str(),
-                format!("{}{}", route.header_prefix, secret),
-                vec![secret.as_bytes().to_vec()],
-            )
-        }
-        Some(ProxyInjectionConfig::Bearer { secret_key }) => {
-            let secret = secrets
-                .get(secret_key)
-                .context("proxy bearer credential is unavailable")?;
-            (
-                "authorization",
-                format!("Bearer {secret}"),
-                vec![secret.as_bytes().to_vec()],
-            )
-        }
-        Some(ProxyInjectionConfig::Header {
-            secret_key,
-            header,
-            prefix,
-        }) => {
-            let secret = secrets
-                .get(secret_key)
-                .context("proxy header credential is unavailable")?;
-            (
-                header.as_str(),
-                format!("{prefix}{secret}"),
-                vec![secret.as_bytes().to_vec()],
-            )
-        }
-        Some(ProxyInjectionConfig::Basic {
-            username,
-            password_secret_key,
-        }) => {
-            let password = secrets
-                .get(password_secret_key)
-                .context("proxy basic password is unavailable")?;
-            let pair = format!("{username}:{password}");
-            let value = format!("Basic {}", STANDARD.encode(pair.as_bytes()));
-            (
-                "authorization",
-                value,
-                vec![password.as_bytes().to_vec(), pair.into_bytes()],
-            )
-        }
-    };
-    sensitive_values.push(value.as_bytes().to_vec());
-    let name = HeaderName::from_bytes(name.as_bytes())?;
-    let mut value = HeaderValue::from_str(&value)?;
-    value.set_sensitive(true);
-    Ok((name, value, sensitive_values))
-}
-
-fn apply_body_substitutions(
-    route: &ProxyRouteConfig,
-    secrets: &BTreeMap<String, String>,
-    body: &[u8],
-) -> Result<(Bytes, Vec<Vec<u8>>)> {
-    let mut output = body.to_vec();
-    let mut sensitive_values = Vec::with_capacity(route.body_substitutions.len());
-    for (placeholder, secret_key) in &route.body_substitutions {
-        let secret = secrets
-            .get(secret_key)
-            .with_context(|| format!("body substitution secret {secret_key} is unavailable"))?;
-        let occurrences = output
-            .windows(placeholder.len())
-            .filter(|window| *window == placeholder.as_bytes())
-            .count();
-        if occurrences != 1 {
-            bail!("body placeholder must appear exactly once");
-        }
-        let position = output
-            .windows(placeholder.len())
-            .position(|window| window == placeholder.as_bytes())
-            .context("body placeholder disappeared")?;
-        let resulting_length = output
-            .len()
-            .saturating_sub(placeholder.len())
-            .saturating_add(secret.len());
-        if resulting_length > route.max_body_bytes {
-            bail!("substituted request body is too large");
-        }
-        output.splice(
-            position..position + placeholder.len(),
-            secret.as_bytes().iter().copied(),
-        );
-        sensitive_values.push(secret.as_bytes().to_vec());
-    }
-    Ok((Bytes::from(output), sensitive_values))
-}
-
+#[cfg(test)]
 fn enforce_proxy_policy(route: &ProxyRouteConfig, path: &str, method: &Method) -> Result<String> {
-    if !route
-        .allowed_methods
-        .iter()
-        .any(|allowed| allowed.eq_ignore_ascii_case(method.as_str()))
-    {
-        bail!("method is not allowed");
-    }
-
-    let normalized_path = format!("/{}", path.trim_start_matches('/'));
-    if normalized_path.contains('\\')
-        || normalized_path.contains('%')
-        || normalized_path.contains("//")
-        || normalized_path.chars().any(char::is_control)
-        || normalized_path
-            .split('/')
-            .any(|segment| matches!(segment, "." | ".."))
-    {
-        bail!("path contains a traversal sequence");
-    }
-
-    if !route.allowed_exact_paths.contains(&normalized_path)
-        && !route
-            .allowed_path_prefixes
-            .iter()
-            .any(|prefix| path_matches_prefix(&normalized_path, prefix))
-    {
-        bail!("path is not allowed");
-    }
-    Ok(normalized_path)
-}
-
-/// The TLS tunnel is already bound to a catalog host by CONNECT. Repeat that
-/// check on the decrypted HTTP request so a client cannot smuggle a different
-/// target through an absolute-form URI, Host header, or nested proxy auth.
-/// Any allowed caller headers are later copied by `proxy_request`; everything
-/// else is dropped rather than forwarded to the provider.
-fn enforce_transparent_tunnel_target(
-    route: &ProxyRouteConfig,
-    uri: &Uri,
-    headers: &HeaderMap,
-) -> Result<()> {
-    if uri.scheme().is_some() || uri.authority().is_some() || !uri.path().starts_with('/') {
-        bail!("transparent tunnel requires an origin-form request target");
-    }
-    if headers.get_all(header::HOST).iter().count() != 1 {
-        bail!("transparent tunnel requires exactly one Host header");
-    }
-    if headers
-        .get_all(header::PROXY_AUTHORIZATION)
-        .iter()
-        .next()
-        .is_some()
-    {
-        bail!("transparent tunnel must not contain proxy authorization");
-    }
-    let configured =
-        url::Url::parse(&route.base_url).context("transparent route base URL disappeared")?;
-    let supplied_host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .context("transparent tunnel Host header is invalid")?;
-    let supplied = url::Url::parse(&format!("https://{supplied_host}"))
-        .context("transparent tunnel Host header is malformed")?;
-    if supplied.username() != ""
-        || supplied.password().is_some()
-        || supplied.port_or_known_default() != Some(443)
-        || supplied.host_str() != configured.host_str()
-    {
-        bail!("transparent tunnel Host does not match its configured route");
-    }
-    Ok(())
-}
-
-fn path_matches_prefix(path: &str, configured_prefix: &str) -> bool {
-    let normalized_prefix = format!("/{}", configured_prefix.trim_matches('/'));
-    if normalized_prefix == "/" {
-        return true;
-    }
-    path == normalized_prefix
-        || path
-            .strip_prefix(&normalized_prefix)
-            .is_some_and(|remainder| remainder.starts_with('/'))
+    validate_proxy_request(route, path, None, method, &HeaderMap::new(), 0)
+        .map(|request| request.normalized_path().to_owned())
 }
 
 fn is_trusted_browser_origin(headers: &HeaderMap, public_url: &str) -> bool {
@@ -4909,221 +4557,64 @@ fn dynamic_proxy_renewal_delay(expires_at: SystemTime) -> Result<Duration> {
     Ok(Duration::from_secs((remaining.as_secs() / 2).max(1)))
 }
 
+#[cfg(test)]
 fn enforce_proxy_content_type(
     route: &ProxyRouteConfig,
     headers: &HeaderMap,
     body_len: usize,
 ) -> Result<()> {
-    if body_len == 0 {
-        return Ok(());
-    }
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .map(str::trim)
-        .map(str::to_ascii_lowercase)
-        .context("request body requires a valid Content-Type")?;
-    if !route
-        .allowed_content_types
-        .iter()
-        .any(|allowed| allowed == &content_type)
-    {
-        bail!("request Content-Type is not allowed");
-    }
-    Ok(())
+    validate_proxy_request(
+        route,
+        representative_proxy_path(route)?,
+        None,
+        &representative_proxy_method(route)?,
+        headers,
+        body_len,
+    )
+    .map(|_| ())
 }
 
+#[cfg(test)]
 fn validate_proxy_query(
     route: &ProxyRouteConfig,
     query: Option<&str>,
 ) -> Result<Vec<(String, String)>> {
-    let Some(query) = query.filter(|query| !query.is_empty()) else {
-        return Ok(Vec::new());
-    };
-    validate_percent_encoding(query)?;
-    let mut names = BTreeSet::new();
-    let mut validated = Vec::new();
-    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        if name.chars().any(char::is_control) || value.chars().any(char::is_control) {
-            bail!("query contains control characters");
-        }
-        if !route
-            .allowed_query_parameters
-            .iter()
-            .any(|allowed| allowed == name.as_ref())
-        {
-            bail!("query parameter is not allowed");
-        }
-        if !names.insert(name.to_string()) {
-            bail!("duplicate query parameters are not allowed");
-        }
-        validated.push((name.into_owned(), value.into_owned()));
-    }
-    Ok(validated)
+    validate_proxy_request(
+        route,
+        representative_proxy_path(route)?,
+        query,
+        &representative_proxy_method(route)?,
+        &HeaderMap::new(),
+        0,
+    )
+    .map(|request| request.query().to_vec())
 }
 
-fn validate_percent_encoding(value: &str) -> Result<()> {
-    let bytes = value.as_bytes();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == b'%' {
-            if index + 2 >= bytes.len()
-                || !bytes[index + 1].is_ascii_hexdigit()
-                || !bytes[index + 2].is_ascii_hexdigit()
-            {
-                bail!("query contains invalid percent encoding");
-            }
-            index += 3;
-        } else {
-            index += 1;
-        }
-    }
-    Ok(())
+#[cfg(test)]
+fn representative_proxy_path(route: &ProxyRouteConfig) -> Result<&str> {
+    route
+        .allowed_exact_paths
+        .first()
+        .or_else(|| route.allowed_path_prefixes.first())
+        .map(String::as_str)
+        .context("test route has no allowed path")
 }
 
-struct StreamingRedactor {
-    pending: Vec<u8>,
-    patterns: Vec<Vec<u8>>,
-    maximum_pattern_length: usize,
-}
-
-impl StreamingRedactor {
-    #[cfg(test)]
-    fn new(secret: &[u8]) -> Self {
-        Self::new_multiple(&[secret.to_vec()])
-    }
-
-    fn new_multiple(secrets: &[Vec<u8>]) -> Self {
-        let mut patterns = secrets
-            .iter()
-            .flat_map(|secret| credential_encodings(secret))
-            .filter(|pattern| !pattern.is_empty())
-            .collect::<Vec<_>>();
-        patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        patterns.dedup();
-        let maximum_pattern_length = patterns.iter().map(Vec::len).max().unwrap_or(1);
-        Self {
-            pending: Vec::new(),
-            patterns,
-            maximum_pattern_length,
-        }
-    }
-
-    fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
-        self.pending.extend_from_slice(chunk);
-        self.emit(false)
-    }
-
-    fn finish(&mut self) -> Vec<u8> {
-        self.emit(true)
-    }
-
-    fn emit(&mut self, finished: bool) -> Vec<u8> {
-        let safe_limit = if finished {
-            self.pending.len()
-        } else {
-            self.pending
-                .len()
-                .saturating_sub(self.maximum_pattern_length.saturating_sub(1))
-        };
-        let mut consumed = 0;
-        let mut output = Vec::with_capacity(safe_limit);
-        while consumed < safe_limit {
-            if let Some(pattern) = self
-                .patterns
-                .iter()
-                .find(|pattern| self.pending[consumed..].starts_with(pattern.as_slice()))
-            {
-                output.extend_from_slice(b"[REDACTED]");
-                consumed += pattern.len();
-            } else {
-                output.push(self.pending[consumed]);
-                consumed += 1;
-            }
-        }
-        self.pending.drain(..consumed);
-        output
-    }
+#[cfg(test)]
+fn representative_proxy_method(route: &ProxyRouteConfig) -> Result<Method> {
+    Method::from_bytes(
+        route
+            .allowed_methods
+            .first()
+            .context("test route has no allowed method")?
+            .as_bytes(),
+    )
+    .context("test route method is invalid")
 }
 
 #[cfg(test)]
 fn redact(body: &[u8], secret: &[u8]) -> Vec<u8> {
-    redact_secrets(body, &[secret.to_vec()])
-}
-
-fn redact_secrets(body: &[u8], secrets: &[Vec<u8>]) -> Vec<u8> {
-    let mut output = body.to_vec();
-    let mut patterns = secrets
-        .iter()
-        .flat_map(|secret| credential_encodings(secret))
-        .collect::<Vec<_>>();
-    patterns.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    patterns.dedup();
-    for pattern in patterns {
-        output = redact_exact(&output, &pattern);
-    }
-    output
-}
-
-fn redact_exact(body: &[u8], secret: &[u8]) -> Vec<u8> {
-    if secret.is_empty() || body.len() < secret.len() {
-        return body.to_vec();
-    }
-    let mut output = Vec::with_capacity(body.len());
-    let mut offset = 0;
-    while let Some(position) = body[offset..]
-        .windows(secret.len())
-        .position(|window| window == secret)
-    {
-        let absolute = offset + position;
-        output.extend_from_slice(&body[offset..absolute]);
-        output.extend_from_slice(b"[REDACTED]");
-        offset = absolute + secret.len();
-    }
-    output.extend_from_slice(&body[offset..]);
-    output
-}
-
-fn credential_encodings(secret: &[u8]) -> Vec<Vec<u8>> {
-    let percent_encoded = url::form_urlencoded::byte_serialize(secret).collect::<String>();
-    let mut encodings = vec![
-        secret.to_vec(),
-        STANDARD.encode(secret).into_bytes(),
-        STANDARD_NO_PAD.encode(secret).into_bytes(),
-        URL_SAFE.encode(secret).into_bytes(),
-        URL_SAFE_NO_PAD.encode(secret).into_bytes(),
-        percent_encoded.as_bytes().to_vec(),
-        lowercase_percent_hex(&percent_encoded).into_bytes(),
-    ];
-    if let Ok(secret) = std::str::from_utf8(secret)
-        && let Ok(json) = serde_json::to_string(secret)
-    {
-        encodings.push(json.as_bytes()[1..json.len() - 1].to_vec());
-    }
-    encodings.sort_by_key(|value| std::cmp::Reverse(value.len()));
-    encodings.dedup();
-    encodings
-}
-
-fn lowercase_percent_hex(value: &str) -> String {
-    let mut bytes = value.as_bytes().to_vec();
-    let mut index = 0;
-    while index + 2 < bytes.len() {
-        if bytes[index] == b'%' {
-            bytes[index + 1].make_ascii_lowercase();
-            bytes[index + 2].make_ascii_lowercase();
-            index += 3;
-        } else {
-            index += 1;
-        }
-    }
-    String::from_utf8(bytes).expect("percent encoding is ASCII")
-}
-
-fn redact_header(value: &HeaderValue, secrets: &[Vec<u8>]) -> Option<HeaderValue> {
-    let redacted = redact_secrets(value.as_bytes(), secrets);
-    HeaderValue::from_bytes(&redacted).ok()
+    RedactionSet::new([secret]).redact_bytes(body)
 }
 
 fn unauthorized(error: anyhow::Error) -> Response {
@@ -6390,7 +5881,7 @@ mod tests {
         let encoded = STANDARD.encode(secret);
         let percent = url::form_urlencoded::byte_serialize(secret).collect::<String>();
         let input = format!("before stream+secret middle {encoded} after {percent}");
-        let mut redactor = StreamingRedactor::new(secret);
+        let mut redactor = RedactionSet::new([secret]).into_streaming();
         let mut output = Vec::new();
         for byte in input.as_bytes() {
             output.extend(redactor.push(std::slice::from_ref(byte)));
@@ -6500,13 +5991,15 @@ mod tests {
             username: "service-user".into(),
             password_secret_key: "API_TOKEN".into(),
         });
-        let (name, value, sensitive) = build_proxy_injection(&route, &secrets).unwrap();
-        assert_eq!(name, header::AUTHORIZATION);
+        let prepared = prepare_credentials(&route, &secrets, b"").unwrap();
+        assert_eq!(prepared.injection_name(), header::AUTHORIZATION);
         assert_eq!(
-            value,
-            HeaderValue::from_static("Basic c2VydmljZS11c2VyOnNlY3JldCt2YWx1ZQ==")
+            prepared.injection_value(),
+            &HeaderValue::from_static("Basic c2VydmljZS11c2VyOnNlY3JldCt2YWx1ZQ==")
         );
-        let reflected = redact_secrets(value.as_bytes(), &sensitive);
+        let reflected_value = prepared.injection_value().clone();
+        let (_, redaction) = prepared.into_body_and_redaction();
+        let reflected = redaction.redact_bytes(reflected_value.as_bytes());
         assert_eq!(reflected, b"[REDACTED]");
     }
 
@@ -6517,17 +6010,14 @@ mod tests {
         route
             .body_substitutions
             .insert("__AV_SECRET_TOKEN__".into(), "API_TOKEN".into());
-        let (body, sensitive) =
-            apply_body_substitutions(&route, &secrets, br#"{"token":"__AV_SECRET_TOKEN__"}"#)
-                .unwrap();
-        assert_eq!(body, r#"{"token":"secret+value"}"#);
-        assert_eq!(
-            redact_secrets(&body, &sensitive),
-            br#"{"token":"[REDACTED]"}"#
-        );
-        assert!(apply_body_substitutions(&route, &secrets, b"missing").is_err());
+        let prepared =
+            prepare_credentials(&route, &secrets, br#"{"token":"__AV_SECRET_TOKEN__"}"#).unwrap();
+        assert_eq!(prepared.body(), br#"{"token":"secret+value"}"#);
+        let (body, redaction) = prepared.into_body_and_redaction();
+        assert_eq!(redaction.redact_bytes(&body), br#"{"token":"[REDACTED]"}"#);
+        assert!(prepare_credentials(&route, &secrets, b"missing").is_err());
         assert!(
-            apply_body_substitutions(&route, &secrets, b"__AV_SECRET_TOKEN____AV_SECRET_TOKEN__")
+            prepare_credentials(&route, &secrets, b"__AV_SECRET_TOKEN____AV_SECRET_TOKEN__")
                 .is_err()
         );
     }
@@ -6607,7 +6097,7 @@ mod tests {
                 session_id: session.session_id.clone(),
                 profile: session.profile.clone(),
                 policy: websocket_policy(),
-                sensitive_values: vec![b"provider-secret".to_vec()],
+                redaction: RedactionSet::new([b"provider-secret".as_slice()]),
                 dynamic_lease: None,
             },
         ));
@@ -6668,7 +6158,7 @@ mod tests {
                 session_id: session.session_id,
                 profile: session.profile,
                 policy,
-                sensitive_values: vec![b"provider-secret".to_vec()],
+                redaction: RedactionSet::new([b"provider-secret".as_slice()]),
                 dynamic_lease: None,
             },
         ));
@@ -6721,7 +6211,7 @@ mod tests {
                 session_id: session.session_id,
                 profile: session.profile,
                 policy: websocket_policy(),
-                sensitive_values: vec![],
+                redaction: RedactionSet::new(std::iter::empty::<&[u8]>()),
                 dynamic_lease: Some(owner),
             },
         ));
@@ -6783,7 +6273,7 @@ mod tests {
                 session_id: session.session_id,
                 profile: session.profile,
                 policy: websocket_policy(),
-                sensitive_values: vec![],
+                redaction: RedactionSet::new(std::iter::empty::<&[u8]>()),
                 dynamic_lease: Some(owner),
             },
         ));

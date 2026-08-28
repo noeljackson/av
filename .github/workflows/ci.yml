@@ -9,6 +9,21 @@ permissions:
   contents: read
 
 jobs:
+  shared-library-msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: 1.91.1
+          components: clippy
+      - name: Shared library MSRV checks
+        run: |
+          cargo +1.91.1 test --locked -p av-credential-proxy --all-targets
+          cargo +1.91.1 clippy --locked -p av-credential-proxy --all-targets -- -D warnings
+
   test:
     runs-on: ubuntu-latest
     steps:
