@@ -5,6 +5,10 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+pub use av_credential_proxy::{
+    ProxyInjectionConfig, ProxyResponseMode, ProxyRouteConfig, ProxyTunnelConfig,
+    ProxyWebSocketConfig,
+};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -359,111 +363,6 @@ pub enum ProviderOperationConfig {
         account_id: String,
         secret_key: String,
     },
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProxyRouteConfig {
-    pub profile: String,
-    pub base_url: String,
-    /// Legacy header injection fields. New configuration should use the typed
-    /// `injection` block; mixing both forms is rejected.
-    #[serde(default)]
-    pub secret_key: String,
-    #[serde(default)]
-    pub header: String,
-    #[serde(default)]
-    pub header_prefix: String,
-    #[serde(default)]
-    pub injection: Option<ProxyInjectionConfig>,
-    /// Exact one-use request-body placeholders mapped to profile secret keys.
-    /// Substitution is bounded by max_body_bytes and never acts as a template
-    /// language.
-    #[serde(default)]
-    pub body_substitutions: BTreeMap<String, String>,
-    #[serde(default)]
-    pub allowed_methods: Vec<String>,
-    #[serde(default)]
-    pub allowed_exact_paths: Vec<String>,
-    #[serde(default)]
-    pub allowed_path_prefixes: Vec<String>,
-    #[serde(default = "default_allowed_request_headers")]
-    pub allowed_request_headers: Vec<String>,
-    #[serde(default = "default_allowed_response_headers")]
-    pub allowed_response_headers: Vec<String>,
-    #[serde(default)]
-    pub allowed_query_parameters: Vec<String>,
-    #[serde(default)]
-    pub allowed_content_types: Vec<String>,
-    #[serde(default = "default_proxy_max_body_bytes")]
-    pub max_body_bytes: usize,
-    #[serde(default)]
-    pub response_mode: ProxyResponseMode,
-    #[serde(default = "default_proxy_max_response_bytes")]
-    pub max_response_bytes: usize,
-    /// Explicit WebSocket policy for transparent CONNECT/MITM sessions.
-    /// Without this block every upgrade request is denied.
-    #[serde(default)]
-    pub websocket: Option<ProxyWebSocketConfig>,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProxyInjectionConfig {
-    Bearer {
-        secret_key: String,
-    },
-    Header {
-        secret_key: String,
-        header: String,
-        #[serde(default)]
-        prefix: String,
-    },
-    Basic {
-        username: String,
-        password_secret_key: String,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ProxyResponseMode {
-    #[default]
-    Buffered,
-    Streaming,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProxyWebSocketConfig {
-    /// Exact browser Origin values. Wildcards are intentionally unsupported.
-    #[serde(default)]
-    pub allowed_origins: Vec<String>,
-    /// Non-browser clients often omit Origin. This requires an explicit opt-in.
-    #[serde(default)]
-    pub allow_missing_origin: bool,
-    /// Exact WebSocket subprotocol tokens the upstream may negotiate.
-    #[serde(default)]
-    pub allowed_subprotocols: Vec<String>,
-    #[serde(default = "default_websocket_max_duration_seconds")]
-    pub max_duration_seconds: u64,
-    #[serde(default = "default_websocket_max_message_bytes")]
-    pub max_message_bytes: usize,
-    #[serde(default = "default_websocket_max_total_bytes")]
-    pub max_total_bytes: u64,
-}
-
-#[derive(Clone, Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ProxyTunnelConfig {
-    pub profile: String,
-    /// Exact DNS host. The standard TLS port 443 is implicit.
-    pub host: String,
-    /// Private/CGNAT addresses are denied unless an operator opts in. Loopback,
-    /// link-local, multicast, unspecified, and broadcast addresses are always
-    /// denied, including cloud metadata destinations.
-    #[serde(default)]
-    pub allow_private_ips: bool,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -871,235 +770,28 @@ impl Config {
         }
 
         for (name, route) in &self.proxy_routes {
-            validate_name("proxy route", name)?;
             if !self.profiles.contains_key(&route.profile) {
                 bail!(
                     "proxy route {name} references unknown profile {}",
                     route.profile
                 );
             }
-            let base = Url::parse(&route.base_url)
-                .with_context(|| format!("proxy route {name} base_url must be a URL"))?;
-            if base.host_str().is_none()
-                || (base.scheme() != "https"
-                    && !(base.scheme() == "http" && allow_insecure_connector_http))
-            {
-                bail!("proxy route {name} base_url must use HTTPS");
-            }
-            if has_url_credentials(&base) || base.query().is_some() || base.fragment().is_some() {
-                bail!(
-                    "proxy route {name} base_url may not contain credentials, query, or fragment"
-                );
-            }
-            if route.allowed_methods.is_empty()
-                || (route.allowed_exact_paths.is_empty() && route.allowed_path_prefixes.is_empty())
-            {
-                bail!("proxy route {name} must constrain methods and at least one path");
-            }
-            if route.max_body_bytes == 0 || route.max_body_bytes > 16 * 1024 * 1024 {
-                bail!("proxy route {name} max_body_bytes must be between 1 and 16777216");
-            }
-            if route.max_response_bytes == 0 || route.max_response_bytes > 256 * 1024 * 1024 {
-                bail!("proxy route {name} max_response_bytes must be between 1 and 268435456");
-            }
-            if route.allowed_methods.iter().any(|method| {
-                !matches!(
-                    method.to_ascii_uppercase().as_str(),
-                    "GET" | "HEAD" | "POST" | "PUT" | "PATCH" | "DELETE"
-                )
-            }) {
-                bail!("proxy route {name} contains a non-CRUD HTTP method");
-            }
-            if route
-                .allowed_exact_paths
-                .iter()
-                .chain(&route.allowed_path_prefixes)
-                .any(|path| {
-                    !path.starts_with('/')
-                        || path.contains(['?', '#', '\\', '%'])
-                        || path.contains("//")
-                        || path.chars().any(char::is_control)
-                        || path.split('/').any(|segment| matches!(segment, "." | ".."))
-                })
-            {
-                bail!("proxy route {name} contains an unsafe path policy");
-            }
-            let (injection_header, injection_secret_keys): (&str, Vec<&str>) = match &route
-                .injection
-            {
-                None => {
-                    if route.secret_key.is_empty() || route.header.is_empty() {
-                        bail!("proxy route {name} legacy injection requires secret_key and header");
-                    }
-                    (route.header.as_str(), vec![route.secret_key.as_str()])
-                }
-                Some(ProxyInjectionConfig::Bearer { secret_key }) => {
-                    if !route.secret_key.is_empty()
-                        || !route.header.is_empty()
-                        || !route.header_prefix.is_empty()
-                    {
-                        bail!("proxy route {name} may not mix typed and legacy injection fields");
-                    }
-                    ("authorization", vec![secret_key.as_str()])
-                }
-                Some(ProxyInjectionConfig::Header {
-                    secret_key,
-                    header,
-                    prefix,
-                }) => {
-                    if !route.secret_key.is_empty()
-                        || !route.header.is_empty()
-                        || !route.header_prefix.is_empty()
-                    {
-                        bail!("proxy route {name} may not mix typed and legacy injection fields");
-                    }
-                    if prefix.chars().any(char::is_control) {
-                        bail!("proxy route {name} injection prefix contains control characters");
-                    }
-                    (header.as_str(), vec![secret_key.as_str()])
-                }
-                Some(ProxyInjectionConfig::Basic {
-                    username,
-                    password_secret_key,
-                }) => {
-                    if !route.secret_key.is_empty()
-                        || !route.header.is_empty()
-                        || !route.header_prefix.is_empty()
-                    {
-                        bail!("proxy route {name} may not mix typed and legacy injection fields");
-                    }
-                    if username.is_empty()
-                        || username.len() > 256
-                        || username.contains(':')
-                        || username.chars().any(char::is_control)
-                    {
-                        bail!("proxy route {name} basic username is invalid");
-                    }
-                    ("authorization", vec![password_secret_key.as_str()])
-                }
-            };
-            for secret_key in injection_secret_keys {
-                validate_environment_name(secret_key).with_context(|| {
-                    format!("proxy route {name} injection secret key is invalid")
-                })?;
-            }
-            if !injection_header.eq_ignore_ascii_case("authorization")
-                && !injection_header.to_ascii_lowercase().starts_with("x-")
-            {
-                bail!("proxy route {name} may inject Authorization or an X-* header only");
-            }
-            if axum::http::HeaderName::from_bytes(injection_header.as_bytes()).is_err() {
-                bail!("proxy route {name} injection header is invalid");
-            }
-            validate_proxy_header_allowlist(
+            av_credential_proxy::validate_proxy_route(
                 name,
-                "request",
-                &route.allowed_request_headers,
-                Some(injection_header),
+                route,
+                allow_insecure_connector_http,
+                self.transparent_proxy.is_some(),
             )?;
-            validate_proxy_header_allowlist(
-                name,
-                "response",
-                &route.allowed_response_headers,
-                None,
-            )?;
-            validate_string_allowlist(
-                name,
-                "query parameter",
-                &route.allowed_query_parameters,
-                |value| {
-                    !value.is_empty()
-                        && value.bytes().all(|byte| {
-                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
-                        })
-                },
-            )?;
-            if route.body_substitutions.len() > 16 {
-                bail!("proxy route {name} may define at most 16 body substitutions");
-            }
-            if !route.body_substitutions.is_empty() && route.allowed_content_types.is_empty() {
-                bail!(
-                    "proxy route {name} body substitutions require explicit allowed content types"
-                );
-            }
-            for (placeholder, secret_key) in &route.body_substitutions {
-                if !valid_body_placeholder(placeholder) {
-                    bail!("proxy route {name} contains an invalid body placeholder");
-                }
-                validate_environment_name(secret_key).with_context(|| {
-                    format!("proxy route {name} body substitution secret key is invalid")
-                })?;
-            }
-            validate_string_allowlist(
-                name,
-                "content type",
-                &route.allowed_content_types,
-                |value| {
-                    !value.is_empty()
-                        && value == value.to_ascii_lowercase()
-                        && !value.contains(';')
-                        && value.split_once('/').is_some()
-                        && axum::http::HeaderValue::from_str(value).is_ok()
-                },
-            )?;
-            if !(1..=4 * 1024 * 1024).contains(&route.max_body_bytes) {
-                bail!("proxy route {name} max_body_bytes must be between 1 and 4194304");
-            }
-            if let Some(websocket) = &route.websocket {
-                if self.transparent_proxy.is_none()
-                    || base.scheme() != "https"
-                    || base.port_or_known_default() != Some(443)
-                {
-                    bail!(
-                        "proxy route {name} WebSockets require the transparent proxy and standard HTTPS"
-                    );
-                }
-                if !route
-                    .allowed_methods
-                    .iter()
-                    .any(|method| method.eq_ignore_ascii_case("GET"))
-                {
-                    bail!("proxy route {name} WebSockets require GET");
-                }
-                if websocket.allowed_origins.is_empty() && !websocket.allow_missing_origin {
-                    bail!(
-                        "proxy route {name} WebSockets require allowed_origins or allow_missing_origin"
-                    );
-                }
-                if websocket.allowed_origins.len() > 32 || websocket.allowed_subprotocols.len() > 16
-                {
-                    bail!("proxy route {name} WebSocket policy is too large");
-                }
-                for origin in &websocket.allowed_origins {
-                    validate_websocket_origin(origin).with_context(|| {
-                        format!("proxy route {name} has an invalid WebSocket origin")
-                    })?;
-                }
-                validate_string_allowlist(
-                    name,
-                    "WebSocket subprotocol",
-                    &websocket.allowed_subprotocols,
-                    valid_http_token,
-                )?;
-                if !(1..=24 * 60 * 60).contains(&websocket.max_duration_seconds)
-                    || !(1..=16 * 1024 * 1024).contains(&websocket.max_message_bytes)
-                    || !(1..=1024 * 1024 * 1024).contains(&websocket.max_total_bytes)
-                {
-                    bail!("proxy route {name} WebSocket limits are outside safe bounds");
-                }
-            }
         }
 
         for (name, tunnel) in &self.proxy_tunnels {
-            validate_name("proxy tunnel", name)?;
             if !self.profiles.contains_key(&tunnel.profile) {
                 bail!(
                     "proxy tunnel {name} references unknown profile {}",
                     tunnel.profile
                 );
             }
-            crate::transparent_proxy::canonical_tunnel_host(&tunnel.host)
-                .with_context(|| format!("proxy tunnel {name} has an invalid host"))?;
+            av_credential_proxy::validate_proxy_tunnel(name, tunnel)?;
         }
 
         if let Some(transparent_proxy) = &self.transparent_proxy {
@@ -1270,74 +962,6 @@ fn valid_google_secret_resource(value: &str) -> bool {
         }
         _ => false,
     }
-}
-
-fn validate_proxy_header_allowlist(
-    route_name: &str,
-    direction: &str,
-    headers: &[String],
-    injection_header: Option<&str>,
-) -> Result<()> {
-    const FORBIDDEN: &[&str] = &[
-        "authorization",
-        "connection",
-        "content-length",
-        "cookie",
-        "forwarded",
-        "host",
-        "location",
-        "proxy-authenticate",
-        "proxy-authorization",
-        "set-cookie",
-        "te",
-        "trailer",
-        "transfer-encoding",
-        "upgrade",
-        "user-agent",
-        "www-authenticate",
-        "x-forwarded-for",
-        "x-forwarded-host",
-        "x-forwarded-port",
-        "x-forwarded-proto",
-        "x-http-method-override",
-        "x-method-override",
-        "x-original-url",
-        "x-real-ip",
-        "x-rewrite-url",
-    ];
-    let mut unique = BTreeSet::new();
-    for configured in headers {
-        let lower = configured.to_ascii_lowercase();
-        if configured != &lower
-            || axum::http::HeaderName::from_bytes(configured.as_bytes()).is_err()
-            || FORBIDDEN.contains(&lower.as_str())
-            || injection_header.is_some_and(|header| header.eq_ignore_ascii_case(configured))
-        {
-            bail!("proxy route {route_name} contains unsafe {direction} header {configured:?}");
-        }
-        if !unique.insert(lower) {
-            bail!("proxy route {route_name} repeats {direction} header {configured:?}");
-        }
-    }
-    Ok(())
-}
-
-fn validate_string_allowlist(
-    route_name: &str,
-    kind: &str,
-    values: &[String],
-    valid: impl Fn(&str) -> bool,
-) -> Result<()> {
-    let mut unique = BTreeSet::new();
-    for value in values {
-        if !valid(value) {
-            bail!("proxy route {route_name} contains invalid {kind} {value:?}");
-        }
-        if !unique.insert(value) {
-            bail!("proxy route {route_name} repeats {kind} {value:?}");
-        }
-    }
-    Ok(())
 }
 
 fn validate_transparent_proxy(config: &Config, proxy: &TransparentProxyConfig) -> Result<()> {
@@ -1511,6 +1135,7 @@ fn default_api_rate_limit_burst() -> u32 {
     100
 }
 
+#[cfg(test)]
 fn default_allowed_request_headers() -> Vec<String> {
     ["accept", "content-type", "if-match", "if-none-match"]
         .into_iter()
@@ -1518,6 +1143,7 @@ fn default_allowed_request_headers() -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn default_allowed_response_headers() -> Vec<String> {
     ["content-type", "etag", "last-modified", "retry-after"]
         .into_iter()
@@ -1525,62 +1151,14 @@ fn default_allowed_response_headers() -> Vec<String> {
         .collect()
 }
 
+#[cfg(test)]
 fn default_proxy_max_body_bytes() -> usize {
     1024 * 1024
 }
 
+#[cfg(test)]
 fn default_proxy_max_response_bytes() -> usize {
     4 * 1024 * 1024
-}
-
-fn default_websocket_max_duration_seconds() -> u64 {
-    5 * 60
-}
-
-fn default_websocket_max_message_bytes() -> usize {
-    1024 * 1024
-}
-
-fn default_websocket_max_total_bytes() -> u64 {
-    64 * 1024 * 1024
-}
-
-fn validate_websocket_origin(value: &str) -> Result<()> {
-    let origin = Url::parse(value).context("origin must be a URL")?;
-    if !matches!(origin.scheme(), "https" | "http")
-        || origin.host_str().is_none()
-        || has_url_credentials(&origin)
-        || origin.query().is_some()
-        || origin.fragment().is_some()
-        || !matches!(origin.path(), "" | "/")
-    {
-        bail!("origin must be an exact HTTP(S) origin");
-    }
-    Ok(())
-}
-
-fn valid_http_token(value: &str) -> bool {
-    !value.is_empty()
-        && value.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'.'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'|'
-                        | b'~'
-                )
-        })
 }
 
 fn default_proxy_session_ttl_seconds() -> u64 {
@@ -1599,20 +1177,6 @@ fn valid_github_organization(organization: &str) -> bool {
         && bytes
             .iter()
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
-}
-
-fn valid_body_placeholder(value: &str) -> bool {
-    let Some(name) = value
-        .strip_prefix("__AV_SECRET_")
-        .and_then(|value| value.strip_suffix("__"))
-    else {
-        return false;
-    };
-    !name.is_empty()
-        && value.len() <= 128
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
 #[cfg(test)]

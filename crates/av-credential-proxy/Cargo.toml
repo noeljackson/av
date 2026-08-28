@@ -1,0 +1,29 @@
+[package]
+name = "av-credential-proxy"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Fail-closed credential proxy policy, injection, redaction, and TLS primitives"
+repository = "https://github.com/noeljackson/av"
+rust-version = "1.91.1"
+publish = false
+
+[dependencies]
+anyhow = "=1.0.104"
+base64 = "=0.22.1"
+http = "=1.4.2"
+rand_core = { version = "=0.6.4", features = ["getrandom"] }
+rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+rustls = { version = "=0.23.42", default-features = false, features = ["std"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = "=1.0.150"
+sha2 = "=0.10.9"
+time = "=0.3.47"
+url = "=2.5.8"
+zeroize = "=1.9.0"
+
+[dev-dependencies]
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
+tempfile = "=3.26.0"
+tokio = { version = "=1.52.3", features = ["io-util", "macros", "rt-multi-thread"] }
+tokio-rustls = "=0.26.4"

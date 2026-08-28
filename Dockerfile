@@ -1,6 +1,7 @@
 FROM docker.io/library/rust:1.96.1-alpine3.23@sha256:14b9b5f47dcc6644d0f0c1b35a2c2c5d0124f67159aaee28a348627523459b55 AS build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
+COPY crates/av-credential-proxy ./crates/av-credential-proxy
 COPY build.rs ./
 COPY proto ./proto
 COPY src ./src

@@ -7,10 +7,15 @@ description = "Stateless OIDC-authenticated credential connector and policy prox
 repository = "https://github.com/noeljackson/av"
 rust-version = "1.96"
 
+[workspace]
+members = ["crates/av-credential-proxy"]
+resolver = "3"
+
 [dependencies]
 anyhow = "=1.0.104"
 argon2 = "=0.5.3"
 askama = "=0.15.4"
+av-credential-proxy = { path = "crates/av-credential-proxy" }
 axum = { version = "=0.8.8", features = ["http2", "json", "tokio"] }
 base64 = "=0.22.1"
 bytes = "=1.12.1"

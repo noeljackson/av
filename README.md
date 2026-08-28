@@ -32,6 +32,12 @@ Google Secret Manager profiles map each exported local name to an exact secret
 version resource and authenticate with ADC/Workload Identity Federation. See
 [secret backends](docs/secret-backends.md) for the backend and IAM contract.
 
+The provider-neutral policy, injection, redaction, CONNECT, tunnel-address,
+and interception-CA engine is available as the
+[`av-credential-proxy`](crates/av-credential-proxy) Rust library. AV remains its
+first host: identity, secret backends, lease ownership, audit storage, DNS,
+network sockets, and process lifecycle deliberately stay outside the library.
+
 ## Daily use
 
 ```bash
