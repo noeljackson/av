@@ -8,11 +8,13 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+#[cfg(feature = "certificate-authority")]
 mod ca;
 mod catalog;
 mod policy;
 mod redaction;
 
+#[cfg(feature = "certificate-authority")]
 pub use ca::ProxyCertificateAuthority;
 pub use catalog::{
     AuthorizedConnect, ProxySessionCredential, TransparentDestination, TransparentRouteCatalog,

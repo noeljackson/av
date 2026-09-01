@@ -23,6 +23,8 @@ jobs:
         run: |
           cargo +1.91.1 test --locked -p av-credential-proxy --all-targets
           cargo +1.91.1 clippy --locked -p av-credential-proxy --all-targets -- -D warnings
+          cargo +1.91.1 test --locked -p av-credential-proxy --no-default-features --lib
+          cargo +1.91.1 clippy --locked -p av-credential-proxy --no-default-features --lib -- -D warnings
 
   test:
     runs-on: ubuntu-latest

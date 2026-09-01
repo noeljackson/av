@@ -8,19 +8,23 @@ repository = "https://github.com/noeljackson/av"
 rust-version = "1.91.1"
 publish = false
 
+[features]
+default = ["certificate-authority"]
+certificate-authority = ["dep:rcgen", "dep:rustls", "dep:time"]
+
 [dependencies]
-anyhow = "=1.0.104"
-base64 = "=0.22.1"
-http = "=1.4.2"
-rand_core = { version = "=0.6.4", features = ["getrandom"] }
-rcgen = { version = "=0.14.7", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
-rustls = { version = "=0.23.42", default-features = false, features = ["std"] }
-serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.150"
-sha2 = "=0.10.9"
-time = "=0.3.47"
-url = "=2.5.8"
-zeroize = "=1.9.0"
+anyhow = "1"
+base64 = "0.22"
+http = "1"
+rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["std"], optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+time = { version = "0.3", optional = true }
+url = "2"
+zeroize = "1"
 
 [dev-dependencies]
 rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }

@@ -13,6 +13,13 @@ each authorized request. Transparent HTTPS clients additionally use
 `TransparentRouteCatalog`, `authorize_connect_request`, and
 `ProxyCertificateAuthority`.
 
+The `certificate-authority` feature is enabled by default for AV. Consumers
+that use explicit base-URL routes and do not terminate CONNECT TLS can set
+`default-features = false`; this keeps `rcgen`, `rustls`, and `time` out of that
+consumer's dependency graph. The application workspace retains exact versions
+in its root manifest and lockfile, while this reusable crate uses compatible
+library requirements so it composes with another locked Rust workspace.
+
 The embedding host owns:
 
 - authenticating a workload and binding it to an exact credential profile;
